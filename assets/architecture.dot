@@ -1,0 +1,13 @@
+digraph A {
+ graph [rankdir=TB, bgcolor="white", splines=polyline, nodesep=0.28, ranksep=0.42, pad=0.18];
+ node [shape=box, style="rounded,filled", fillcolor="#EDF2FC", color="#A5B6DC", penwidth=1.2, fontname="DejaVu Sans", fontsize=11, fontcolor="#1D3159", margin="0.16,0.12"];
+ edge [color="#6D80A4", arrowsize=0.7, penwidth=1.1];
+ UI [label="React / TypeScript\nWorkspace UI", fillcolor="#DDE7FD"];
+ API [label="FastAPI on 127.0.0.1\nLocal API + Job scheduler", fillcolor="#DDE7FD"];
+ DB [label="SQLite WAL\nProjects • Revisions • Jobs", fillcolor="#E3F4EB"];
+ FS [label="Local files\nSource • Audio • MP4", fillcolor="#E3F4EB"];
+ PROC [label="Workers\nASR • TTS • Sync • Render", fillcolor="#F0ECFC"];
+ EXT [label="Internet (only when requested)\nGemini Translation • Edge-TTS", fillcolor="#FFF0DE"];
+ UI -> API;API -> DB;API -> FS;API -> PROC;PROC -> DB;PROC -> FS;PROC -> EXT;
+ {rank=same;DB;FS;PROC;}
+}

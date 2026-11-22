@@ -1,0 +1,50 @@
+# Local user data, video/audio/render outputs
+/data/
+/media/
+/outputs/
+/cache/
+/scratch/
+/backups/
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.wav
+*.mp3
+*.flac
+*.db
+*.db-shm
+*.db-wal
+*.sqlite*
+*.autodubpack
+
+# Credentials and environments
+.env
+.env.*
+!.env.example
+backend/.venv/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# JS/build
+node_modules/
+frontend/dist/
+frontend/.vite/
+dist/
+build/
+
+# Local IDE/OS
+.vscode/
+.idea/
+*.log
+.DS_Store
+Thumbs.db
+
+# Generated project reports
+/docs/reports/*.docx
+/docs/reports/*.pdf/docs/reports/*.docx
+/docs/reports/*.pdf

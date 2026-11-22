@@ -1,0 +1,7 @@
+digraph P {
+ graph [rankdir=LR,bgcolor="white",nodesep=.16,ranksep=.28,splines=polyline,pad=.12];
+ node [shape=box,style="rounded,filled",fontname="DejaVu Sans",fontsize=9,margin="0.1,0.1",fillcolor="#E9EEFA",color="#B5C0D4",fontcolor="#233452"];
+ edge [color="#7283A2",arrowsize=.55];
+ IN [label="Video local"];ASR [label="Faster-Whisper\nASR"];TR [label="Gemini\n2-Pass"];TTS [label="Edge-TTS\nUnits"];SY [label="Sync plan"];RE [label="FFmpeg\nRender"];OUT [label="MP4 local"];
+ IN->ASR->TR->TTS->SY->RE->OUT;
+}
