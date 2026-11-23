@@ -1,6 +1,6 @@
 # AutoDub Local vNext — Project Root (Design + Repository Skeleton)
 
-**Status:** DESIGN / SCAFFOLD ONLY — no runnable implementation has been delivered, and no runtime tests have passed for this new repository.
+**Status:** DESIGN + minimal runnable development skeleton — G0 is not accepted. Only local session bootstrap and health-status UI are executable; project and dubbing features remain unimplemented.
 **Target:** Windows 10/11, single-user webapp on `127.0.0.1`, all persistent Project data on local disk; **NO Supabase**.
 **Purpose:** A user-controlled workflow to dub permitted video sources into Vietnamese: source → ASR → edit → Gemini translation → edit → Edge-TTS → measured sync → FFmpeg render.
 
@@ -20,16 +20,28 @@ AutoDub-Local-vNext/
 ├── README.md, AGENTS.md, RULES.md, PLAN.md, TASK.md
 ├── CHANGELOG.md, UPDATES.md, ERROR_LOG.md, FILE_INDEX.md
 ├── .gitignore, .env.example
-├── backend/             # FastAPI, domain/storage/worker adapters (empty skeleton)
-├── frontend/            # React + TypeScript + Vite (empty skeleton)
-├── scripts/             # Windows bootstrap and diagnostics (not implemented)
-├── tests/               # Fixtures / e2e test skeleton
+├── backend/             # Minimal FastAPI local session/health skeleton
+├── frontend/            # React + TypeScript status UI and Vite proxy
+├── scripts/             # Windows development launcher
+├── tests/               # Stage fixtures and test guidance
 ├── docs/                # Detailed specifications and architecture reports
 │   ├── 01_PRODUCT_REQUIREMENTS.md ... 14_SCOPE_BASELINE.md
 │   └── reports/          # Editable Word and PDF design reports
 ├── adr/                 # Architecture decisions
 └── assets/              # Proposed diagrams
 ```
+
+## Run the development skeleton (Windows)
+
+Prerequisites: Python 3.14 and Node.js 22.12+ (Vite 8 requirement); npm is included with Node. From the repository root:
+
+```powershell
+.\scripts\windows\dev.ps1
+```
+
+The launcher binds both services to `127.0.0.1`, creates/uses `backend/.venv`, installs pinned backend packages and runs `npm ci` when dependencies are absent. It opens the UI with a one-time bootstrap token in the URL fragment; the frontend clears the fragment before establishing the session. Use Ctrl+C in the launcher to stop. Run the actual local integration smoke suite with `.\scripts\windows\dev.ps1 -SmokeTest`. Direct backend tests: `Push-Location backend; .\.venv\Scripts\python.exe -m unittest discover -s tests -v; Pop-Location`; frontend production build/type check: `npm --prefix frontend run build`.
+
+The health indicator reports only API liveness. There is no project persistence, media access, provider integration or render endpoint in this skeleton. G0 remains pending Product Owner acceptance.
 
 The working media directory is **outside the repository**, chosen by the owner. Do not create or commit actual user data under the source tree.
 
@@ -48,4 +60,4 @@ The working media directory is **outside the repository**, chosen by the owner. 
 
 ## Implementation status / next action
 
-This ZIP contains specifications and a **real project-root directory skeleton**, not app code. Begin at `ARCH-00` after owner approval. Do not invent runtime completion, benchmarks, or hardware capability.
+The project now contains a minimal runnable development skeleton only. Later stages still require owner approval; do not infer pipeline completion, hardware capability or G0 acceptance from these liveness checks.

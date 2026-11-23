@@ -4,22 +4,12 @@
 
 ## Mandatory reading order
 
-1. `README.md`
-2. `RULES.md`
-3. `docs/14_SCOPE_BASELINE.md`
-4. `docs/01_PRODUCT_REQUIREMENTS.md`
-5. `docs/02_SYSTEM_ARCHITECTURE.md`
-6. `docs/03_DATA_AND_STORAGE.md`
-7. `docs/04_PIPELINE_ALGORITHMS.md`
-8. `docs/05_HARDWARE_PERFORMANCE.md`
-9. `docs/06_UI_UX.md`
-10. `docs/07_JOBS_AND_API.md`
-11. `docs/08_IMPLEMENTATION_ROADMAP.md`
-12. `docs/09_LEGACY_REUSE_AUDIT.md`
-13. `docs/10_QA_SECURITY_RECOVERY.md`
-14. `PLAN.md`, `TASK.md`, `CHANGELOG.md`, `UPDATES.md`, `ERROR_LOG.md`
+1. Read this `AGENTS.md` first.
+2. Read only the files and sections directly relevant to the current Task ID, including applicable task-specific specs.
+3. Read the relevant `RULES.md` rules for that task.
+4. Open additional project documents when a dependency or actual conflict requires them; record why they were needed.
 
-Read task-specific specs before editing. Conflicting requirements: user instruction > documented accepted ADR > accepted product contract > implementation notes. Log unresolved conflicts instead of guessing.
+Preserve all project invariants, safety rules and scope boundaries while applying this focused reading approach. Conflicting requirements: user instruction > documented accepted ADR > accepted product contract > implementation notes. Log unresolved conflicts instead of guessing.
 
 ## Workflow for each coded task
 

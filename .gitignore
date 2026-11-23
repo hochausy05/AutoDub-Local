@@ -48,3 +48,5 @@ Thumbs.db
 /docs/reports/*.docx
 /docs/reports/*.pdf/docs/reports/*.docx
 /docs/reports/*.pdf
+.dev-run/
+*.tsbuildinfo

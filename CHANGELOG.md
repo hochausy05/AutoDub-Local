@@ -1,5 +1,18 @@
 # CHANGELOG — AutoDub Local vNext
 
+## 2026-11-23 13:55 UTC+7 — ARCH-00D — Runnable development skeleton
+- Tạo FastAPI loopback backend với one-time bootstrap, in-memory session, CSRF, strict Host/Origin/Fetch Metadata và health liveness; tạo React/TypeScript status UI (trạng thái trống, không giả lập media), Vite dev proxy, lockfile/dependency pins và Windows launcher `scripts/windows/dev.ps1`.
+- Thêm backend security smoke tests, frontend/proxy integration smoke, cập nhật README/`.env.example`/`.gitignore`; chuyển giao quy tắc hai tầng CoverageGroup → RevisionSegment → TranslationUnit cho TRANS-01 trong proposal ARCH-00C. Không thêm ASR, Gemini, TTS, SQLite, import hay render.
+- Backend unittest **PASS** (4 tests); `npm ci` và `npm run build` **PASS**; `scripts/windows/dev.ps1 -SmokeTest` **PASS** (2 tests, real local FastAPI/Vite proxy). Windows start/stop đã chạy; browser visual acceptance **BLOCKED** do computer-use native pipe unavailable. G0 chưa nghiệm thu.
+
+## 2026-11-23 13:14 UTC+7 — ARCH-00C — Đề xuất hợp đồng pipeline MVP
+- Tạo `docs/proposals/ARCH-00C_PIPELINE_CONTRACT_PROPOSAL.md`: đặc tả Gemini hai pass, Edge-TTS theo Unit, SyncPlan trên thời lượng đo thực và RenderPlan/Verified MP4; gồm schema, trạng thái, fingerprint, lỗi/recovery, test matrix và quyết định chờ PO/TL.
+- Xác minh UTF-8 và nội dung proposal; `git diff --check` **PASS**. Runtime/provider/Windows/FFmpeg tests **NOT RUN**; G0 chưa nghiệm thu.
+
+## 2026-11-23 13:08 UTC+7 — ARCH-00B-R1 — Sửa hợp đồng an ninh local
+- Cập nhật `docs/proposals/ARCH-00B_LOCAL_API_SECURITY_CONTRACT_PROPOSAL.md`: bổ sung durable selection cho Import Job, trusted picker helper IPC, chính sách DataRoot và hợp đồng session/Host/Origin/CSRF độc lập công cụ build; sửa đoạn lỗi mã hóa và thêm test cases B23–B28.
+- Proposal được giải mã UTF-8 nghiêm ngặt và kiểm tra lại nội dung tiếng Việt. Test runtime/browser/Windows/helper IPC **NOT RUN**; G0 chưa nghiệm thu.
+
 ## 2026-11-23 12:40 UTC+7 — ARCH-00B — Đề xuất API local và an ninh
 - Tạo `docs/proposals/ARCH-00B_LOCAL_API_SECURITY_CONTRACT_PROPOSAL.md`; cập nhật `CHANGELOG.md`. Đề xuất trust boundary, phiên local, picker và COPY/LINK, media Range, API/Job/CAS, Windows cancellation và privacy; chờ review, chưa owner duyệt.
 - Đọc lại tài liệu, đối chiếu ARCH-00A/scope và kiểm tra whitespace Git; runtime, browser, picker, provider và Windows process tests **NOT RUN**. Không triển khai API; G0 chưa nghiệm thu.
