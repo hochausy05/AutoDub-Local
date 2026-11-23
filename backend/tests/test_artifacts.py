@@ -209,13 +209,13 @@ class ArtifactPublicationTests(unittest.TestCase):
         with self.assertRaisesRegex(ArtifactConflict, "producer_not_running"):
             self.publish()
 
-    def test_migration_v4_is_additive_and_repeatable(self):
+    def test_migration_v6_is_additive_and_repeatable(self):
         with closing(self.app.state.database.connect()) as connection:
-            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 4)
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 6)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 1)
         self.app.state.database.initialize()
         with closing(self.app.state.database.connect()) as connection:
-            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 4)
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 6)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 1)
 
 

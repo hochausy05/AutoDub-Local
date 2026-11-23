@@ -16,12 +16,13 @@ from typing import Callable, Literal
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from app.database import Database, IdempotencyConflict
 from app.artifacts import ArtifactPublicationService
 from app.jobs import JobConflict, JobInputError, JobNotFound, JobService
 from app.recovery import StartupRecovery
+from app.media import FFprobe, LinkManifestValidator, MediaError, MediaImportService, MediaImportWorker, SourceVideoValidator, parse_single_byte_range
 
 
 SESSION_COOKIE = "autodub_session"
@@ -106,6 +107,18 @@ class RetryJobRequest(BaseModel):
     expected_status: Literal["FAILED", "INTERRUPTED"]
 
 
+class ImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    selection_id: str = Field(min_length=32, max_length=128)
+    mode: Literal["COPY", "LINK"]
+
+
+class RelinkRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    selection_id: str = Field(min_length=32, max_length=128)
+    expected_lock_version: int = Field(ge=1)
+
+
 def _is_loopback(address: str | None) -> bool:
     if not address:
         return False
@@ -132,13 +145,22 @@ def create_app(
     database = Database(data_root)
     artifact_service = ArtifactPublicationService(database)
     job_service = JobService(database, artifact_service)
+    ffprobe = FFprobe(os.environ.get("FFPROBE_PATH"))
+    artifact_service.validators.update({"source_video": SourceVideoValidator(ffprobe), "media_link_manifest": LinkManifestValidator()})
+    media_service = MediaImportService(database, job_service, artifact_service, ffprobe)
+    media_worker = MediaImportWorker(media_service)
     startup_recovery = StartupRecovery(database, job_service, artifact_service)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         database.initialize()
         _app.state.recovery_report = startup_recovery.reconcile()
-        yield
+        _app.state.recovery_report["media_assets_recovered"] = media_service.reconcile_pending_assets()
+        media_worker.start()
+        try:
+            yield
+        finally:
+            media_worker.stop()
 
     app = FastAPI(
         title="AutoDub Local API",
@@ -151,6 +173,7 @@ def create_app(
     app.state.artifact_service = artifact_service
     app.state.job_service = job_service
     app.state.startup_recovery = startup_recovery
+    app.state.media_service = media_service
     expected_host = f"{host}:{port}"
     sessions: dict[str, Session] = {}
     secret_deadline = clock() + BOOTSTRAP_TTL_SECONDS
@@ -345,6 +368,148 @@ def create_app(
             return job_service.get_job(job_id, project_id)
         except (JobNotFound, JobInputError) as exc:
             return job_exception(exc)
+
+    @app.post("/api/v1/projects/{project_id}/selections", status_code=201)
+    def create_source_selection(project_id: str, body: EmptyJobRequest, request: Request):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            parsed = uuid.UUID(project_id)
+            if str(parsed) != project_id.lower():
+                raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_project_id", "Project ID must be a canonical UUID.")
+        session = get_session(request)
+        try:
+            return media_service.choose_source(session[0], str(parsed))
+        except MediaError as exc:
+            status = 404 if exc.code == "project_not_found" else 503 if exc.code.startswith("picker_") else 409
+            return api_error(status, exc.code, "Không thể chọn video nguồn.")
+
+    @app.post("/api/v1/projects/{project_id}/media/{asset_id}/relink-selections", status_code=201)
+    def create_relink_selection(project_id: str, asset_id: str, body: EmptyJobRequest, request: Request):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project = uuid.UUID(project_id)
+            asset = uuid.UUID(asset_id)
+            if str(project) != project_id.lower() or str(asset) != asset_id.lower():
+                raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_media_id", "Project và Asset ID phải là UUID chuẩn.")
+        session = get_session(request)
+        try:
+            return media_service.choose_source(session[0], str(project), purpose="relink", asset_id=str(asset))
+        except MediaError as exc:
+            status = 404 if exc.code in {"project_not_found", "relink_not_allowed"} else 503 if exc.code.startswith("picker_") else 409
+            return api_error(status, exc.code, "Không thể chọn lại video nguồn.")
+
+    @app.post("/api/v1/projects/{project_id}/media/{asset_id}/relink", status_code=200)
+    def relink_media(project_id: str, asset_id: str, body: RelinkRequest, request: Request):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        key = request.headers.get("idempotency-key", "")
+        session = get_session(request)
+        try:
+            return media_service.relink_asset(session[0], project_id, asset_id, body.selection_id, body.expected_lock_version, key)
+        except IdempotencyConflict:
+            return api_error(409, "idempotency_key_reused", "Idempotency-Key đã được dùng cho nội dung khác.")
+        except MediaError as exc:
+            code = exc.code
+            status = 410 if code == "selection_expired" else 404 if code == "asset_not_found" else 409 if code in {"selection_invalid", "selection_consumed", "asset_revision_conflict", "relink_content_mismatch", "relink_not_required"} else 422
+            return api_error(status, code, "Không thể liên kết lại video.")
+
+    @app.post("/api/v1/projects/{project_id}/media/imports", status_code=202)
+    def create_media_import(project_id: str, body: ImportRequest, request: Request):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        key = request.headers.get("idempotency-key", "")
+        try:
+            parsed = uuid.UUID(project_id)
+            if str(parsed) != project_id.lower():
+                raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_project_id", "Project ID must be a canonical UUID.")
+        session = get_session(request)
+        try:
+            job = media_service.create_import_job(session[0], str(parsed), body.selection_id, body.mode, key)
+            return job
+        except IdempotencyConflict:
+            return api_error(409, "idempotency_key_reused", "Idempotency-Key đã được dùng cho nội dung khác.")
+        except (MediaError, JobInputError) as exc:
+            code = exc.code if isinstance(exc, MediaError) else str(exc)
+            status = 410 if code == "selection_expired" else 409 if code in {"selection_consumed", "source_changed"} else 404 if code in {"project_not_found", "selection_invalid"} else 422
+            return api_error(status, code, "Không thể tạo Import Job.")
+
+    @app.get("/api/v1/projects/{project_id}/media")
+    def list_project_media(project_id: str, request: Request):
+        current = require_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            parsed = uuid.UUID(project_id)
+            if str(parsed) != project_id.lower():
+                raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_project_id", "Project ID must be a canonical UUID.")
+        if database.get_project(str(parsed)) is None:
+            return api_error(404, "project_not_found", "Project was not found.")
+        return {"items": media_service.list_assets(str(parsed))}
+
+    @app.api_route("/api/v1/projects/{project_id}/media/{asset_id}/stream", methods=["GET", "HEAD"])
+    def stream_project_media(project_id: str, asset_id: str, request: Request):
+        current = require_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project = uuid.UUID(project_id)
+            asset = uuid.UUID(asset_id)
+            if str(project) != project_id.lower() or str(asset) != asset_id.lower():
+                raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_media_id", "Project và Asset ID phải là UUID chuẩn.")
+        if database.get_project(str(project)) is None:
+            return api_error(404, "project_not_found", "Project was not found.")
+        try:
+            opened = media_service.open_media_stream(str(project), str(asset))
+        except MediaError as exc:
+            status = 404 if exc.code == "asset_not_found" else 415 if exc.code == "media_type_unsupported" else 409
+            return api_error(status, exc.code, "Video hiện không sẵn sàng để phát.")
+        headers = {
+            "Accept-Ranges": "bytes",
+            "ETag": opened.etag,
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        }
+        if_none_match = request.headers.get("if-none-match", "")
+        if any(tag.strip() == "*" or tag.strip().removeprefix("W/") == opened.etag for tag in if_none_match.split(",")):
+            opened.handle.close()
+            return Response(status_code=304, headers=headers)
+        start, end = 0, opened.size - 1
+        status = 200
+        range_header = request.headers.get("range")
+        if range_header and request.headers.get("if-range", opened.etag) == opened.etag:
+            try:
+                start, end = parse_single_byte_range(range_header, opened.size)
+            except MediaError as exc:
+                opened.handle.close()
+                if exc.code == "range_not_satisfiable":
+                    headers["Content-Range"] = f"bytes */{opened.size}"
+                    return Response(status_code=416, headers=headers)
+                return api_error(400, "invalid_range", "Chỉ hỗ trợ một byte range hợp lệ.")
+            status = 206
+            headers["Content-Range"] = f"bytes {start}-{end}/{opened.size}"
+        length = max(0, end - start + 1)
+        headers["Content-Length"] = str(length)
+        headers["Content-Type"] = opened.content_type
+        if request.method == "HEAD":
+            opened.handle.close()
+            return Response(status_code=status, headers=headers, media_type=None)
+        return StreamingResponse(media_service.stream_chunks(opened, start, length), status_code=status, headers=headers, media_type=None)
 
     @app.post("/api/v1/jobs/{job_id}/cancel", response_model=JobRead)
     def cancel_job(job_id: str, body: EmptyJobRequest, request: Request, project_id: str | None = Query(default=None)):

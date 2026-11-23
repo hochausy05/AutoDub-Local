@@ -86,7 +86,7 @@ class DurableJobTests(unittest.TestCase):
         )
         return self.artifacts.completion_evidence(job["id"], claimed["attempt"]["id"], [artifact["id"]])
 
-    def test_migration_v4_preserves_core_01a_b_c_data(self):
+    def test_migrations_v4_through_v6_preserve_core_01a_b_c_data(self):
         legacy_root = Path(self.temp.name) / "legacy"
         legacy = Database(legacy_root)
         legacy.initialize(target_version=1)
@@ -110,13 +110,13 @@ class DurableJobTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 3)
         legacy.initialize()
         with closing(legacy.connect()) as connection:
-            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 4)
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 6)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM projects WHERE id=?", (project["id"],)).fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM jobs WHERE id=?", (job_id,)).fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM job_attempts WHERE id=?", (attempt_id,)).fetchone()[0], 1)
         legacy.initialize()
         with closing(legacy.connect()) as connection:
-            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 4)
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 6)
 
     def test_running_job_and_attempt_are_interrupted_on_backend_restart(self):
         job = self.create_job()

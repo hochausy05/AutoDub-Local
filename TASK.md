@@ -18,11 +18,15 @@
 - [ ] SQLite WAL/foreign keys/migrations, API errors, loopback-only API and local settings.
 - [ ] Minimal single-machine durable Job/Attempt status, cancellation and startup reconciliation.
 - [ ] Atomic file staging → validation → publish, no orphan files misreported as READY.
-- [ ] **G1:** Restart/interrupt/retry/duplicate-click tests pass without complex distributed lease service.
+- [x] **G1:** Product Owner accepted after Windows restart/recovery verification (2026-11-23); this does not imply G2 acceptance.
 
 ### MEDIA-01 — Local media
+- [x] **MEDIA-01A implementation + automated checks:** additive migration v5, Windows helper selection, durable COPY/LINK Import Job, FFprobe metadata and UI; 58 backend tests and frontend build pass. Manual desktop acceptance is BLOCKED; see CHANGELOG.
+- [x] **MEDIA-01A-FIX:** FastAPI body model scope corrected; COPY/LINK API integration plus atomic Job/MediaAsset READY verified (60 backend tests); G2 remains unaccepted.
+- [ ] **MEDIA-01A Windows manual acceptance:** native picker, real-user-video COPY/LINK, visible metadata and restart persistence — BLOCKED (desktop automation unavailable; launcher ports occupied).
 - [ ] Copy/link source, choose local data/export paths; keep browser path selection safe.
 - [ ] FFprobe metadata, HTTP Range player, Unicode paths, missing-source relink.
+- [x] **MEDIA-01B automated implementation slice:** migration v6 relink contracts, guarded GET/HEAD Range playback, verified COPY/LINK source checks and same-content relink CAS; backend suite (64 tests), frontend build and helper parser pass. Browser/native picker/manual G2 acceptance remains NOT RUN/BLOCKED; see CHANGELOG.
 - [ ] **G2:** Play/source-relink and safe delete verified.
 
 ### ASR-01 — Faster-Whisper

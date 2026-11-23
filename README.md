@@ -1,6 +1,6 @@
 # AutoDub Local vNext — Project Root (Design + Repository Skeleton)
 
-**Status:** DESIGN + runnable local development app — Project persistence and internal durable Job/Attempt lifecycle slices are implemented; G0/G1 are not accepted. Dubbing executors remain unimplemented.
+**Status:** Runnable local development app — Project persistence, durable Jobs/Attempts, artifact recovery and a MEDIA-01A source-import slice are implemented. G1 was accepted by the Product Owner; G2 remains unaccepted and Windows native picker/manual acceptance is pending.
 **Target:** Windows 10/11, single-user webapp on `127.0.0.1`, all persistent Project data on local disk; **NO Supabase**.
 **Purpose:** A user-controlled workflow to dub permitted video sources into Vietnamese: source → ASR → edit → Gemini translation → edit → Edge-TTS → measured sync → FFmpeg render.
 
@@ -41,9 +41,9 @@ Prerequisites: Python 3.14 and Node.js 22.12+ (Vite 8 requirement); npm is inclu
 
 The launcher binds both services to `127.0.0.1`, creates/uses `backend/.venv`, installs pinned backend packages and runs `npm ci` when dependencies are absent. It opens the UI with a one-time bootstrap token in the URL fragment; the frontend clears the fragment before establishing the session. Use Ctrl+C in the launcher to stop. Run the actual local integration smoke suite with `.\scripts\windows\dev.ps1 -SmokeTest`. Direct backend tests: `Push-Location backend; .\.venv\Scripts\python.exe -m unittest discover -s tests -v; Pop-Location`; frontend production build/type check: `npm --prefix frontend run build`.
 
-Project API and UI currently support local Project create/list/read. The SQLite file defaults to `%LOCALAPPDATA%\AutoDub-Local\autodub.sqlite3` on Windows, or to `AUTODUB_DATA_ROOT` when set to a local folder outside the source tree. WAL is enabled; UNC and mapped network drives are rejected. The frontend cannot choose a database path. Backend session cookies remain in memory and are reset when the backend restarts; use the launcher's new bootstrap link to establish a session again.
+Project API and UI support local Project create/list/read and source-video COPY/LINK imports. Choose a Project, select COPY or LINK, then use **Chọn video** to open the Windows file picker. COPY publishes a managed immutable video artifact; LINK records a private source reference and does not copy the original. Both modes use FFprobe and show probed metadata. The SQLite file defaults to `%LOCALAPPDATA%\AutoDub-Local\autodub.sqlite3` on Windows, or to `AUTODUB_DATA_ROOT` when set to a local folder outside the source tree. WAL is enabled; UNC and mapped network drives are rejected. The frontend cannot choose a database path. Backend session cookies remain in memory and are reset when the backend restarts; use the launcher's new bootstrap link to establish a session again.
 
-CORE-01B adds internal durable Job creation/claim/failure/completion/progress/retry/cancel service operations and session-protected `GET /api/v1/jobs/{id}`, `POST .../cancel`, and `POST .../retry`. CORE-01C/D add atomic Artifact publication, startup reconciliation, typed stage input/pointer generations and activation CAS. Startup changes pre-restart RUNNING/CANCEL_REQUESTED Jobs to INTERRUPTED, verifies managed Artifact candidates, and inventories unowned files without deleting them. Retry remains explicit and is capped at three Attempts. This build has no media/provider executor or worker process-tree cancellation; it never kills a process using a persisted PID.
+CORE-01B adds internal durable Job creation/claim/failure/completion/progress/retry/cancel operations. CORE-01C/D add atomic Artifact publication, startup reconciliation, typed stage generations and activation CAS. MEDIA-01A adds a local media import worker and session/CSRF guarded selection/import/media endpoints. Job input snapshots keep private source references out of API responses; errors and logs do not include the path. Native Windows dialog visual/manual checks remain required. Retry stays explicit and capped at three Attempts.
 
 Project persistence checks use an isolated temporary database:
 
@@ -52,7 +52,7 @@ Push-Location backend; .\.venv\Scripts\python.exe -m unittest discover -s tests 
 npm --prefix frontend run build
 ```
 
-The Project panel uses the real API; no sample Projects are embedded. Job lifecycle and Artifact recovery are internal/backend-only; there is no Job dashboard, media import, provider or render implementation. G0/G1 remain pending broader acceptance and Product Owner decisions.
+Project and Media panels use real API data; no sample Projects are embedded. No HTTP Range playback, missing-source relink, provider, ASR or render implementation is included. G2 remains pending Windows manual acceptance and PO review.
 
 The working media directory is **outside the repository**, chosen by the owner. Do not create or commit actual user data under the source tree.
 
@@ -71,4 +71,4 @@ The working media directory is **outside the repository**, chosen by the owner. 
 
 ## Implementation status / next action
 
-The project now contains a minimal runnable development skeleton only. Later stages still require owner approval; do not infer pipeline completion, hardware capability or G0 acceptance from these liveness checks.
+The current source-import slice is implemented and automated-tested; manual native-picker acceptance and G2 remain pending. Later pipeline stages still require owner approval; do not infer ASR/translation/TTS/render capability or G2 acceptance from a successful build.

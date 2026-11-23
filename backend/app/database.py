@@ -14,7 +14,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 BUSY_TIMEOUT_MS = 5000
 
 
@@ -285,6 +285,37 @@ class Database:
                     connection.execute(
                         "INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (4, utc_now())
                     )
+                    current = 4
+                if current < 5 and target_version >= 5:
+                    statements = (
+                        "CREATE TABLE selections (id_hash TEXT PRIMARY KEY NOT NULL, session_hash TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT, purpose TEXT NOT NULL CHECK(purpose='source'), private_path TEXT NOT NULL, display_name TEXT NOT NULL, file_identity_json TEXT NOT NULL CHECK(json_valid(file_identity_json)), expires_at REAL NOT NULL, state TEXT NOT NULL CHECK(state IN ('ISSUED','CONSUMED','EXPIRED','REVOKED')), consumed_job_id TEXT REFERENCES jobs(id) ON DELETE RESTRICT, created_at TEXT NOT NULL)",
+                        "CREATE INDEX selections_expiry_idx ON selections(state,expires_at)",
+                        "CREATE TRIGGER selection_source_immutable BEFORE UPDATE OF id_hash,session_hash,project_id,purpose,private_path,display_name,file_identity_json,created_at ON selections BEGIN SELECT RAISE(ABORT, 'selection source snapshot is immutable'); END",
+                        "CREATE TABLE media_assets (id TEXT PRIMARY KEY NOT NULL, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT, mode TEXT NOT NULL CHECK(mode IN ('COPY','LINK')), status TEXT NOT NULL CHECK(status IN ('PENDING','READY','MISSING','CHANGED')), display_name TEXT NOT NULL, private_source_path TEXT, managed_artifact_id TEXT REFERENCES artifacts(id) ON DELETE RESTRICT, sha256 TEXT NOT NULL CHECK(length(sha256)=64), file_size INTEGER NOT NULL CHECK(file_size>=0), metadata_json TEXT NOT NULL CHECK(json_valid(metadata_json)), source_identity_json TEXT NOT NULL CHECK(json_valid(source_identity_json)), producer_job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE RESTRICT, generation INTEGER NOT NULL CHECK(generation>=1), created_at TEXT NOT NULL, UNIQUE(project_id,generation), UNIQUE(project_id,id), CHECK((mode='COPY' AND private_source_path IS NULL AND managed_artifact_id IS NOT NULL) OR (mode='LINK' AND private_source_path IS NOT NULL)))",
+                        "CREATE INDEX media_assets_project_idx ON media_assets(project_id,created_at DESC)",
+                        "CREATE TABLE media_import_state (project_id TEXT PRIMARY KEY NOT NULL REFERENCES projects(id) ON DELETE RESTRICT, desired_generation INTEGER NOT NULL CHECK(desired_generation>=0), active_generation INTEGER NOT NULL CHECK(active_generation>=0), active_asset_id TEXT, FOREIGN KEY(project_id,active_asset_id) REFERENCES media_assets(project_id,id) ON DELETE RESTRICT)",
+                    )
+                    for statement in statements:
+                        connection.execute(statement)
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (5, utc_now()))
+                    current = 5
+                if current < 6 and target_version >= 6:
+                    statements = (
+                        "DROP INDEX selections_expiry_idx",
+                        "DROP TRIGGER selection_source_immutable",
+                        "ALTER TABLE selections RENAME TO selections_v5",
+                        "CREATE TABLE selections (id_hash TEXT PRIMARY KEY NOT NULL, session_hash TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT, purpose TEXT NOT NULL CHECK(purpose IN ('source','relink')), private_path TEXT NOT NULL, display_name TEXT NOT NULL, file_identity_json TEXT NOT NULL CHECK(json_valid(file_identity_json)), expires_at REAL NOT NULL, state TEXT NOT NULL CHECK(state IN ('ISSUED','CONSUMED','EXPIRED','REVOKED')), consumed_job_id TEXT REFERENCES jobs(id) ON DELETE RESTRICT, asset_id TEXT REFERENCES media_assets(id) ON DELETE RESTRICT, created_at TEXT NOT NULL, CHECK((purpose='source' AND asset_id IS NULL) OR (purpose='relink' AND asset_id IS NOT NULL)))",
+                        "INSERT INTO selections(id_hash,session_hash,project_id,purpose,private_path,display_name,file_identity_json,expires_at,state,consumed_job_id,created_at) SELECT id_hash,session_hash,project_id,purpose,private_path,display_name,file_identity_json,expires_at,state,consumed_job_id,created_at FROM selections_v5",
+                        "DROP TABLE selections_v5",
+                        "CREATE INDEX selections_expiry_idx ON selections(state,expires_at)",
+                        "CREATE TRIGGER selection_source_immutable BEFORE UPDATE OF id_hash,session_hash,project_id,purpose,private_path,display_name,file_identity_json,asset_id,created_at ON selections BEGIN SELECT RAISE(ABORT, 'selection source snapshot is immutable'); END",
+                        "ALTER TABLE media_assets ADD COLUMN lock_version INTEGER NOT NULL DEFAULT 1 CHECK(lock_version>=1)",
+                        "CREATE TABLE media_relink_history (id TEXT PRIMARY KEY NOT NULL, asset_id TEXT NOT NULL REFERENCES media_assets(id) ON DELETE RESTRICT, selection_hash TEXT NOT NULL, previous_private_source_path TEXT NOT NULL, previous_identity_json TEXT NOT NULL CHECK(json_valid(previous_identity_json)), previous_sha256 TEXT NOT NULL CHECK(length(previous_sha256)=64), new_private_source_path TEXT NOT NULL, new_identity_json TEXT NOT NULL CHECK(json_valid(new_identity_json)), relinked_at TEXT NOT NULL, UNIQUE(asset_id,selection_hash))",
+                        "CREATE INDEX media_relink_history_asset_idx ON media_relink_history(asset_id,relinked_at DESC)",
+                    )
+                    for statement in statements:
+                        connection.execute(statement)
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (6, utc_now()))
                 connection.commit()
             except BaseException:
                 connection.rollback()

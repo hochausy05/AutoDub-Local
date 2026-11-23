@@ -84,6 +84,39 @@ class LocalApiSmokeTests(unittest.TestCase):
         self.assertEqual(self.client.get("/docs", headers=self.headers).status_code, 404)
         self.assertEqual(self.client.get("/openapi.json", headers=self.headers).status_code, 404)
 
+    def test_media_selection_and_listing_keep_existing_session_csrf_guards(self):
+        self.assertEqual(self.client.post(f"/api/v1/projects/{'00000000-0000-4000-8000-000000000001'}/selections", headers={**self.headers, "content-type": "application/json"}, json={}).status_code, 401)
+        csrf = self.bootstrap()
+        project_id = self.create(csrf=csrf).json()["id"]
+        route = f"/api/v1/projects/{project_id}/selections"
+        self.assertEqual(self.client.post(route, headers={**self.headers, "content-type": "application/json"}, json={}).status_code, 403)
+        self.assertEqual(self.client.post(route, headers={**self.headers, "content-type": "application/json", "x-csrf-token": csrf}, json={"path": "C:\\private\\file.mp4"}).status_code, 422)
+        listed = self.client.get(f"/api/v1/projects/{project_id}/media", headers=self.headers)
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.json(), {"items": []})
+        self.assertNotIn("path", listed.text.lower())
+
+    def test_media_import_post_uses_json_body_not_required_query_parameter(self):
+        csrf = self.bootstrap()
+        project_id = self.create(csrf=csrf).json()["id"]
+        response = self.client.post(
+            f"/api/v1/projects/{project_id}/media/imports",
+            headers={**self.headers, "content-type": "application/json", "x-csrf-token": csrf,
+                     "idempotency-key": "import-contract-regression-0001"},
+            json={"selection_id": "a" * 64, "mode": "COPY"},
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["error"]["code"], "selection_invalid")
+        missing_mode = self.client.post(
+            f"/api/v1/projects/{project_id}/media/imports",
+            headers={**self.headers, "content-type": "application/json", "x-csrf-token": csrf,
+                     "idempotency-key": "import-missing-mode-idempotency-01"},
+            json={"selection_id": "a" * 64},
+        )
+        self.assertEqual(missing_mode.status_code, 422)
+        self.assertEqual(missing_mode.json()["error"]["code"], "validation_error")
+        self.assertEqual(missing_mode.json()["error"]["details"][0]["field"], "mode")
+
     def test_first_startup_creates_database_and_configures_sqlite(self):
         self.assertTrue(self.app.state.database.path.is_file())
         with closing(self.app.state.database.connect()) as connection:
@@ -110,7 +143,7 @@ class LocalApiSmokeTests(unittest.TestCase):
         reopened = TestClient(create_app("next-secret", data_root=self.data_root), client=("127.0.0.1", 50001))
         with reopened:
             with closing(reopened.app.state.database.connect()) as connection:
-                self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 4)
+                self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 6)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 1)
                 self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
                 self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")

@@ -11,7 +11,7 @@ import uuid
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from app.database import Database, IdempotencyConflict, utc_now
 from app.artifacts import ArtifactError, ArtifactPublicationService, CompletionEvidence
@@ -262,15 +262,16 @@ class JobService:
             raise JobNotFound
         return detail
 
-    def claim_next_job(self) -> dict[str, Any] | None:
+    def claim_next_job(self, kind: str | None = None) -> dict[str, Any] | None:
         if not self._recovery_complete:
             raise JobConflict("startup_recovery_required")
         with self._write() as connection:
             if connection.execute("SELECT 1 FROM jobs WHERE status IN ('RUNNING','CANCEL_REQUESTED') LIMIT 1").fetchone():
                 return None
-            row = connection.execute(
-                "SELECT id FROM jobs WHERE status='QUEUED' ORDER BY created_at,id LIMIT 1"
-            ).fetchone()
+            if kind is None:
+                row = connection.execute("SELECT id FROM jobs WHERE status='QUEUED' ORDER BY created_at,id LIMIT 1").fetchone()
+            else:
+                row = connection.execute("SELECT id FROM jobs WHERE status='QUEUED' AND kind=? ORDER BY created_at,id LIMIT 1", (kind,)).fetchone()
             if row is None:
                 return None
             job_id = row["id"]
@@ -410,7 +411,10 @@ class JobService:
             connection.execute("UPDATE jobs SET updated_at=? WHERE id=?", (utc_now(), job_id))
             return self._job_detail(connection, job_id)
 
-    def complete_attempt(self, job_id: str, attempt_id: str, evidence: CompletionEvidence) -> dict[str, Any]:
+    def complete_attempt(
+        self, job_id: str, attempt_id: str, evidence: CompletionEvidence,
+        *, completion_hook: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> dict[str, Any]:
         job_id = self._uuid(job_id, "job_id")
         attempt_id = self._uuid(attempt_id, "attempt_id")
         with closing(self.database.connect()) as connection:
@@ -474,6 +478,8 @@ class JobService:
                             activation_outcome = "ACTIVE" if changed == 1 else "STALE"
                     else:
                         activation_outcome = "STALE"
+                if completion_hook is not None:
+                    completion_hook(connection)
                 connection.execute(
                     "UPDATE job_attempts SET status='SUCCEEDED',ended_at=?,completion_evidence_json=?,activation_outcome=? WHERE id=?",
                     (stamp, evidence_json, activation_outcome, attempt_id),
