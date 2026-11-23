@@ -14,3 +14,42 @@
 .media-player h3 { margin: 0; font-size: 1rem; }
 .media-player video { display: block; width: min(100%, 52rem); max-height: 65vh; background: #171717; border-radius: .5rem; }
 .media-player small { color: var(--muted); }
+.asr-panel { display: grid; gap: .5rem; margin-top: 1.2rem; padding-top: 1rem; border-top: 1px solid var(--line); }
+.asr-panel h3, .asr-panel p { margin: 0; }
+.asr-panel h3 { font-size: 1rem; }
+.asr-panel p, .asr-panel small { color: var(--muted); font-size: .82rem; }
+.asr-panel select { width: min(100%, 26rem); padding: .5rem; border: 1px solid var(--line); border-radius: .4rem; }
+.asr-panel button { justify-self: start; }
+.processing-video { display: grid; gap: .3rem; max-width: 42rem; padding: .85rem; border: 1px solid var(--line); border-radius: .55rem; background: #fff; }
+.processing-video strong { font-size: .78rem; color: var(--muted); }
+.processing-video span { font-weight: 600; overflow-wrap: anywhere; }
+.processing-video small, .media-actions small { color: var(--muted); overflow-wrap: anywhere; font: .68rem var(--mono); }
+.processing-video button { margin-top: .3rem; }
+.asr-result { display: grid; gap: .4rem; margin-top: .5rem; }
+.asr-result p { color: var(--ink); }
+.asr-segments { display: grid; gap: .4rem; padding-left: 1.5rem; }
+.asr-segments li { display: grid; grid-template-columns: 8rem 1fr; gap: .3rem .6rem; padding: .55rem; border: 1px solid var(--line); border-radius: .45rem; }
+.asr-segments button { justify-self: start; border: 0; padding: 0; color: var(--green); background: transparent; font: 600 .8rem var(--mono); cursor: pointer; }
+.asr-segments span { white-space: pre-wrap; overflow-wrap: anywhere; }
+.asr-segments small { grid-column: 2; color: #a23f32; }
+.transcript-editor { display: grid; gap: .65rem; margin-top: 1.15rem; padding: 1rem; border: 1px solid var(--line); border-radius: .65rem; background: #fffdfa; }
+.transcript-editor>header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .5rem; }
+.transcript-editor>header h3 { margin: 0; }
+.transcript-editor>header small, .transcript-editor>p, .transcript-footer small { color: var(--muted); font-size: .78rem; }
+.transcript-state { padding: .3rem .5rem; border-radius: 1rem; background: #f2eee3; color: #76612c; font-size: .72rem; }
+.transcript-accepted { color: #365c43; background: #e9f2ea; }
+.transcript-editor select { width: min(100%, 28rem); padding: .5rem; border: 1px solid var(--line); border-radius: .4rem; }
+.transcript-segments { display: grid; gap: .55rem; max-height: 34rem; overflow: auto; padding: 0; list-style: none; }
+.transcript-segments li { display: grid; gap: .5rem; min-width: 0; padding: .75rem; border: 1px solid var(--line); border-radius: .5rem; background: white; }
+.transcript-segments li.transcript-segment-active { border-color: var(--green); box-shadow: 0 0 0 2px #537b6518; }
+.transcript-segment-heading { display: flex; flex-wrap: wrap; align-items: center; gap: .55rem; color: var(--muted); font-size: .75rem; }
+.transcript-segment-heading button { border: 0; padding: 0; color: var(--green); background: transparent; font: 600 .8rem var(--mono); cursor: pointer; }
+.transcript-segment-heading small { color: #a23f32; }
+.transcript-segments textarea { width: 100%; resize: vertical; padding: .55rem; border: 1px solid var(--line); border-radius: .4rem; font: inherit; line-height: 1.5; }
+.transcript-readonly-text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.transcript-footer { display: flex; flex-wrap: wrap; align-items: center; gap: .45rem; }
+.transcript-footer button { border: 1px solid var(--line); border-radius: .4rem; padding: .45rem .65rem; background: #f8f7f3; cursor: pointer; font-size: .75rem; }
+.transcript-footer button:disabled { opacity: .5; cursor: default; }
+.transcript-footer { padding-top: .5rem; border-top: 1px solid var(--line); }
+.transcript-footer button:last-child:not(:first-child) { color: white; border-color: var(--ink); background: var(--ink); }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }

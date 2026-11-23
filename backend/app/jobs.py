@@ -136,6 +136,26 @@ class JobService:
             for attempt in attempts
         ]
         latest = values[-1] if values else None
+        retry_block_reason = None
+        retry_available = False
+        if row["status"] in {"FAILED", "INTERRUPTED"}:
+            if latest is None or not latest["retryable"]:
+                retry_block_reason = "job_not_retryable"
+            elif len(values) >= MAX_ATTEMPTS:
+                retry_block_reason = "retry_limit_reached"
+            elif row["activation_stage"] is not None:
+                pointer = connection.execute(
+                    "SELECT input_fingerprint,input_generation,pointer_generation FROM stage_pointers WHERE project_id=? AND stage=?",
+                    (row["project_id"], row["activation_stage"]),
+                ).fetchone()
+                if (pointer is None or pointer["input_fingerprint"] != row["input_fingerprint"] or
+                    pointer["input_generation"] != row["expected_input_generation"] or
+                    pointer["pointer_generation"] != row["expected_pointer_generation"]):
+                    retry_block_reason = "job_stale"
+                else:
+                    retry_available = True
+            else:
+                retry_available = True
         return {
             "id": row["id"],
             "project_id": row["project_id"],
@@ -151,6 +171,8 @@ class JobService:
             "attempts": values,
             "progress": latest["progress"] if latest else None,
             "error_code": latest["error_code"] if latest else None,
+            "retry_available": retry_available,
+            "retry_block_reason": retry_block_reason,
             "activation_stage": row["activation_stage"],
             "expected_input_generation": row["expected_input_generation"],
             "expected_pointer_generation": row["expected_pointer_generation"],

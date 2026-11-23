@@ -370,6 +370,55 @@ class MediaImportService:
             items.append({"id": row["id"], "mode": row["mode"], "status": status, "display_name": row["display_name"], "sha256": row["sha256"], "file_size": row["file_size"], "metadata": json.loads(row["metadata_json"]), "created_at": row["created_at"], "lock_version": lock_version})
         return items
 
+    def get_processing_source(self, project_id: str, *, auto_select_single: bool = True) -> dict[str, Any]:
+        assets = {item["id"]: item for item in self.list_assets(project_id)}
+        with closing(self.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT media_asset_id,generation FROM project_processing_sources WHERE project_id=?", (project_id,)).fetchone()
+            if row is None and auto_select_single:
+                ready = [asset for asset in assets.values() if asset["status"] == "READY"]
+                if len(ready) == 1:
+                    stamp = utc_now()
+                    connection.execute(
+                        "INSERT INTO project_processing_sources(project_id,media_asset_id,generation,updated_at) VALUES(?,?,1,?)",
+                        (project_id, ready[0]["id"], stamp),
+                    )
+                    row = connection.execute("SELECT media_asset_id,generation FROM project_processing_sources WHERE project_id=?", (project_id,)).fetchone()
+            connection.commit()
+        if row is None:
+            return {"media_asset_id": None, "generation": 0, "status": "UNSELECTED", "asset": None}
+        asset = assets.get(row["media_asset_id"])
+        status = asset["status"] if asset else "MISSING"
+        return {"media_asset_id": row["media_asset_id"], "generation": row["generation"], "status": status, "asset": asset}
+
+    def select_processing_source(self, project_id: str, asset_id: str, expected_generation: int) -> dict[str, Any]:
+        if type(expected_generation) is not int or expected_generation < 0:
+            raise MediaError("invalid_source_generation")
+        assets = {item["id"]: item for item in self.list_assets(project_id)}
+        asset = assets.get(asset_id)
+        if asset is None:
+            raise MediaError("asset_not_found")
+        if asset["status"] != "READY":
+            raise MediaError("asset_unavailable" if asset["status"] == "MISSING" else "asset_changed")
+        with closing(self.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT media_asset_id,generation FROM project_processing_sources WHERE project_id=?", (project_id,)).fetchone()
+            current_generation = row["generation"] if row else 0
+            if current_generation != expected_generation:
+                connection.rollback()
+                raise MediaError("source_selection_conflict")
+            if row and row["media_asset_id"] == asset_id:
+                generation = row["generation"]
+            else:
+                generation = current_generation + 1
+                connection.execute(
+                    "INSERT INTO project_processing_sources(project_id,media_asset_id,generation,updated_at) VALUES(?,?,?,?) "
+                    "ON CONFLICT(project_id) DO UPDATE SET media_asset_id=excluded.media_asset_id,generation=excluded.generation,updated_at=excluded.updated_at",
+                    (project_id, asset_id, generation, utc_now()),
+                )
+            connection.commit()
+        return {"media_asset_id": asset_id, "generation": generation, "status": "READY", "asset": asset}
+
     def relink_asset(self, session_token: str, project_id: str, asset_id: str, selection_id: str,
                      expected_lock_version: int, idempotency_key: str) -> dict[str, Any]:
         try:
@@ -590,6 +639,49 @@ class MediaImportService:
         except BaseException:
             handle.close()
             raise
+
+    def get_transcription_source(self, project_id: str, asset_id: str) -> dict[str, Any]:
+        """Return an internal verified path snapshot for the supervised ASR worker only."""
+        with closing(self.database.connect()) as connection:
+            row = connection.execute("SELECT * FROM media_assets WHERE id=? AND project_id=?", (asset_id, project_id)).fetchone()
+        if row is None or row["status"] != "READY":
+            raise MediaError("asset_unavailable")
+        opened = self.open_media_stream(project_id, asset_id)
+        opened.handle.close()
+        if row["mode"] == "COPY":
+            artifact = self.artifacts.get_artifact(row["managed_artifact_id"], project_id)
+            path = self.artifacts._path(artifact["managed_relative_path"])
+        elif row["mode"] == "LINK":
+            path = Path(row["private_source_path"])
+        else:
+            raise MediaError("asset_unavailable")
+        identity = _path_identity(path)
+        if identity["size"] != row["file_size"] or _hash_file(path) != (row["sha256"], row["file_size"]):
+            self._mark_media_status(dict(row), "CHANGED")
+            raise MediaError("asset_changed")
+        return {
+            "asset_id": asset_id, "project_id": project_id, "mode": row["mode"], "path": path,
+            "sha256": row["sha256"], "file_size": row["file_size"],
+            "duration_us": json.loads(row["metadata_json"])["duration_us"], "identity": self._identity_tuple(identity),
+        }
+
+    def verify_transcription_source(self, snapshot: dict[str, Any]) -> bool:
+        path = snapshot["path"]
+        try:
+            identity = _path_identity(path)
+            unchanged = (
+                self._identity_tuple(identity) == snapshot["identity"] and
+                identity["size"] == snapshot["file_size"] and
+                _hash_file(path) == (snapshot["sha256"], snapshot["file_size"])
+            )
+        except (MediaError, OSError):
+            unchanged = False
+        if not unchanged:
+            with closing(self.database.connect()) as connection:
+                row = connection.execute("SELECT * FROM media_assets WHERE id=? AND project_id=?", (snapshot["asset_id"], snapshot["project_id"])).fetchone()
+            if row is not None:
+                self._mark_media_status(dict(row), "CHANGED")
+        return unchanged
 
     def stream_chunks(self, opened: OpenMedia, start: int, length: int) -> Iterator[bytes]:
         remaining = length

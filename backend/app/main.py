@@ -23,6 +23,8 @@ from app.artifacts import ArtifactPublicationService
 from app.jobs import JobConflict, JobInputError, JobNotFound, JobService
 from app.recovery import StartupRecovery
 from app.media import FFprobe, LinkManifestValidator, MediaError, MediaImportService, MediaImportWorker, SourceVideoValidator, parse_single_byte_range
+from app.asr import ASRConfig, ASRError, ASRService, ASRWorker, TranscriptArtifactValidator
+from app.transcripts import TranscriptError, TranscriptService
 
 
 SESSION_COOKIE = "autodub_session"
@@ -96,6 +98,8 @@ class JobRead(BaseModel):
     attempts: list[JobAttemptRead]
     progress: dict[str, object] | None
     error_code: str | None
+    retry_available: bool = False
+    retry_block_reason: str | None = None
 
 
 class EmptyJobRequest(BaseModel):
@@ -117,6 +121,62 @@ class RelinkRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     selection_id: str = Field(min_length=32, max_length=128)
     expected_lock_version: int = Field(ge=1)
+
+
+class ASRJobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    language: Literal["auto", "en", "zh"] = "auto"
+    allow_model_download: bool = False
+
+
+class ProcessingSourceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    media_asset_id: uuid.UUID
+    expected_generation: int = Field(ge=0)
+
+
+class TranscriptRevisionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_run_id: uuid.UUID | None = None
+    parent_revision_id: uuid.UUID | None = None
+
+
+class TranscriptSegmentEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    row_id: uuid.UUID
+    text: str | None = None
+    start_us: int | None = None
+    end_us: int | None = None
+
+
+class TranscriptRevisionSave(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_lock_version: int = Field(ge=1)
+    edits: list[TranscriptSegmentEdit] = Field(min_length=1, max_length=10000)
+
+
+class TranscriptSplitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_lock_version: int = Field(ge=1)
+    split_at_codepoint: int
+    split_at_us: int
+
+
+class TranscriptMergeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_lock_version: int = Field(ge=1)
+    merged_text: str
+
+
+class TranscriptReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_lock_version: int = Field(ge=1)
+
+
+class TranscriptAcceptRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_lock_version: int = Field(ge=1)
+    expected_active_revision_id: uuid.UUID | None = None
 
 
 def _is_loopback(address: str | None) -> bool:
@@ -149,6 +209,10 @@ def create_app(
     artifact_service.validators.update({"source_video": SourceVideoValidator(ffprobe), "media_link_manifest": LinkManifestValidator()})
     media_service = MediaImportService(database, job_service, artifact_service, ffprobe)
     media_worker = MediaImportWorker(media_service)
+    artifact_service.validators["transcript_json"] = TranscriptArtifactValidator()
+    asr_service = ASRService(database, job_service, artifact_service, media_service)
+    asr_worker = ASRWorker(asr_service)
+    transcript_service = TranscriptService(database)
     startup_recovery = StartupRecovery(database, job_service, artifact_service)
 
     @asynccontextmanager
@@ -157,9 +221,11 @@ def create_app(
         _app.state.recovery_report = startup_recovery.reconcile()
         _app.state.recovery_report["media_assets_recovered"] = media_service.reconcile_pending_assets()
         media_worker.start()
+        asr_worker.start()
         try:
             yield
         finally:
+            asr_worker.stop()
             media_worker.stop()
 
     app = FastAPI(
@@ -169,11 +235,13 @@ def create_app(
         openapi_url=None,
         lifespan=lifespan,
     )
+    app.state.transcript_service = transcript_service
     app.state.database = database
     app.state.artifact_service = artifact_service
     app.state.job_service = job_service
     app.state.startup_recovery = startup_recovery
     app.state.media_service = media_service
+    app.state.asr_service = asr_service
     expected_host = f"{host}:{port}"
     sessions: dict[str, Session] = {}
     secret_deadline = clock() + BOOTSTRAP_TTL_SECONDS
@@ -245,6 +313,16 @@ def create_app(
         if isinstance(exc, JobConflict):
             return api_error(409, exc.code, "The Job cannot make that state transition.")
         raise exc
+
+    def transcript_exception(exc: TranscriptError | IdempotencyConflict) -> JSONResponse:
+        code = exc.code if isinstance(exc, TranscriptError) else "idempotency_key_reused"
+        if code in {"transcript_revision_not_found", "transcription_run_not_found", "transcript_segment_not_found"}:
+            status = 404
+        elif code in {"transcript_revision_conflict", "transcript_active_revision_conflict", "transcript_input_stale", "transcript_revision_immutable", "transcript_parent_not_accepted", "transcript_review_required", "transcript_coverage_group_not_pending", "transcript_merge_incompatible", "transcript_source_coverage_duplicate"} or isinstance(exc, IdempotencyConflict):
+            status = 409
+        else:
+            status = 422
+        return api_error(status, code, "Không thể cập nhật lời thoại. Bản nháp đã lưu trước đó vẫn được giữ.")
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, exc: RequestValidationError):
@@ -459,6 +537,245 @@ def create_app(
         if database.get_project(str(parsed)) is None:
             return api_error(404, "project_not_found", "Project was not found.")
         return {"items": media_service.list_assets(str(parsed))}
+
+    @app.get("/api/v1/asr/models")
+    def list_asr_models(request: Request):
+        current = require_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        return asr_service.models()
+
+    @app.get("/api/v1/projects/{project_id}/processing-source")
+    def get_processing_source(project_id: str, request: Request):
+        current = require_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            parsed = uuid.UUID(project_id)
+            if str(parsed) != project_id.lower():
+                raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_project_id", "Project ID must be a canonical UUID.")
+        if database.get_project(str(parsed)) is None:
+            return api_error(404, "project_not_found", "Project was not found.")
+        return asr_service.get_processing_source(str(parsed))
+
+    @app.put("/api/v1/projects/{project_id}/processing-source")
+    def select_processing_source(project_id: str, body: ProcessingSourceRequest, request: Request):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            parsed = uuid.UUID(project_id)
+            if str(parsed) != project_id.lower():
+                raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_project_id", "Project ID must be a canonical UUID.")
+        if database.get_project(str(parsed)) is None:
+            return api_error(404, "project_not_found", "Project was not found.")
+        try:
+            return asr_service.select_processing_source(str(parsed), str(body.media_asset_id), body.expected_generation)
+        except MediaError as exc:
+            status = 409 if exc.code in {"source_selection_conflict", "asset_changed"} else 422 if exc.code == "invalid_source_generation" else 404
+            return api_error(status, exc.code, "Không thể chọn video xử lý. Kiểm tra trạng thái video rồi thử lại.")
+
+    @app.post("/api/v1/projects/{project_id}/asr/jobs", status_code=202)
+    def create_asr_job(project_id: str, body: ASRJobRequest, request: Request):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        key = request.headers.get("idempotency-key", "")
+        try:
+            parsed = uuid.UUID(project_id)
+            if str(parsed) != project_id.lower():
+                raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_project_id", "Project ID phải là UUID chuẩn.")
+        try:
+            result = asr_service.create_job(
+                str(parsed),
+                ASRConfig(model="base", language=None if body.language == "auto" else body.language,
+                          device="cpu", vad_enabled=True, beam_size=3, allow_cpu_fallback=False,
+                          allow_model_download=body.allow_model_download), key,
+            )
+            return result
+        except IdempotencyConflict:
+            return api_error(409, "idempotency_key_reused", "Idempotency-Key đã được dùng cho cấu hình khác.")
+        except ASRError as exc:
+            code = exc.code
+            status = 404 if code == "asset_unavailable" else 409 if code in {"model_download_consent_required", "source_changed", "asset_changed"} else 422
+            return api_error(status, code, "Không thể tạo ASR Job với đầu vào hiện tại.")
+        except (JobInputError, JobConflict) as exc:
+            code = exc.code if isinstance(exc, JobConflict) else str(exc)
+            return api_error(409 if isinstance(exc, JobConflict) else 422, code, "Không thể tạo ASR Job.")
+
+    @app.get("/api/v1/projects/{project_id}/asr/runs")
+    def list_asr_runs(project_id: str, request: Request):
+        current = require_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            parsed = uuid.UUID(project_id)
+            if str(parsed) != project_id.lower():
+                raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_project_id", "Project ID phải là UUID chuẩn.")
+        if database.get_project(str(parsed)) is None:
+            return api_error(404, "project_not_found", "Project was not found.")
+        return {"items": asr_service.list_runs(str(parsed))}
+
+    @app.get("/api/v1/projects/{project_id}/asr/runs/{run_id}")
+    def get_asr_run(project_id: str, run_id: str, request: Request):
+        current = require_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project = uuid.UUID(project_id)
+            run = uuid.UUID(run_id)
+            if str(project) != project_id.lower() or str(run) != run_id.lower():
+                raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_run_id", "Project và Run ID phải là UUID chuẩn.")
+        result = asr_service.get_run(str(project), str(run))
+        if result is None:
+            return api_error(404, "transcription_run_not_found", "Transcription Run không tồn tại.")
+        return result
+
+    @app.get("/api/v1/projects/{project_id}/transcripts")
+    def list_transcript_revisions(project_id: str, source_asset_id: str, request: Request):
+        current = require_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project, asset = uuid.UUID(project_id), uuid.UUID(source_asset_id)
+            if str(project) != project_id.lower() or str(asset) != source_asset_id.lower():
+                raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_transcript_query", "Project và Asset ID phải là UUID chuẩn.")
+        if database.get_project(str(project)) is None:
+            return api_error(404, "project_not_found", "Project was not found.")
+        return {"items": transcript_service.list_revisions(str(project), str(asset))}
+
+    @app.post("/api/v1/projects/{project_id}/transcripts/revisions", status_code=201)
+    def create_transcript_draft(project_id: str, body: TranscriptRevisionCreate, request: Request):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project = uuid.UUID(project_id)
+            if str(project) != project_id.lower():
+                raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_project_id", "Project ID phải là UUID chuẩn.")
+        if database.get_project(str(project)) is None:
+            return api_error(404, "project_not_found", "Project was not found.")
+        try:
+            result = transcript_service.create_draft(
+                str(project), source_run_id=str(body.source_run_id) if body.source_run_id else None,
+                parent_revision_id=str(body.parent_revision_id) if body.parent_revision_id else None,
+                idempotency_key=request.headers.get("idempotency-key", ""),
+            )
+            return JSONResponse(status_code=201, content=result)
+        except (TranscriptError, IdempotencyConflict) as exc:
+            return transcript_exception(exc)
+
+    @app.get("/api/v1/projects/{project_id}/transcripts/revisions/{revision_id}")
+    def get_transcript_revision(project_id: str, revision_id: str, request: Request):
+        current = require_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project, revision = uuid.UUID(project_id), uuid.UUID(revision_id)
+            if str(project) != project_id.lower() or str(revision) != revision_id.lower():
+                raise ValueError
+            return transcript_service.get_revision(str(project), str(revision))
+        except ValueError:
+            return api_error(422, "invalid_revision_id", "Project và Revision ID phải là UUID chuẩn.")
+        except TranscriptError as exc:
+            return transcript_exception(exc)
+
+    @app.patch("/api/v1/projects/{project_id}/transcripts/revisions/{revision_id}")
+    def save_transcript_draft(project_id: str, revision_id: str, body: TranscriptRevisionSave, request: Request):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project, revision = uuid.UUID(project_id), uuid.UUID(revision_id)
+            if str(project) != project_id.lower() or str(revision) != revision_id.lower():
+                raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_revision_id", "Project và Revision ID phải là UUID chuẩn.")
+        try:
+            return transcript_service.save_edits(
+                str(project), str(revision), body.expected_lock_version,
+                [edit.model_dump(mode="json", exclude_unset=True) for edit in body.edits], request.headers.get("idempotency-key", ""),
+            )
+        except (TranscriptError, IdempotencyConflict) as exc:
+            return transcript_exception(exc)
+
+    @app.post("/api/v1/projects/{project_id}/transcripts/revisions/{revision_id}/segments/{row_id}/split")
+    def split_transcript_segment(project_id: str, revision_id: str, row_id: str, body: TranscriptSplitRequest, request: Request):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project, revision, row = uuid.UUID(project_id), uuid.UUID(revision_id), uuid.UUID(row_id)
+            if str(project) != project_id.lower() or str(revision) != revision_id.lower() or str(row) != row_id.lower():
+                raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_revision_id", "Project, Revision và Segment ID phải là UUID chuẩn.")
+        try:
+            return transcript_service.split_segment(str(project), str(revision), str(row), body.expected_lock_version, body.split_at_codepoint, body.split_at_us, request.headers.get("idempotency-key", ""))
+        except (TranscriptError, IdempotencyConflict) as exc:
+            return transcript_exception(exc)
+
+    @app.post("/api/v1/projects/{project_id}/transcripts/revisions/{revision_id}/segments/{row_id}/merge-next")
+    def merge_transcript_segment(project_id: str, revision_id: str, row_id: str, body: TranscriptMergeRequest, request: Request):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project, revision, row = uuid.UUID(project_id), uuid.UUID(revision_id), uuid.UUID(row_id)
+            if str(project) != project_id.lower() or str(revision) != revision_id.lower() or str(row) != row_id.lower():
+                raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_revision_id", "Project, Revision và Segment ID phải là UUID chuẩn.")
+        try:
+            return transcript_service.merge_next(str(project), str(revision), str(row), body.expected_lock_version, body.merged_text, request.headers.get("idempotency-key", ""))
+        except (TranscriptError, IdempotencyConflict) as exc:
+            return transcript_exception(exc)
+
+    @app.post("/api/v1/projects/{project_id}/transcripts/revisions/{revision_id}/coverage-groups/{group_id}/review")
+    def review_transcript_coverage_group(project_id: str, revision_id: str, group_id: str, body: TranscriptReviewRequest, request: Request):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project, revision, group = uuid.UUID(project_id), uuid.UUID(revision_id), uuid.UUID(group_id)
+            if str(project) != project_id.lower() or str(revision) != revision_id.lower() or str(group) != group_id.lower():
+                raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_revision_id", "Project, Revision và Coverage ID phải là UUID chuẩn.")
+        try:
+            return transcript_service.review_group(str(project), str(revision), str(group), body.expected_lock_version, request.headers.get("idempotency-key", ""))
+        except (TranscriptError, IdempotencyConflict) as exc:
+            return transcript_exception(exc)
+
+    @app.post("/api/v1/projects/{project_id}/transcripts/revisions/{revision_id}/accept")
+    def accept_transcript_revision(project_id: str, revision_id: str, body: TranscriptAcceptRequest, request: Request):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project, revision = uuid.UUID(project_id), uuid.UUID(revision_id)
+            if str(project) != project_id.lower() or str(revision) != revision_id.lower():
+                raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_revision_id", "Project và Revision ID phải là UUID chuẩn.")
+        try:
+            return transcript_service.accept(str(project), str(revision), body.expected_lock_version, str(body.expected_active_revision_id) if body.expected_active_revision_id else None, request.headers.get("idempotency-key", ""))
+        except (TranscriptError, IdempotencyConflict) as exc:
+            return transcript_exception(exc)
 
     @app.api_route("/api/v1/projects/{project_id}/media/{asset_id}/stream", methods=["GET", "HEAD"])
     def stream_project_media(project_id: str, asset_id: str, request: Request):

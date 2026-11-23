@@ -209,14 +209,16 @@ class ArtifactPublicationTests(unittest.TestCase):
         with self.assertRaisesRegex(ArtifactConflict, "producer_not_running"):
             self.publish()
 
-    def test_migration_v6_is_additive_and_repeatable(self):
+    def test_migration_v8_is_additive_and_repeatable(self):
         with closing(self.app.state.database.connect()) as connection:
-            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 6)
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 9)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 1)
+            self.assertIsNotNone(connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_processing_sources'").fetchone())
         self.app.state.database.initialize()
         with closing(self.app.state.database.connect()) as connection:
-            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 6)
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 9)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 1)
+            self.assertIsNotNone(connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_processing_sources'").fetchone())
 
 
 if __name__ == "__main__":

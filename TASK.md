@@ -18,20 +18,24 @@
 - [ ] SQLite WAL/foreign keys/migrations, API errors, loopback-only API and local settings.
 - [ ] Minimal single-machine durable Job/Attempt status, cancellation and startup reconciliation.
 - [ ] Atomic file staging → validation → publish, no orphan files misreported as READY.
-- [x] **G1:** Product Owner accepted after Windows restart/recovery verification (2026-11-23); this does not imply G2 acceptance.
+- [x] **G1:** Product Owner accepted after Windows restart/recovery verification (2026-11-23); G2 acceptance is recorded separately below.
 
 ### MEDIA-01 — Local media
 - [x] **MEDIA-01A implementation + automated checks:** additive migration v5, Windows helper selection, durable COPY/LINK Import Job, FFprobe metadata and UI; 58 backend tests and frontend build pass. Manual desktop acceptance is BLOCKED; see CHANGELOG.
-- [x] **MEDIA-01A-FIX:** FastAPI body model scope corrected; COPY/LINK API integration plus atomic Job/MediaAsset READY verified (60 backend tests); G2 remains unaccepted.
+- [x] **MEDIA-01A-FIX:** FastAPI body model scope corrected; COPY/LINK API integration plus atomic Job/MediaAsset READY verified (60 backend tests); G2 was still pending at this slice and was accepted later as recorded below.
 - [ ] **MEDIA-01A Windows manual acceptance:** native picker, real-user-video COPY/LINK, visible metadata and restart persistence — BLOCKED (desktop automation unavailable; launcher ports occupied).
 - [ ] Copy/link source, choose local data/export paths; keep browser path selection safe.
 - [ ] FFprobe metadata, HTTP Range player, Unicode paths, missing-source relink.
-- [x] **MEDIA-01B automated implementation slice:** migration v6 relink contracts, guarded GET/HEAD Range playback, verified COPY/LINK source checks and same-content relink CAS; backend suite (64 tests), frontend build and helper parser pass. Browser/native picker/manual G2 acceptance remains NOT RUN/BLOCKED; see CHANGELOG.
-- [ ] **G2:** Play/source-relink and safe delete verified.
+- [x] **MEDIA-01B automated implementation slice:** migration v6 relink contracts, guarded GET/HEAD Range playback, verified COPY/LINK source checks and same-content relink CAS; backend suite (64 tests), frontend build and helper parser pass. Browser/native picker manual acceptance was NOT RUN/BLOCKED at this slice; PO G2 acceptance was subsequently recorded below.
+- [x] **G2:** Product Owner accepted (2026-11-23; per explicit ASR-01A handoff).
 
 ### ASR-01 — Faster-Whisper
-- [ ] Source extraction, language/VAD/model/device controls and measured hardware fallback.
-- [ ] Segment timestamps and correction review; no fake transcript.
+- [x] **ASR-01A implementation slice:** real FFmpeg extraction, pinned Faster-Whisper adapter, model/device/VAD controls, durable immutable runs/segments and API/UI; 77 backend tests, frontend build and Windows launcher smoke pass. Real speech inference is NOT RUN; G3 remains pending PO acceptance (see CHANGELOG).
+- [x] **ASR-01A-UX-REFINE automated slice:** persistent Project processing-source selection (migration v8), source/generation snapshots and stale activation guard, separated Play/source actions, simplified language/model-consent UI and backend CPU defaults; covered by backend tests and frontend build. Browser visual acceptance BLOCKED by unavailable native pipe; see CHANGELOG.
+- [x] **ASR-01A-INFERENCE-FIX:** reproduced Faster-Whisper/PyAV incompatibility, pinned compatible PyAV, verified real CPU inference and SQLite restart readback; retry availability now comes from backend and terminal UI states hide active phase. Backend suite (84 tests) and frontend build pass; launcher/browser interaction blocked, G3 remains pending PO acceptance (see CHANGELOG).
+- [x] FFmpeg source extraction, language/VAD/model/device controls and explicit CPU fallback policy covered by automated tests; real device inference measurements remain pending G3.
+- [x] **ASR-01B transcript revision automated slice:** immutable ASR source, editable text drafts, split/merge lineage contracts, transactional acceptance and history; backend tests and frontend build pass. UX correction keeps timing read-only and hides split/merge controls; browser interaction acceptance remains NOT RUN (see CHANGELOG).
+- [ ] **ASR-01B-UX-SIMPLIFY manual acceptance:** exercise edit/cancel/save/approve/re-edit/history/restart in Windows browser. Automated backend regression and frontend build pass; interaction test NOT RUN (see CHANGELOG).
 - [ ] **G3:** Real media/no-audio/VFR handling tested.
 
 ### TRANS-01 — Gemini

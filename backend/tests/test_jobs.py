@@ -86,7 +86,7 @@ class DurableJobTests(unittest.TestCase):
         )
         return self.artifacts.completion_evidence(job["id"], claimed["attempt"]["id"], [artifact["id"]])
 
-    def test_migrations_v4_through_v6_preserve_core_01a_b_c_data(self):
+    def test_migrations_v4_through_v9_preserve_core_01a_b_c_data(self):
         legacy_root = Path(self.temp.name) / "legacy"
         legacy = Database(legacy_root)
         legacy.initialize(target_version=1)
@@ -110,13 +110,13 @@ class DurableJobTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 3)
         legacy.initialize()
         with closing(legacy.connect()) as connection:
-            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 6)
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 9)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM projects WHERE id=?", (project["id"],)).fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM jobs WHERE id=?", (job_id,)).fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM job_attempts WHERE id=?", (attempt_id,)).fetchone()[0], 1)
         legacy.initialize()
         with closing(legacy.connect()) as connection:
-            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 6)
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 9)
 
     def test_running_job_and_attempt_are_interrupted_on_backend_restart(self):
         job = self.create_job()
@@ -256,6 +256,23 @@ class DurableJobTests(unittest.TestCase):
         with self.assertRaisesRegex(JobConflict, "retry_limit_reached"):
             self.service.retry_job(bounded["id"], "FAILED", "job-retry-cap-final-key-01")
         self.assertEqual(len(self.service.get_job(bounded["id"])["attempts"]), 3)
+        self.assertFalse(self.service.get_job(bounded["id"])["retry_available"])
+        self.assertEqual(self.service.get_job(bounded["id"])["retry_block_reason"], "retry_limit_reached")
+
+    def test_job_api_reports_retry_availability_and_limit_to_ui(self):
+        job = self.create_job(key="job-api-retry-state-create-01")
+        for attempt_no in range(1, 4):
+            claimed = self.claim(job)
+            self.service.fail_attempt(job["id"], claimed["attempt"]["id"], "temporary_error", retryable=True)
+            response = self.client.get(f"/api/v1/jobs/{job['id']}", headers=self.headers)
+            self.assertEqual(response.status_code, 200)
+            if attempt_no < 3:
+                self.assertTrue(response.json()["retry_available"])
+                self.assertIsNone(response.json()["retry_block_reason"])
+                job = self.service.retry_job(job["id"], "FAILED", f"job-api-retry-state-{attempt_no:02d}")
+            else:
+                self.assertFalse(response.json()["retry_available"])
+                self.assertEqual(response.json()["retry_block_reason"], "retry_limit_reached")
 
     def test_unverified_completion_and_invalid_transitions_are_rejected(self):
         job = self.create_job()

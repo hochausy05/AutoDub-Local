@@ -143,7 +143,7 @@ class LocalApiSmokeTests(unittest.TestCase):
         reopened = TestClient(create_app("next-secret", data_root=self.data_root), client=("127.0.0.1", 50001))
         with reopened:
             with closing(reopened.app.state.database.connect()) as connection:
-                self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 6)
+                self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 9)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 1)
                 self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
                 self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")

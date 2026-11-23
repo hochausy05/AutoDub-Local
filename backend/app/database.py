@@ -14,7 +14,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 9
 BUSY_TIMEOUT_MS = 5000
 
 
@@ -316,6 +316,194 @@ class Database:
                     for statement in statements:
                         connection.execute(statement)
                     connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (6, utc_now()))
+                    current = 6
+                if current < 7 and target_version >= 7:
+                    statements = (
+                        """CREATE TABLE transcription_runs (
+                            id TEXT PRIMARY KEY NOT NULL,
+                            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+                            source_asset_id TEXT NOT NULL,
+                            artifact_id TEXT NOT NULL,
+                            input_fingerprint TEXT NOT NULL CHECK(length(input_fingerprint)=64 AND input_fingerprint NOT GLOB '*[^a-f0-9]*'),
+                            model_id TEXT NOT NULL,
+                            model_revision TEXT NOT NULL,
+                            faster_whisper_version TEXT NOT NULL,
+                            ctranslate2_version TEXT NOT NULL,
+                            language TEXT,
+                            language_probability REAL CHECK(language_probability IS NULL OR (language_probability>=0 AND language_probability<=1)),
+                            vad_enabled INTEGER NOT NULL CHECK(vad_enabled IN (0,1)),
+                            requested_device TEXT NOT NULL CHECK(requested_device IN ('auto','cpu','cuda')),
+                            actual_device TEXT NOT NULL CHECK(actual_device IN ('cpu','cuda')),
+                            compute_type TEXT NOT NULL,
+                            status TEXT NOT NULL CHECK(status IN ('READY','NO_SPEECH','REVIEW_REQUIRED')),
+                            duration_us INTEGER NOT NULL CHECK(duration_us>0),
+                            audio_start_offset_us INTEGER NOT NULL,
+                            timing_json TEXT NOT NULL CHECK(json_valid(timing_json)),
+                            provenance_json TEXT NOT NULL CHECK(json_valid(provenance_json)),
+                            created_at TEXT NOT NULL,
+                            completed_at TEXT NOT NULL,
+                            UNIQUE(project_id,id),
+                            UNIQUE(project_id,artifact_id),
+                            FOREIGN KEY(project_id,source_asset_id) REFERENCES media_assets(project_id,id) ON DELETE RESTRICT,
+                            FOREIGN KEY(project_id,artifact_id) REFERENCES artifacts(project_id,id) ON DELETE RESTRICT
+                        )""",
+                        "CREATE INDEX transcription_runs_project_idx ON transcription_runs(project_id,created_at DESC,id)",
+                        """CREATE TABLE segments (
+                            id TEXT PRIMARY KEY NOT NULL,
+                            project_id TEXT NOT NULL,
+                            run_id TEXT NOT NULL,
+                            position INTEGER NOT NULL CHECK(position>=0),
+                            start_us INTEGER NOT NULL CHECK(start_us>=0),
+                            end_us INTEGER NOT NULL CHECK(end_us>start_us),
+                            source_text TEXT NOT NULL CHECK(length(source_text)>0),
+                            avg_logprob REAL,
+                            no_speech_prob REAL CHECK(no_speech_prob IS NULL OR (no_speech_prob>=0 AND no_speech_prob<=1)),
+                            compression_ratio REAL CHECK(compression_ratio IS NULL OR compression_ratio>=0),
+                            flags_json TEXT NOT NULL CHECK(json_valid(flags_json)),
+                            UNIQUE(run_id,position),
+                            UNIQUE(project_id,run_id,id),
+                            FOREIGN KEY(project_id,run_id) REFERENCES transcription_runs(project_id,id) ON DELETE RESTRICT
+                        )""",
+                        "CREATE INDEX segments_run_order_idx ON segments(run_id,position)",
+                        "CREATE TRIGGER transcription_runs_immutable_update BEFORE UPDATE ON transcription_runs BEGIN SELECT RAISE(ABORT, 'transcription runs are immutable'); END",
+                        "CREATE TRIGGER transcription_runs_immutable_delete BEFORE DELETE ON transcription_runs BEGIN SELECT RAISE(ABORT, 'transcription runs are immutable'); END",
+                        "CREATE TRIGGER segments_immutable_update BEFORE UPDATE ON segments BEGIN SELECT RAISE(ABORT, 'ASR segments are immutable'); END",
+                        "CREATE TRIGGER segments_immutable_delete BEFORE DELETE ON segments BEGIN SELECT RAISE(ABORT, 'ASR segments are immutable'); END",
+                    )
+                    for statement in statements:
+                        connection.execute(statement)
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (7, utc_now()))
+                    current = 7
+                if current < 8 and target_version >= 8:
+                    connection.execute(
+                        """CREATE TABLE project_processing_sources (
+                            project_id TEXT PRIMARY KEY NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+                            media_asset_id TEXT NOT NULL,
+                            generation INTEGER NOT NULL CHECK(generation>=1),
+                            updated_at TEXT NOT NULL,
+                            FOREIGN KEY(project_id,media_asset_id) REFERENCES media_assets(project_id,id) ON DELETE RESTRICT
+                        )"""
+                    )
+                    connection.execute("CREATE INDEX project_processing_source_asset_idx ON project_processing_sources(project_id,media_asset_id)")
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (8, utc_now()))
+                    current = 8
+                if current < 9 and target_version >= 9:
+                    statements = (
+                        """CREATE TABLE transcript_revisions (
+                            id TEXT PRIMARY KEY NOT NULL,
+                            project_id TEXT NOT NULL,
+                            run_id TEXT NOT NULL,
+                            parent_revision_id TEXT,
+                            revision_no INTEGER NOT NULL CHECK(revision_no>=1),
+                            status TEXT NOT NULL CHECK(status IN ('DRAFT','ACCEPTED')),
+                            lock_version INTEGER NOT NULL DEFAULT 1 CHECK(lock_version>=1),
+                            schema_version INTEGER NOT NULL DEFAULT 1 CHECK(schema_version>=1),
+                            created_at TEXT NOT NULL,
+                            accepted_at TEXT,
+                            UNIQUE(project_id,id),
+                            UNIQUE(run_id,revision_no),
+                            FOREIGN KEY(project_id,run_id) REFERENCES transcription_runs(project_id,id) ON DELETE RESTRICT,
+                            FOREIGN KEY(project_id,parent_revision_id) REFERENCES transcript_revisions(project_id,id) ON DELETE RESTRICT,
+                            CHECK((status='DRAFT' AND accepted_at IS NULL) OR (status='ACCEPTED' AND accepted_at IS NOT NULL))
+                        )""",
+                        "CREATE UNIQUE INDEX transcript_one_draft_per_run_idx ON transcript_revisions(project_id,run_id) WHERE status='DRAFT'",
+                        "CREATE INDEX transcript_revisions_history_idx ON transcript_revisions(project_id,run_id,revision_no DESC)",
+                        """CREATE TABLE revision_segments (
+                            row_id TEXT PRIMARY KEY NOT NULL,
+                            project_id TEXT NOT NULL,
+                            revision_id TEXT NOT NULL,
+                            stable_segment_key TEXT NOT NULL,
+                            position INTEGER NOT NULL CHECK(position>=0),
+                            text TEXT NOT NULL CHECK(length(text)>0),
+                            start_us INTEGER NOT NULL CHECK(start_us>=0),
+                            end_us INTEGER NOT NULL CHECK(end_us>start_us),
+                            UNIQUE(project_id,revision_id,row_id),
+                            UNIQUE(revision_id,stable_segment_key),
+                            UNIQUE(revision_id,position),
+                            FOREIGN KEY(project_id,revision_id) REFERENCES transcript_revisions(project_id,id) ON DELETE RESTRICT
+                        )""",
+                        "CREATE INDEX revision_segments_order_idx ON revision_segments(revision_id,position)",
+                        "CREATE UNIQUE INDEX segments_project_id_unique_v9 ON segments(project_id,id)",
+                        """CREATE TABLE revision_segment_parents (
+                            project_id TEXT NOT NULL,
+                            child_revision_id TEXT NOT NULL,
+                            child_row_id TEXT NOT NULL,
+                            parent_revision_id TEXT NOT NULL,
+                            parent_stable_segment_key TEXT NOT NULL,
+                            ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+                            PRIMARY KEY(child_revision_id,child_row_id,ordinal),
+                            FOREIGN KEY(project_id,child_revision_id,child_row_id) REFERENCES revision_segments(project_id,revision_id,row_id) ON DELETE RESTRICT,
+                            FOREIGN KEY(project_id,parent_revision_id) REFERENCES transcript_revisions(project_id,id) ON DELETE RESTRICT,
+                            CHECK(child_revision_id<>parent_revision_id OR length(parent_stable_segment_key)>0)
+                        )""",
+                        """CREATE TABLE coverage_groups (
+                            group_id TEXT PRIMARY KEY NOT NULL,
+                            project_id TEXT NOT NULL,
+                            revision_id TEXT NOT NULL,
+                            review_status TEXT NOT NULL CHECK(review_status IN ('PENDING','REVIEWED')),
+                            disposition TEXT NOT NULL CHECK(disposition IN ('INCLUDED','SKIPPED')),
+                            skip_reason TEXT,
+                            UNIQUE(project_id,revision_id,group_id),
+                            FOREIGN KEY(project_id,revision_id) REFERENCES transcript_revisions(project_id,id) ON DELETE RESTRICT,
+                            CHECK((disposition='SKIPPED' AND skip_reason IS NOT NULL AND length(trim(skip_reason))>0) OR (disposition='INCLUDED' AND skip_reason IS NULL))
+                        )""",
+                        """CREATE TABLE coverage_group_sources (
+                            project_id TEXT NOT NULL,
+                            revision_id TEXT NOT NULL,
+                            group_id TEXT NOT NULL,
+                            source_id TEXT NOT NULL,
+                            ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+                            PRIMARY KEY(revision_id,source_id),
+                            UNIQUE(group_id,ordinal),
+                            FOREIGN KEY(project_id,revision_id,group_id) REFERENCES coverage_groups(project_id,revision_id,group_id) ON DELETE RESTRICT,
+                            FOREIGN KEY(project_id,source_id) REFERENCES segments(project_id,id) ON DELETE RESTRICT
+                        )""",
+                        """CREATE TABLE coverage_group_members (
+                            project_id TEXT NOT NULL,
+                            revision_id TEXT NOT NULL,
+                            group_id TEXT NOT NULL,
+                            row_id TEXT NOT NULL,
+                            ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+                            PRIMARY KEY(revision_id,row_id),
+                            UNIQUE(group_id,ordinal),
+                            FOREIGN KEY(project_id,revision_id,group_id) REFERENCES coverage_groups(project_id,revision_id,group_id) ON DELETE RESTRICT,
+                            FOREIGN KEY(project_id,revision_id,row_id) REFERENCES revision_segments(project_id,revision_id,row_id) ON DELETE RESTRICT
+                        )""",
+                        """CREATE TABLE project_active_transcript_revisions (
+                            project_id TEXT PRIMARY KEY NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+                            revision_id TEXT NOT NULL,
+                            generation INTEGER NOT NULL CHECK(generation>=1),
+                            updated_at TEXT NOT NULL,
+                            FOREIGN KEY(project_id,revision_id) REFERENCES transcript_revisions(project_id,id) ON DELETE RESTRICT
+                        )""",
+                        """CREATE TRIGGER accepted_transcript_revision_immutable BEFORE UPDATE ON transcript_revisions
+                            WHEN OLD.status='ACCEPTED' BEGIN SELECT RAISE(ABORT, 'accepted transcript revision is immutable'); END""",
+                        """CREATE TRIGGER accepted_transcript_revision_delete_guard BEFORE DELETE ON transcript_revisions
+                            WHEN OLD.status='ACCEPTED' BEGIN SELECT RAISE(ABORT, 'accepted transcript revision cannot be deleted'); END""",
+                    )
+                    for statement in statements:
+                        connection.execute(statement)
+                    for table in ("revision_segments", "revision_segment_parents", "coverage_groups", "coverage_group_sources", "coverage_group_members"):
+                        revision_column = "child_revision_id" if table == "revision_segment_parents" else "revision_id"
+                        connection.execute(
+                            f"""CREATE TRIGGER {table}_draft_insert_guard BEFORE INSERT ON {table}
+                                WHEN (SELECT status FROM transcript_revisions WHERE id=NEW.{revision_column}) <> 'DRAFT'
+                                BEGIN SELECT RAISE(ABORT, 'transcript revision is immutable'); END"""
+                        )
+                        connection.execute(
+                            f"""CREATE TRIGGER {table}_draft_update_guard BEFORE UPDATE ON {table}
+                                WHEN (SELECT status FROM transcript_revisions WHERE id=OLD.{revision_column}) <> 'DRAFT'
+                                  OR (SELECT status FROM transcript_revisions WHERE id=NEW.{revision_column}) <> 'DRAFT'
+                                BEGIN SELECT RAISE(ABORT, 'transcript revision is immutable'); END"""
+                        )
+                        connection.execute(
+                            f"""CREATE TRIGGER {table}_draft_delete_guard BEFORE DELETE ON {table}
+                                WHEN (SELECT status FROM transcript_revisions WHERE id=OLD.{revision_column}) <> 'DRAFT'
+                                BEGIN SELECT RAISE(ABORT, 'transcript revision is immutable'); END"""
+                        )
+                    connection.execute("CREATE TRIGGER active_transcript_revision_accepted_insert BEFORE INSERT ON project_active_transcript_revisions WHEN (SELECT status FROM transcript_revisions WHERE id=NEW.revision_id)<>'ACCEPTED' BEGIN SELECT RAISE(ABORT, 'active transcript revision must be accepted'); END")
+                    connection.execute("CREATE TRIGGER active_transcript_revision_accepted_update BEFORE UPDATE ON project_active_transcript_revisions WHEN (SELECT status FROM transcript_revisions WHERE id=NEW.revision_id)<>'ACCEPTED' BEGIN SELECT RAISE(ABORT, 'active transcript revision must be accepted'); END")
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (9, utc_now()))
                 connection.commit()
             except BaseException:
                 connection.rollback()

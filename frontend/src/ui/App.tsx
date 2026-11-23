@@ -1,13 +1,52 @@
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { fetchBackendHealth, type BackendHealth } from "../api/health";
 import { createProject, fetchProjects, type Project } from "../api/projects";
 import { establishSession } from "../api/session";
-import { chooseSource, fetchMedia, getImportJob, importSelected, mediaStreamUrl, relinkMedia, type ImportJob, type MediaAsset } from "../api/media";
+import { acceptTranscriptRevision, cancelLocalJob, chooseSource, createASRJob, createTranscriptDraft, fetchASRModels, fetchASRRun, fetchASRRuns, fetchMedia, fetchProcessingSource, fetchTranscriptRevision, fetchTranscriptRevisions, getImportJob, importSelected, mediaStreamUrl, relinkMedia, retryLocalJob, saveTranscriptDraft, selectProcessingSource, type ASRJob, type ASRRun, type ASRRunSummary, type ImportJob, type MediaAsset, type ProcessingSource, type TranscriptRevision } from "../api/media";
 
 type Connection =
   | { state: "checking"; message: string; health: null }
   | { state: "online"; message: string; health: BackendHealth }
   | { state: "offline"; message: string; health: null };
+
+function asrPhaseLabel(phase?: string) {
+  if (phase === "extracting_audio") return "Đang chuẩn bị video";
+  if (phase === "loading_model") return "Đang chuẩn bị dữ liệu nhận diện";
+  if (phase === "transcribing") return "Đang nhận diện lời thoại";
+  if (phase === "publishing_transcript") return "Đang lưu kết quả";
+  return phase ? "Đang xử lý" : "";
+}
+
+function asrFailureLabel(code?: string | null) {
+  const messages: Record<string, string> = {
+    asr_inference_failed: "Không thể hoàn tất nhận diện. Kết quả cũ vẫn được giữ; xem nhật ký chẩn đoán cục bộ để biết chi tiết.",
+    model_download_failed: "Không tải được dữ liệu nhận diện. Kiểm tra kết nối Internet rồi thử lại.",
+    insufficient_model_disk_space: "Không đủ dung lượng trống để tải dữ liệu nhận diện.",
+    no_audio_stream: "Video không có âm thanh để nhận diện.",
+    asset_unavailable: "Không tìm thấy video nguồn. Chọn lại video hoặc relink file LINK.",
+    asset_changed: "Video nguồn đã thay đổi. Kiểm tra hoặc chọn lại file rồi thử lại.",
+  };
+  return code ? `${messages[code] ?? "Nhận diện chưa hoàn tất. Kiểm tra video rồi thử lại nếu được phép."} (${code})` : "Nhận diện chưa hoàn tất.";
+}
+
+function formatSeconds(microseconds: number) {
+  return (microseconds / 1_000_000).toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function sourceTranscriptDraft(run: ASRRun, projectId: string): TranscriptRevision {
+  return {
+    id: "", project_id: projectId, run_id: run.id, source_asset_id: run.source_asset_id,
+    parent_revision_id: null, revision_no: 0, status: "DRAFT", lock_version: 0,
+    created_at: run.created_at, accepted_at: null, is_active: false, is_current: false,
+    active_generation: 0, run_status: run.status, duration_us: run.duration_us,
+    segments: run.segments.map((segment) => ({
+      row_id: segment.id, stable_segment_key: segment.id, position: segment.position,
+      text: segment.source_text, start_us: segment.start_us, end_us: segment.end_us,
+      parent_keys: [], coverage_group_id: null, coverage_status: "REVIEWED",
+      source_segment_ids: [segment.id], source_texts: [segment.source_text], timing_warning: false,
+    })),
+  };
+}
 
 export function App() {
   const [connection, setConnection] = useState<Connection>({
@@ -27,7 +66,39 @@ export function App() {
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [selectingMedia, setSelectingMedia] = useState(false);
   const [selectedMediaId, setSelectedMediaId] = useState("");
+  const [playingMediaId, setPlayingMediaId] = useState("");
+  const [processingSource, setProcessingSource] = useState<ProcessingSource | null>(null);
+  const [savingProcessingSource, setSavingProcessingSource] = useState(false);
   const [relinkingAssetId, setRelinkingAssetId] = useState("");
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const pendingSeek = useRef<{ assetId: string; timeSeconds: number } | null>(null);
+  const [asrModelCached, setAsrModelCached] = useState(false);
+  const [asrLanguage, setAsrLanguage] = useState("auto");
+  const [asrJob, setAsrJob] = useState<ASRJob | null>(null);
+  const [asrJobSourceId, setAsrJobSourceId] = useState("");
+  const [asrRuns, setAsrRuns] = useState<ASRRunSummary[]>([]);
+  const [selectedRun, setSelectedRun] = useState<ASRRun | null>(null);
+  const [asrError, setAsrError] = useState<string | null>(null);
+  const [startingASR, setStartingASR] = useState(false);
+  const [asrActionBusy, setAsrActionBusy] = useState(false);
+  const [transcriptRevisions, setTranscriptRevisions] = useState<TranscriptRevision[]>([]);
+  const [transcriptRevision, setTranscriptRevision] = useState<TranscriptRevision | null>(null);
+  const [transcriptDirty, setTranscriptDirty] = useState(false);
+  const [transcriptEditing, setTranscriptEditing] = useState(false);
+  const [transcriptSaving, setTranscriptSaving] = useState(false);
+  const [transcriptError, setTranscriptError] = useState<string | null>(null);
+  const savedTranscript = useRef<TranscriptRevision | null>(null);
+  const cancelToOriginal = useRef(false);
+  const [videoPlayheadUs, setVideoPlayheadUs] = useState(0);
+
+  const installTranscript = useCallback((revision: TranscriptRevision | null) => {
+    setTranscriptRevision(revision);
+    savedTranscript.current = revision;
+    cancelToOriginal.current = false;
+    setTranscriptDirty(false);
+    setTranscriptEditing(false);
+    setTranscriptError(null);
+  }, []);
 
   const check = useCallback(async (signal?: AbortSignal) => {
     try {
@@ -72,7 +143,72 @@ export function App() {
     catch (error) { setMediaError(error instanceof Error ? error.message : "Không tải được media."); }
   }, []);
 
+  const refreshProcessingSource = useCallback(async (projectId: string) => {
+    if (!projectId) { setProcessingSource(null); setSelectedMediaId(""); return; }
+    try {
+      const source = await fetchProcessingSource(projectId);
+      setProcessingSource(source);
+      setSelectedMediaId(source.media_asset_id ?? "");
+    } catch (error) { setMediaError(error instanceof Error ? error.message : "Không tải được video xử lý."); }
+  }, []);
+
   useEffect(() => { void refreshMedia(selectedProject); }, [selectedProject, refreshMedia]);
+
+  useEffect(() => {
+    if (connection.state !== "online") return;
+    void fetchASRModels().then((result) => setAsrModelCached(result.items.find((item) => item.id === "base")?.cached ?? false)).catch(() => setAsrModelCached(false));
+  }, [connection.state]);
+
+  useEffect(() => {
+    setAsrRuns([]); setSelectedRun(null); setAsrJob(null);
+    if (!selectedProject) return;
+    void refreshProcessingSource(selectedProject);
+  }, [selectedProject, refreshProcessingSource]);
+
+  useEffect(() => {
+    let stopped = false;
+    setSelectedRun(null); setAsrRuns([]);
+    if (!selectedProject || !selectedMediaId) return;
+    void fetchASRRuns(selectedProject).then(async (runs) => {
+      if (stopped) return;
+      const matching = runs.filter((run) => run.source_asset_id === selectedMediaId);
+      setAsrRuns(matching);
+      const active = matching.find((run) => run.is_active) ?? matching[0];
+      if (active) {
+        const detail = await fetchASRRun(selectedProject, active.id);
+        if (!stopped && detail.source_asset_id === selectedMediaId) setSelectedRun(detail);
+      }
+    }).catch((error) => { if (!stopped) setAsrError(error instanceof Error ? error.message : "Không tải được kết quả nhận diện."); });
+    return () => { stopped = true; };
+  }, [selectedProject, selectedMediaId]);
+
+  useEffect(() => {
+    let stopped = false;
+    setTranscriptRevisions([]);
+    installTranscript(null);
+    if (!selectedProject || !selectedMediaId) return;
+    void fetchTranscriptRevisions(selectedProject, selectedMediaId).then((revisions) => {
+      if (stopped) return;
+      setTranscriptRevisions(revisions);
+      const preferred = revisions.find((revision) => revision.status === "DRAFT") ?? revisions.find((revision) => revision.is_active) ?? null;
+      installTranscript(preferred);
+    }).catch((error) => { if (!stopped) setTranscriptError(error instanceof Error ? error.message : "Không tải được lời thoại đã lưu."); });
+    return () => { stopped = true; };
+  }, [selectedProject, selectedMediaId, installTranscript]);
+
+  useEffect(() => {
+    let stopped = false;
+    if (!selectedProject || !selectedRun || selectedRun.source_asset_id !== selectedMediaId) return;
+    void fetchTranscriptRevisions(selectedProject, selectedMediaId).then((revisions) => {
+      if (stopped) return;
+      setTranscriptRevisions(revisions);
+      if (!transcriptDirty && !transcriptEditing) {
+        const matching = revisions.filter((revision) => revision.run_id === selectedRun.id);
+        installTranscript(matching.find((revision) => revision.status === "DRAFT") ?? matching.find((revision) => revision.is_active) ?? null);
+      }
+    }).catch((error) => { if (!stopped) setTranscriptError(error instanceof Error ? error.message : "Không tải được phiên bản lời thoại."); });
+    return () => { stopped = true; };
+  }, [selectedProject, selectedMediaId, selectedRun?.id, transcriptDirty, transcriptEditing, installTranscript]);
 
   useEffect(() => {
     if (!importJob || !["QUEUED", "RUNNING", "CANCEL_REQUESTED"].includes(importJob.status)) return;
@@ -82,14 +218,49 @@ export function App() {
         const next = await getImportJob(importJob.id, importJob.project_id);
         if (stopped) return;
         setImportJob(next);
-        if (next.status === "READY") void refreshMedia(next.project_id);
+        if (next.status === "READY") { void refreshMedia(next.project_id); void refreshProcessingSource(next.project_id); }
         else if (["FAILED", "CANCELLED", "INTERRUPTED"].includes(next.status)) setMediaError(next.error_code ? `Import dừng: ${next.error_code.replaceAll("_", " ")}.` : "Import thất bại.");
         else window.setTimeout(poll, 800);
       } catch (error) { if (!stopped) setMediaError(error instanceof Error ? error.message : "Không theo dõi được Import Job."); }
     };
     const timer = window.setTimeout(poll, 500);
     return () => { stopped = true; window.clearTimeout(timer); };
-  }, [importJob, refreshMedia]);
+  }, [importJob, refreshMedia, refreshProcessingSource]);
+
+  useEffect(() => {
+    if (!asrJob || !["QUEUED", "RUNNING", "CANCEL_REQUESTED"].includes(asrJob.status)) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const next = await getImportJob(asrJob.id, asrJob.project_id);
+        if (stopped) return;
+        setAsrJob(next);
+        if (next.status === "READY") {
+          void fetchASRModels().then((result) => setAsrModelCached(result.items.find((item) => item.id === "base")?.cached ?? false)).catch(() => undefined);
+          const runs = await fetchASRRuns(next.project_id);
+          if (!stopped) {
+            const matching = runs.filter((run) => run.source_asset_id === asrJobSourceId);
+            if (selectedMediaId === asrJobSourceId) {
+              setAsrRuns(matching);
+              const active = matching.find((run) => run.is_active) ?? matching[0];
+              if (active) setSelectedRun(await fetchASRRun(next.project_id, active.id));
+              const revisions = await fetchTranscriptRevisions(next.project_id, asrJobSourceId);
+              if (!stopped) {
+                setTranscriptRevisions(revisions);
+                if (!transcriptDirty && !transcriptEditing) installTranscript(revisions.find((revision) => revision.status === "DRAFT") ?? revisions.find((revision) => revision.is_active) ?? null);
+              }
+            }
+          }
+        } else if (["FAILED", "CANCELLED", "INTERRUPTED"].includes(next.status)) {
+          setAsrError(asrFailureLabel(next.error_code));
+          void fetchASRModels().then((result) => setAsrModelCached(result.items.find((item) => item.id === "base")?.cached ?? false)).catch(() => setAsrModelCached(false));
+        } else timer = window.setTimeout(poll, 800);
+      } catch (error) { if (!stopped) setAsrError(error instanceof Error ? error.message : "Không theo dõi được ASR Job."); }
+    };
+    timer = window.setTimeout(poll, 500);
+    return () => { stopped = true; if (timer) window.clearTimeout(timer); };
+  }, [asrJob, asrJobSourceId, selectedMediaId, transcriptDirty, transcriptEditing, installTranscript]);
 
   const startImport = async () => {
     if (!selectedProject) return;
@@ -108,9 +279,152 @@ export function App() {
     try {
       await relinkMedia(selectedProject, asset);
       await refreshMedia(selectedProject);
-      setSelectedMediaId(asset.id);
+      await refreshProcessingSource(selectedProject);
     } catch (error) { setMediaError(error instanceof Error ? error.message : "Không thể chọn lại video."); }
     finally { setRelinkingAssetId(""); }
+  };
+
+  const chooseProcessingVideo = async (asset: MediaAsset) => {
+    if (!selectedProject || asset.status !== "READY") return;
+    if (transcriptDirty && !window.confirm("Bạn còn lời thoại chưa lưu. Rời video này sẽ bỏ các thay đổi đang nhập. Bạn muốn tiếp tục?")) return;
+    setSavingProcessingSource(true); setMediaError(null);
+    try {
+      const source = await selectProcessingSource(selectedProject, asset.id, processingSource?.generation ?? 0);
+      setProcessingSource(source);
+      setSelectedMediaId(asset.id);
+    } catch (error) { setMediaError(error instanceof Error ? error.message : "Không thể chọn video xử lý."); }
+    finally { setSavingProcessingSource(false); }
+  };
+
+  const startASR = async () => {
+    const source = mediaAssets.find((asset) => asset.id === selectedMediaId && asset.status === "READY");
+    if (!selectedProject || !source) return;
+    setStartingASR(true); setAsrError(null);
+    try {
+      const modelStatus = await fetchASRModels();
+      const modelCached = modelStatus.items.find((item) => item.id === "base")?.cached ?? false;
+      setAsrModelCached(modelCached);
+      const job = await createASRJob(selectedProject, asrLanguage as "auto" | "en" | "zh", !modelCached);
+      setAsrJobSourceId(source.id);
+      setAsrJob(job);
+    } catch (error) { setAsrError(error instanceof Error ? error.message : "Không thể tạo ASR Job."); }
+    finally { setStartingASR(false); }
+  };
+
+  const cancelASR = async () => {
+    if (!asrJob) return;
+    setAsrActionBusy(true);
+    try { setAsrJob(await cancelLocalJob(asrJob.id, asrJob.project_id)); }
+    catch (error) { setAsrError(error instanceof Error ? error.message : "Không thể hủy Job."); }
+    finally { setAsrActionBusy(false); }
+  };
+
+  const retryASR = async () => {
+    if (!asrJob) return;
+    setAsrActionBusy(true); setAsrError(null);
+    try { setAsrJob(await retryLocalJob(asrJob)); }
+    catch (error) { setAsrError(error instanceof Error ? error.message : "Job chưa thể chạy lại."); }
+    finally { setAsrActionBusy(false); }
+  };
+
+  const editTranscript = () => {
+    if (transcriptRevision) {
+      if (transcriptRevision.status === "ACCEPTED") {
+        const existingDraft = transcriptRevisions.find((revision) => revision.run_id === transcriptRevision.run_id && revision.status === "DRAFT");
+        if (existingDraft) {
+          savedTranscript.current = existingDraft;
+          setTranscriptRevision(existingDraft);
+          setTranscriptDirty(false);
+        }
+      }
+      setTranscriptEditing(true);
+      if (transcriptRevision.status === "DRAFT") setTranscriptDirty(false);
+      return;
+    }
+    if (!selectedRun || selectedRun.source_asset_id !== selectedMediaId || !selectedProject) return;
+    const localDraft = sourceTranscriptDraft(selectedRun, selectedProject);
+    savedTranscript.current = localDraft;
+    cancelToOriginal.current = true;
+    setTranscriptRevision(localDraft);
+    setTranscriptEditing(true);
+    setTranscriptDirty(false);
+  };
+
+  const updateTranscriptText = (rowId: string, text: string) => {
+    if (!transcriptEditing || !transcriptRevision) return;
+    const segments = transcriptRevision.segments.map((segment) => segment.row_id === rowId ? { ...segment, text } : segment);
+    setTranscriptRevision({ ...transcriptRevision, segments });
+    const baseline = savedTranscript.current?.segments ?? (transcriptRevision.id ? transcriptRevision.segments : []);
+    setTranscriptDirty(segments.some((segment, index) => segment.text !== baseline[index]?.text));
+  };
+
+  const saveTranscript = async () => {
+    if (!selectedProject || !transcriptRevision || !transcriptEditing || !transcriptDirty) return;
+    setTranscriptSaving(true); setTranscriptError(null);
+    try {
+      let target = transcriptRevision;
+      if (!target.id) {
+        target = await createTranscriptDraft(selectedProject, { source_run_id: target.run_id });
+      } else if (target.status === "ACCEPTED") {
+        target = await createTranscriptDraft(selectedProject, { parent_revision_id: target.id });
+      }
+      const textByPosition = new Map(transcriptRevision.segments.map((segment) => [segment.position, segment.text]));
+      const toSave = { ...target, segments: target.segments.map((segment) => ({ ...segment, text: textByPosition.get(segment.position) ?? segment.text })) };
+      const saved = await saveTranscriptDraft(selectedProject, toSave);
+      setTranscriptRevisions(await fetchTranscriptRevisions(selectedProject, selectedMediaId));
+      installTranscript(saved);
+    } catch (error) { setTranscriptError(error instanceof Error ? error.message : "Không thể lưu nháp. Nội dung đang nhập vẫn được giữ."); }
+    finally { setTranscriptSaving(false); }
+  };
+
+  const cancelTranscriptEdit = () => {
+    installTranscript(cancelToOriginal.current ? null : savedTranscript.current);
+  };
+
+  const acceptTranscript = async () => {
+    if (!selectedProject || transcriptEditing || transcriptDirty) return;
+    if (transcriptRevision?.status === "ACCEPTED") return;
+    if (!transcriptRevision && (!selectedRun || selectedRun.source_asset_id !== selectedMediaId || !selectedRun.segments.length)) return;
+    setTranscriptSaving(true); setTranscriptError(null);
+    try {
+      const currentAccepted = transcriptRevisions.find((revision) => revision.status === "ACCEPTED" && revision.is_current);
+      if (currentAccepted) {
+        installTranscript(currentAccepted);
+        return;
+      }
+      const draft = transcriptRevision?.id
+        ? transcriptRevision
+        : await createTranscriptDraft(selectedProject, { source_run_id: selectedRun!.id });
+      const expectedActive = transcriptRevisions.find((revision) => revision.is_active)?.id ?? null;
+      const accepted = await acceptTranscriptRevision(selectedProject, draft, expectedActive);
+      setTranscriptRevisions(await fetchTranscriptRevisions(selectedProject, selectedMediaId));
+      installTranscript(accepted);
+    } catch (error) { setTranscriptError(error instanceof Error ? error.message : "Không thể duyệt lời thoại. Bản nháp đã lưu vẫn được giữ."); }
+    finally { setTranscriptSaving(false); }
+  };
+
+  const transcriptIsOriginal = (revision: TranscriptRevision) => revision.segments.every((segment) => segment.source_segment_ids.length === 1 && segment.text === segment.source_texts[0]);
+
+  const selectTranscriptHistory = async (revisionId: string) => {
+    if (transcriptDirty && !window.confirm("Bạn còn lời thoại chưa lưu. Đổi phiên bản sẽ bỏ các thay đổi đang nhập. Tiếp tục?")) return;
+    if (!selectedProject || !revisionId) return;
+    try { installTranscript(await fetchTranscriptRevision(selectedProject, revisionId)); }
+    catch (error) { setTranscriptError(error instanceof Error ? error.message : "Không tải được phiên bản lời thoại."); }
+  };
+
+  const seekToTimestamp = (assetId: string, startUs: number) => {
+    const timeSeconds = startUs / 1_000_000;
+    if (playingMediaId === assetId && videoRef.current?.readyState && videoRef.current.readyState >= 1) {
+      videoRef.current.currentTime = timeSeconds;
+      void videoRef.current.play().catch(() => undefined);
+      return;
+    }
+    pendingSeek.current = { assetId, timeSeconds };
+    setPlayingMediaId(assetId);
+  };
+
+  const seekToSegment = (run: ASRRun, startUs: number) => {
+    seekToTimestamp(run.source_asset_id, startUs);
   };
 
   useEffect(() => {
@@ -188,31 +502,114 @@ export function App() {
               <ul className="project-list">{projects.map((project) => <li key={project.id}><span><strong>{project.name}</strong><small>{project.status} · {new Date(project.created_at).toLocaleString()}</small></span><code>{project.id}</code></li>)}</ul>
               <div className="media-import">
                 <label htmlFor="media-project">Project nhận video</label>
-                <select id="media-project" value={selectedProject} onChange={(event) => setSelectedProject(event.target.value)}><option value="">Chọn Project</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select>
+                <select id="media-project" value={selectedProject} onChange={(event) => { if (!transcriptDirty || window.confirm("Bạn còn lời thoại chưa lưu. Đổi Project sẽ bỏ các thay đổi đang nhập. Tiếp tục?")) setSelectedProject(event.target.value); }}><option value="">Chọn Project</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select>
                 <label htmlFor="import-mode">Chế độ lưu nguồn</label>
                 <select id="import-mode" value={importMode} onChange={(event) => setImportMode(event.target.value as "COPY" | "LINK")}><option value="COPY">COPY · quản lý bản sao</option><option value="LINK">LINK · giữ nguyên file gốc</option></select>
-                <button type="button" onClick={() => void startImport()} disabled={!selectedProject || selectingMedia || connection.state !== "online"}>{selectingMedia ? "Đang mở hộp thoại…" : "Chọn video"}</button>
+                <button type="button" onClick={() => void startImport()} disabled={!selectedProject || selectingMedia || connection.state !== "online"}>{selectingMedia ? "Đang mở hộp thoại…" : "Thêm video mới"}</button>
                 {importJob ? <p role="status">Import {importJob.status}{importJob.error_code ? ` · ${importJob.error_code}` : ""}</p> : null}
                 {mediaError ? <p className="project-error" role="alert">{mediaError}</p> : null}
-                <ul className="media-list">{mediaAssets.map((asset) => <li key={asset.id}>
+                <h3 id="video-library">Video đã nhập</h3>
+                <ul className="media-list">{mediaAssets.map((asset) => <li key={asset.id} data-asset-id={asset.id}>
                   <strong>{asset.display_name}</strong>
                   <span>{asset.status} · {asset.mode} · {(asset.file_size / 1024 / 1024).toFixed(1)} MB · {(asset.metadata.duration_us / 1_000_000).toFixed(2)} s</span>
                   <span>{asset.metadata.container} · {asset.metadata.width}×{asset.metadata.height} · {asset.metadata.video_codec} · {asset.metadata.audio_streams ? `${asset.metadata.audio_streams} audio stream(s)` : "không có audio"}{asset.metadata.frame_rate ? ` · ${asset.metadata.frame_rate} fps` : ""}</span>
                   <div className="media-actions">
-                    <button type="button" disabled={asset.status !== "READY"} onClick={() => setSelectedMediaId(asset.id)}>Phát video</button>
+                    <button type="button" disabled={asset.status !== "READY"} onClick={() => setPlayingMediaId(asset.id)}>Phát video</button>
+                    <button type="button" disabled={asset.status !== "READY" || savingProcessingSource || selectedMediaId === asset.id} onClick={() => void chooseProcessingVideo(asset)}>{selectedMediaId === asset.id ? "Đang sử dụng để xử lý" : "Chọn làm video xử lý"}</button>
                     {asset.mode === "LINK" && asset.status !== "READY" ? <button type="button" disabled={relinkingAssetId === asset.id} onClick={() => void startRelink(asset)}>{relinkingAssetId === asset.id ? "Đang chọn lại…" : "Chọn lại video"}</button> : null}
+                    <small>ID: {asset.id}</small>
                   </div>
                 </li>)}</ul>
-                {selectedMediaId && mediaAssets.some((asset) => asset.id === selectedMediaId && asset.status === "READY") ? (() => {
-                  const asset = mediaAssets.find((item) => item.id === selectedMediaId)!;
+                {playingMediaId && mediaAssets.some((asset) => asset.id === playingMediaId && asset.status === "READY") ? (() => {
+                  const asset = mediaAssets.find((item) => item.id === playingMediaId)!;
                   return <section className="media-player" aria-label="Trình phát video">
                     <h3>{asset.display_name}</h3>
-                    <video key={`${selectedProject}:${asset.id}`} controls preload="metadata" src={mediaStreamUrl(selectedProject, asset.id)} onError={() => { setMediaError("Trình duyệt không phát được video này. Codec có thể chưa được hỗ trợ; hãy thử MP4/H.264."); void refreshMedia(selectedProject); }}>
+                    <video ref={videoRef} key={`${selectedProject}:${asset.id}`} controls preload="metadata" src={mediaStreamUrl(selectedProject, asset.id)} onLoadedMetadata={() => {
+                      const pending = pendingSeek.current;
+                      if (pending?.assetId === asset.id && videoRef.current) {
+                        videoRef.current.currentTime = pending.timeSeconds;
+                        pendingSeek.current = null;
+                        void videoRef.current.play().catch(() => undefined);
+                      }
+                    }} onTimeUpdate={() => { if (videoRef.current) setVideoPlayheadUs(Math.round(videoRef.current.currentTime * 1_000_000)); }} onError={() => { setMediaError("Trình duyệt không phát được video này. Codec có thể chưa được hỗ trợ; hãy thử MP4/H.264."); void refreshMedia(selectedProject); }}>
                       Trình duyệt không hỗ trợ phát video.
                     </video>
                     <small>{asset.metadata.width}×{asset.metadata.height} · {(asset.metadata.duration_us / 1_000_000).toFixed(2)} giây · {asset.mode}</small>
                   </section>;
                 })() : null}
+                <section className="asr-panel" aria-label="Nhận diện lời thoại">
+                  <h3>Nhận diện lời thoại</h3>
+                  <div className="processing-video">
+                    <strong>Video đang xử lý</strong>
+                    {selectedMediaId ? (() => {
+                      const asset = mediaAssets.find((item) => item.id === selectedMediaId);
+                      return asset ? <><span>{asset.display_name}</span><small>{(asset.metadata.duration_us / 1_000_000).toFixed(0)} giây · {asset.metadata.width} × {asset.metadata.height} · ID {asset.id.slice(0, 8)} · {asset.status}</small></> : <span>Đang kiểm tra video…</span>;
+                    })() : <span>Chưa có video được chọn</span>}
+                    <button type="button" onClick={() => document.getElementById("video-library")?.scrollIntoView({ behavior: "smooth" })}>Đổi video</button>
+                  </div>
+                  {selectedMediaId && processingSource?.status !== "READY" ? <p className="project-error" role="alert">{processingSource?.status === "MISSING" ? "Không tìm thấy video nguồn. Dùng Chọn lại video nếu đây là file LINK." : "Video đã thay đổi hoặc chưa sẵn sàng. Kiểm tra trạng thái trong danh sách video rồi thử lại."}</p> : null}
+                  <label htmlFor="asr-language">Ngôn ngữ lời nói trong video</label>
+                  <small>Bản dịch ở bước sau mặc định là Tiếng Việt.</small>
+                  <select id="asr-language" value={asrLanguage} onChange={(event) => setAsrLanguage(event.target.value)}><option value="auto">Tự động nhận diện</option><option value="en">Tiếng Anh</option><option value="zh">Tiếng Trung</option></select>
+                  {!asrModelCached ? <p role="note">Cần tải dữ liệu nhận diện giọng nói (khoảng 145 MB) cho lần sử dụng đầu tiên.</p> : null}
+                  <button type="button" onClick={() => void startASR()} disabled={!selectedProject || !selectedMediaId || processingSource?.status !== "READY" || startingASR || connection.state !== "online" || (!!asrJob && ["QUEUED", "RUNNING", "CANCEL_REQUESTED"].includes(asrJob.status))}>
+                    {startingASR ? "Đang chuẩn bị…" : !asrModelCached ? "Tải và tiếp tục" : "Nhận diện lời thoại"}
+                  </button>
+                  {asrJob && asrJob.project_id === selectedProject ? <div className="asr-job-status" role="status">
+                    <p>Job cho {mediaAssets.find((asset) => asset.id === asrJobSourceId)?.display_name ?? "video trước"}: {asrJob.status === "QUEUED" ? "Đang chờ" : asrJob.status === "RUNNING" ? "Đang nhận diện lời thoại..." : asrJob.status === "READY" ? "Nhận diện hoàn tất" : asrJob.status === "FAILED" ? "Nhận diện thất bại" : asrJob.status === "INTERRUPTED" ? "Quá trình bị gián đoạn" : asrJob.status === "CANCELLED" ? "Đã hủy" : asrJob.status === "CANCEL_REQUESTED" ? "Đang hủy" : asrJob.status}{["RUNNING", "CANCEL_REQUESTED"].includes(asrJob.status) && asrJob.progress?.phase ? ` · ${asrPhaseLabel(asrJob.progress.phase)}` : ""}{asrJob.error_code ? ` · ${asrJob.error_code}` : ""}</p>
+                    {asrJob.status === "RUNNING" || asrJob.status === "QUEUED" ? <button type="button" disabled={asrActionBusy} onClick={() => void cancelASR()}>{asrActionBusy ? "Đang xử lý…" : "Hủy nhận diện"}</button> : null}
+                    {(["FAILED", "INTERRUPTED"].includes(asrJob.status) && asrJob.retry_available && selectedMediaId === asrJobSourceId) ? <button type="button" disabled={asrActionBusy} onClick={() => void retryASR()}>{asrActionBusy ? "Đang xử lý…" : "Thử lại"}</button> : null}
+                    {(["FAILED", "INTERRUPTED"].includes(asrJob.status) && asrJob.retry_available && selectedMediaId !== asrJobSourceId) ? <small>Đã đổi video xử lý; Job cũ giữ nguyên nguồn snapshot và không thể kích hoạt kết quả cho video mới.</small> : null}
+                    {(["FAILED", "INTERRUPTED"].includes(asrJob.status) && !asrJob.retry_available && asrJob.retry_block_reason === "retry_limit_reached") ? <small>Đã hết số lần thử cho Job này. Bạn có thể chủ động chạy nhận diện mới cho video hiện tại.</small> : null}
+                    {(["FAILED", "INTERRUPTED"].includes(asrJob.status) && !asrJob.retry_available && asrJob.retry_block_reason === "job_stale") ? <small>Đầu vào Job đã cũ; hãy chạy nhận diện mới cho video đang chọn.</small> : null}
+                  </div> : null}
+                  {asrError ? <p className="project-error" role="alert">{asrError}</p> : null}
+                  {asrRuns.length ? <>
+                    <label htmlFor="asr-run">Transcription Runs</label>
+                    <select id="asr-run" value={selectedRun?.id ?? ""} onChange={(event) => {
+                      if (transcriptDirty && !window.confirm("Bạn còn lời thoại chưa lưu. Đổi kết quả nhận diện sẽ bỏ các thay đổi đang nhập. Tiếp tục?")) return;
+                      const run = asrRuns.find((item) => item.id === event.target.value);
+                      if (!run) { setSelectedRun(null); return; }
+                      void fetchASRRun(selectedProject, run.id).then((detail) => { if (detail.source_asset_id === selectedMediaId) setSelectedRun(detail); });
+                    }}>
+                      <option value="">Chọn kết quả</option>{asrRuns.map((run) => <option key={run.id} value={run.id}>{run.status}{run.is_active ? " · active" : " · lịch sử"} · {run.model_id.split("/").at(-1)} · {new Date(run.created_at).toLocaleString()}</option>)}
+                    </select>
+                  </> : null}
+                  {selectedRun && selectedRun.project_id === selectedProject && selectedRun.source_asset_id === selectedMediaId ? <div className="asr-result">
+                    <p>{selectedRun.status === "NO_SPEECH" ? "Không tìm thấy lời thoại" : selectedRun.status === "REVIEW_REQUIRED" ? "Đã nhận diện · cần xem lại một số đoạn" : "Đã nhận diện lời thoại"}{selectedRun.language ? ` · ${selectedRun.language === "en" ? "Tiếng Anh" : selectedRun.language === "zh" ? "Tiếng Trung" : selectedRun.language}` : ""}</p>
+                    {selectedRun.provenance.language_probability !== null ? <small>Xác suất ngôn ngữ: {(selectedRun.provenance.language_probability * 100).toFixed(1)}%</small> : null}
+                    {selectedRun.status === "NO_SPEECH" ? <p>Không tìm thấy lời thoại; không tạo Segment giả.</p> : null}
+                    <ol className="asr-segments">{selectedRun.segments.map((segment) => <li key={segment.id}>
+                      <button type="button" onClick={() => seekToSegment(selectedRun, segment.start_us)} title="Tua video đến Segment">{(segment.start_us / 1_000_000).toFixed(2)}–{(segment.end_us / 1_000_000).toFixed(2)} s</button>
+                      <span>{segment.source_text}</span>{segment.flags.length ? <small>Review: {segment.flags.join(", ")}</small> : null}
+                    </li>)}</ol>
+                  </div> : null}
+                  <section className="transcript-editor" aria-label="Kiểm tra lời thoại">
+                    <header><div><h3>Kiểm tra lời thoại</h3><small>{mediaAssets.find((asset) => asset.id === selectedMediaId)?.display_name ?? "Chưa chọn video"}</small></div>
+                      {transcriptRevision ? <span className={`transcript-state transcript-${transcriptRevision.status.toLowerCase()}`}>{transcriptRevision.status === "ACCEPTED" ? (transcriptRevision.is_current ? (transcriptIsOriginal(transcriptRevision) ? "Đã xác nhận bản nhận diện gốc — Sẵn sàng dịch" : "Đã duyệt bản có chỉnh sửa — Sẵn sàng dịch") : "Bản lịch sử · chỉ xem") : "Bản nháp đã lưu"}</span> : null}
+                    </header>
+                    {transcriptRevisions.length > 0 ? <label htmlFor="transcript-history">Phiên bản lời thoại</label> : null}
+                    {transcriptRevisions.length > 0 ? <select id="transcript-history" value={transcriptRevision?.id ?? ""} onChange={(event) => void selectTranscriptHistory(event.target.value)}><option value="">Chọn phiên bản</option>{transcriptRevisions.map((revision) => <option key={revision.id} value={revision.id}>Phiên bản {revision.revision_no} · {revision.status === "DRAFT" ? "Bản nháp" : revision.is_active && revision.is_current ? "Đã duyệt · đang dùng" : "Đã duyệt · lịch sử"}</option>)}</select> : null}
+                    {!transcriptRevision && selectedRun?.source_asset_id === selectedMediaId ? <p>Chưa có bản chỉnh sửa. Transcript nhận diện gốc vẫn được giữ nguyên.</p> : null}
+                    {selectedRun?.status === "NO_SPEECH" && !transcriptRevision ? <p>Không tìm thấy lời thoại; không tạo Segment giả.</p> : null}
+                    {transcriptRevision ? <>
+                      {transcriptEditing ? <p role="status">{transcriptDirty ? "Có thay đổi chưa lưu" : "Chưa có thay đổi"} · Thời điểm câu được giữ nguyên.</p> : null}
+                      {!transcriptEditing && transcriptRevision.status === "DRAFT" ? <p role="status">Bản nháp đã lưu. Có thể tiếp tục sửa hoặc duyệt để chuyển sang bước dịch.</p> : null}
+                      {transcriptRevision.segments.length === 0 ? <p>Phiên bản này chưa có câu lời thoại.</p> : <ol className="transcript-segments">{transcriptRevision.segments.map((segment, index) => {
+                        const highlighted = playingMediaId === transcriptRevision.source_asset_id && segment.start_us <= videoPlayheadUs && videoPlayheadUs < segment.end_us;
+                        return <li key={segment.row_id} className={highlighted ? "transcript-segment-active" : ""}>
+                          <div className="transcript-segment-heading"><button type="button" onClick={() => seekToTimestamp(transcriptRevision.source_asset_id, segment.start_us)} title="Phát video từ câu này">{formatSeconds(segment.start_us)}–{formatSeconds(segment.end_us)} s</button><span>Câu {index + 1}</span>{segment.timing_warning ? <small role="note">Thời gian chồng lấn — hãy kiểm tra</small> : null}</div>
+                          {transcriptEditing ? <>
+                            <label className="visually-hidden" htmlFor={`transcript-text-${segment.row_id}`}>Nội dung câu {index + 1}</label>
+                            <textarea id={`transcript-text-${segment.row_id}`} value={segment.text} rows={2} onChange={(event) => updateTranscriptText(segment.row_id, event.target.value)} />
+                          </> : <p className="transcript-readonly-text">{segment.text}</p>}
+                        </li>;
+                      })}</ol>}
+                    </> : null}
+                    {transcriptEditing ? <div className="transcript-footer"><button type="button" disabled={transcriptSaving} onClick={cancelTranscriptEdit}>Hủy</button><button type="button" disabled={!transcriptDirty || transcriptSaving} onClick={() => void saveTranscript()}>{transcriptSaving ? "Đang lưu…" : "Lưu chỉnh sửa"}</button></div> : transcriptRevision?.status === "ACCEPTED" ? <div className="transcript-footer">{transcriptRevision.is_current ? <button type="button" disabled={transcriptSaving} onClick={editTranscript}>Sửa lại lời thoại</button> : null}</div> : transcriptRevision?.status === "DRAFT" ? <div className="transcript-footer"><button type="button" disabled={transcriptSaving} onClick={editTranscript}>Sửa lời thoại</button><button type="button" disabled={transcriptSaving || transcriptRevision.segments.length === 0 || transcriptRevision.segments.some((segment) => segment.coverage_status !== "REVIEWED")} onClick={() => void acceptTranscript()}>{transcriptSaving ? "Đang duyệt…" : "Duyệt lời thoại"}</button></div> : selectedRun?.source_asset_id === selectedMediaId ? <div className="transcript-footer"><button type="button" disabled={!selectedRun.segments.length || transcriptSaving} onClick={editTranscript}>Sửa lời thoại</button><button type="button" disabled={!selectedRun.segments.length || transcriptSaving} onClick={() => void acceptTranscript()}>{transcriptSaving ? "Đang duyệt…" : "Duyệt lời thoại"}</button></div> : <p>Chưa có transcript cho video này. Chạy nhận diện để tạo nội dung cần kiểm tra.</p>}
+                    {transcriptError ? <p className="project-error" role="alert">{transcriptError}</p> : null}
+                  </section>
+                </section>
               </div>
             </> : <p className="project-empty">{connection.state === "online" ? "Chưa có Project được lưu." : "Danh sách cần kết nối backend."}</p>}
           </div>
