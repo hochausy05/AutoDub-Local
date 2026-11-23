@@ -37,10 +37,24 @@ test("development UI and proxied backend session are reachable", async () => {
   assert.deepEqual(await health.json(), { status: "ok", service: "autodub-local-backend" });
   assert.notEqual(health.headers.get("access-control-allow-origin"), "*", "the dev proxy must not enable wildcard CORS");
 
-  const unimplemented = await fetch(`${origin}/api/v1/projects`, {
+  const projects = await fetch(`${origin}/api/v1/projects`, {
     headers: { ...apiHeaders, Cookie: sessionCookie },
   });
-  assert.equal(unimplemented.status, 404);
+  assert.equal(projects.status, 200);
+  const projectList = await projects.json();
+  assert.ok(Array.isArray(projectList.items), "Project list should come from the persistent API");
+
+  const mutationWithoutCsrf = await fetch(`${origin}/api/v1/projects`, {
+    method: "POST",
+    headers: {
+      ...apiHeaders,
+      Cookie: sessionCookie,
+      "Content-Type": "application/json",
+      "Idempotency-Key": "integration-smoke-key-0001",
+    },
+    body: JSON.stringify({ name: "Must not be created" }),
+  });
+  assert.equal(mutationWithoutCsrf.status, 403);
 });
 
 test("foreign origins and missing sessions are rejected", async () => {

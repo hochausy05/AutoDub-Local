@@ -1,5 +1,17 @@
 # CHANGELOG — AutoDub Local vNext
 
+## 2026-11-23 14:55 UTC+7 — CORE-01B — Durable Job & Attempt lifecycle
+- Thêm migration v2 (không sửa migration v1): `jobs`, `job_attempts`, FK/UNIQUE/CHECK, one-active-Attempt index, immutable input-snapshot và state-transition guards; giữ nguyên Project cũ. Dùng chung bảng `idempotency_records` theo scope; Job lưu snapshot JSON, fingerprint, request digest và khóa idempotency.
+- Thêm `JobService` nội bộ: tạo, đọc, claim `BEGIN IMMEDIATE` cùng insert Attempt, progress có whitelist, cancel, complete có `CompletionEvidence`, fail với error code đã sanitize và retry có điều kiện (tối đa 3 Attempts). Thêm session/CSRF-protected GET/cancel/retry API; không có public Job creation hay executor/provider.
+- Backend unittest **PASS** (24 tests, gồm 14 Job tests và regression CORE-01A): migration bảo toàn Project, restart giữ RUNNING để CORE-01D reconcile, idempotency đồng thời, claim race, cancel/completion race, retry/history, auth/ownership và transition guards. Frontend build/typecheck **PASS**; Windows launcher/Vite proxy smoke **PASS** (2 tests). `git diff --check` và UTF-8 strict decode **PASS**.
+- Process-tree cancellation, executor thật và startup reconciliation **NOT RUN / ngoài CORE-01B**; G1 chưa nghiệm thu.
+
+## 2026-11-23 14:34 UTC+7 — CORE-01A — SQLite & Project persistence
+- Tạo SQLite factory và migration v1 transactional với WAL, `foreign_keys=ON`, `busy_timeout=5000`; mặc định lưu ngoài source tại `%LOCALAPPDATA%\AutoDub-Local`, từ chối UNC/network drive và cho phép `AUTODUB_DATA_ROOT` local ngoài source. Thêm bảng Projects và durable idempotency records.
+- Thêm API session-protected tạo/liệt kê/đọc Project, validation UUID/name, error envelope, CSRF và idempotency key. Nối UI thật để tạo/liệt kê Project; không có mock Projects. Cập nhật hướng dẫn, smoke test, `TASK.md` đánh dấu riêng slice CORE-01A đã kiểm tra và `UPDATES.md`.
+- Backend unittest **PASS** (10 tests: startup/reopen/migration/SQLite PRAGMAs/FK, persistence, validation/idempotency, session/CSRF, concurrent writes và data-root guard); frontend build/typecheck **PASS**; Windows `scripts/windows/dev.ps1 -SmokeTest` **PASS** (2 tests qua Vite proxy, bao gồm Project list và POST thiếu CSRF).
+- Browser visual acceptance **NOT RUN**. Job/Attempt, recovery, media import, provider và render chưa triển khai; G1/CORE-01 chưa nghiệm thu.
+
 ## 2026-11-23 13:55 UTC+7 — ARCH-00D — Runnable development skeleton
 - Tạo FastAPI loopback backend với one-time bootstrap, in-memory session, CSRF, strict Host/Origin/Fetch Metadata và health liveness; tạo React/TypeScript status UI (trạng thái trống, không giả lập media), Vite dev proxy, lockfile/dependency pins và Windows launcher `scripts/windows/dev.ps1`.
 - Thêm backend security smoke tests, frontend/proxy integration smoke, cập nhật README/`.env.example`/`.gitignore`; chuyển giao quy tắc hai tầng CoverageGroup → RevisionSegment → TranslationUnit cho TRANS-01 trong proposal ARCH-00C. Không thêm ASR, Gemini, TTS, SQLite, import hay render.

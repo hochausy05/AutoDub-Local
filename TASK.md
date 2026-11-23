@@ -1,6 +1,6 @@
 # TASK — AutoDub Local vNext Implementation Queue
 
-**Status:** All tasks below are planned; **none implemented or owner-accepted**. Consult `docs/14_SCOPE_BASELINE.md` before selecting scope. Tests and owner verification are separate.
+**Status:** Planned tasks may contain individually verified implementation slices; no stage or gate is owner-accepted unless stated. Consult `docs/14_SCOPE_BASELINE.md` before selecting scope. Tests and owner verification are separate.
 
 ## MVP
 
@@ -11,6 +11,8 @@
 - [ ] **G0:** Owner approves architecture and pared-down MVP.
 
 ### CORE-01 — SQLite + FastAPI
+- [x] **CORE-01A Project persistence slice:** SQLite WAL/migration foundation, Project create/list/read API and UI; ten backend tests, frontend build and local launcher smoke pass (see CHANGELOG).
+- [x] **CORE-01B durable Job/Attempt slice:** migration v2, internal lifecycle service, session-protected get/cancel/retry API; tested by 14 Job tests plus CORE-01A regression suite (see CHANGELOG).
 - [ ] SQLite WAL/foreign keys/migrations, API errors, loopback-only API and local settings.
 - [ ] Minimal single-machine durable Job/Attempt status, cancellation and startup reconciliation.
 - [ ] Atomic file staging → validation → publish, no orphan files misreported as READY.

@@ -7,11 +7,19 @@ import ipaddress
 import os
 import secrets
 import time
+import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Callable
+from pathlib import Path
+from typing import Callable, Literal
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from fastapi.responses import JSONResponse
+
+from app.database import Database, IdempotencyConflict
+from app.jobs import JobConflict, JobInputError, JobNotFound, JobService
 
 
 SESSION_COOKIE = "autodub_session"
@@ -23,6 +31,77 @@ BOOTSTRAP_TTL_SECONDS = 60
 class Session:
     csrf_token: str
     expires_at: float
+
+
+class ProjectCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=120)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def normalize_name(cls, value):
+        if isinstance(value, str):
+            value = value.strip()
+        return value
+
+
+class ProjectCreated(BaseModel):
+    id: uuid.UUID
+    lock_version: int
+
+
+class ProjectRead(BaseModel):
+    id: uuid.UUID
+    name: str
+    status: str
+    created_at: str
+    updated_at: str
+    lock_version: int
+    schema_version: int
+
+
+class ProjectListResponse(BaseModel):
+    items: list[ProjectRead]
+    limit: int
+    offset: int
+
+
+class JobAttemptRead(BaseModel):
+    id: uuid.UUID
+    attempt_no: int
+    schema_version: int
+    status: str
+    started_at: str
+    ended_at: str | None
+    error_code: str | None
+    retryable: bool
+    progress: dict[str, object] | None
+
+
+class JobRead(BaseModel):
+    id: uuid.UUID
+    project_id: uuid.UUID
+    kind: str
+    input_fingerprint: str
+    status: str
+    cancel_requested: bool
+    lock_version: int
+    schema_version: int
+    created_at: str
+    updated_at: str
+    attempt: JobAttemptRead | None
+    attempts: list[JobAttemptRead]
+    progress: dict[str, object] | None
+    error_code: str | None
+
+
+class EmptyJobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class RetryJobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_status: Literal["FAILED", "INTERRUPTED"]
 
 
 def _is_loopback(address: str | None) -> bool:
@@ -41,18 +120,30 @@ def create_app(
     port: int = 8000,
     allowed_origin: str = "http://127.0.0.1:5173",
     clock: Callable[[], float] = time.monotonic,
+    data_root: Path | str | None = None,
 ) -> FastAPI:
     """Create the app; a missing bootstrap secret leaves session bootstrap disabled."""
     if host != "127.0.0.1":
         raise ValueError("The development API must bind to IPv4 loopback only.")
     if port != 8000 or allowed_origin != "http://127.0.0.1:5173":
         raise ValueError("The development skeleton uses fixed backend and UI ports/origin.")
+    database = Database(data_root)
+    job_service = JobService(database)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        database.initialize()
+        yield
+
     app = FastAPI(
         title="AutoDub Local API",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=lifespan,
     )
+    app.state.database = database
+    app.state.job_service = job_service
     expected_host = f"{host}:{port}"
     sessions: dict[str, Session] = {}
     secret_deadline = clock() + BOOTSTRAP_TTL_SECONDS
@@ -93,6 +184,42 @@ def create_app(
             sessions.pop(token, None)
             return None
         return token, current
+
+    def api_error(status: int, code: str, message: str, *, details=None):
+        return JSONResponse(
+            status_code=status,
+            content={"error": {"code": code, "message": message, "retryable": False, "details": details}, "request_id": str(uuid.uuid4())},
+        )
+
+    def require_session(request: Request) -> Session | JSONResponse:
+        current = get_session(request)
+        if current is None:
+            return api_error(401, "session_required", "A local session is required.")
+        return current[1]
+
+    def require_mutation_session(request: Request) -> Session | JSONResponse:
+        current = require_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        if not hmac.compare_digest(request.headers.get("x-csrf-token", ""), current.csrf_token):
+            return api_error(403, "csrf_invalid", "A valid CSRF token is required.")
+        return current
+
+    def job_exception(exc: Exception) -> JSONResponse:
+        if isinstance(exc, JobNotFound):
+            return api_error(404, "job_not_found", "Job was not found.")
+        if isinstance(exc, IdempotencyConflict):
+            return api_error(409, "idempotency_key_reused", "The idempotency key was already used with a different request.")
+        if isinstance(exc, JobInputError):
+            return api_error(422, str(exc), "The Job request is invalid.")
+        if isinstance(exc, JobConflict):
+            return api_error(409, exc.code, "The Job cannot make that state transition.")
+        raise exc
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_request: Request, exc: RequestValidationError):
+        details = [{"field": ".".join(str(part) for part in error["loc"] if part != "body"), "type": error["type"]} for error in exc.errors()]
+        return api_error(422, "validation_error", "The request is invalid.", details=details)
 
     @app.post("/api/v1/session/bootstrap")
     async def bootstrap(request: Request):
@@ -155,6 +282,89 @@ def create_app(
             return JSONResponse(status_code=401, content={"error": "session_required"})
         # This reports API liveness only. No database/worker readiness is implied.
         return {"status": "ok", "service": "autodub-local-backend"}
+
+    @app.post("/api/v1/projects", response_model=ProjectCreated, status_code=201)
+    def create_project(body: ProjectCreate, request: Request):
+        current = require_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        supplied_csrf = request.headers.get("x-csrf-token", "")
+        if not hmac.compare_digest(supplied_csrf, current.csrf_token):
+            return api_error(403, "csrf_invalid", "A valid CSRF token is required.")
+        key = request.headers.get("idempotency-key", "")
+        if not 16 <= len(key) <= 255 or any(ord(char) < 33 or ord(char) > 126 for char in key):
+            return api_error(422, "invalid_idempotency_key", "A valid Idempotency-Key header is required.")
+        try:
+            result, replay = database.create_project(body.name, key)
+        except IdempotencyConflict:
+            return api_error(409, "idempotency_key_reused", "The idempotency key was already used with a different request.")
+        response = JSONResponse(status_code=201, content=result)
+        response.headers["Idempotency-Replayed"] = "true" if replay else "false"
+        return response
+
+    @app.get("/api/v1/projects", response_model=ProjectListResponse)
+    def list_projects(
+        request: Request,
+        limit: int = Query(default=50, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
+    ):
+        current = require_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        return {"items": database.list_projects(limit, offset), "limit": limit, "offset": offset}
+
+    @app.get("/api/v1/projects/{project_id}", response_model=ProjectRead)
+    def get_project(project_id: str, request: Request):
+        current = require_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            parsed_id = uuid.UUID(project_id)
+        except (ValueError, AttributeError):
+            return api_error(422, "invalid_project_id", "Project ID must be a UUID.")
+        if str(parsed_id) != project_id.lower():
+            return api_error(422, "invalid_project_id", "Project ID must be a canonical UUID.")
+        item = database.get_project(str(parsed_id))
+        if item is None:
+            return api_error(404, "project_not_found", "Project was not found.")
+        return item
+
+    @app.get("/api/v1/jobs/{job_id}", response_model=JobRead)
+    def get_job(job_id: str, request: Request, project_id: str | None = Query(default=None)):
+        current = require_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            return job_service.get_job(job_id, project_id)
+        except (JobNotFound, JobInputError) as exc:
+            return job_exception(exc)
+
+    @app.post("/api/v1/jobs/{job_id}/cancel", response_model=JobRead)
+    def cancel_job(job_id: str, body: EmptyJobRequest, request: Request, project_id: str | None = Query(default=None)):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        key = request.headers.get("idempotency-key", "")
+        try:
+            job_service.get_job(job_id, project_id)
+            result = job_service.request_cancel(job_id, key)
+        except (JobNotFound, JobInputError, JobConflict, IdempotencyConflict) as exc:
+            return job_exception(exc)
+        response = JSONResponse(status_code=202 if result["status"] == "CANCEL_REQUESTED" else 200, content=result)
+        return response
+
+    @app.post("/api/v1/jobs/{job_id}/retry", response_model=JobRead)
+    def retry_job(job_id: str, body: RetryJobRequest, request: Request, project_id: str | None = Query(default=None)):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        key = request.headers.get("idempotency-key", "")
+        try:
+            job_service.get_job(job_id, project_id)
+            result = job_service.retry_job(job_id, body.expected_status, key)
+        except (JobNotFound, JobInputError, JobConflict, IdempotencyConflict) as exc:
+            return job_exception(exc)
+        return JSONResponse(status_code=202, content=result)
 
     return app
 
