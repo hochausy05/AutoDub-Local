@@ -9,17 +9,29 @@ import re
 import sqlite3
 import uuid
 from contextlib import closing, contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Iterator
 
 from app.database import Database, IdempotencyConflict, utc_now
+from app.artifacts import ArtifactError, ArtifactPublicationService, CompletionEvidence
 
 
 _CODE = re.compile(r"^[a-z][a-z0-9_]{0,79}$")
 _KIND = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _PHASE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+_STAGE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+_STAGES = frozenset({"asr", "translation", "tts", "sync", "render"})
 MAX_SNAPSHOT_BYTES = 64 * 1024
 MAX_ATTEMPTS = 3
+
+
+class ActivationStage(StrEnum):
+    ASR = "asr"
+    TRANSLATION = "translation"
+    TTS = "tts"
+    SYNC = "sync"
+    RENDER = "render"
 
 
 class JobNotFound(Exception):
@@ -36,18 +48,16 @@ class JobConflict(Exception):
         super().__init__(code)
 
 
-@dataclass(frozen=True)
-class CompletionEvidence:
-    executor_completed: bool
-    required_outputs_verified: bool
-    evidence_code: str
-
-
 class JobService:
     """Internal service; there is intentionally no public Job creation endpoint."""
 
-    def __init__(self, database: Database):
+    def __init__(self, database: Database, artifact_service: ArtifactPublicationService):
         self.database = database
+        self.artifact_service = artifact_service
+        self._recovery_complete = False
+
+    def _allow_claims_after_recovery(self) -> None:
+        self._recovery_complete = True
 
     @staticmethod
     def _uuid(value: str, field: str) -> str:
@@ -98,14 +108,15 @@ class JobService:
     def _job_detail(self, connection: sqlite3.Connection, job_id: str) -> dict[str, Any]:
         row = connection.execute(
             """SELECT j.id,j.project_id,j.kind,j.input_fingerprint,j.status,j.cancel_requested,
-                      j.lock_version,j.schema_version,j.created_at,j.updated_at
+                      j.lock_version,j.schema_version,j.created_at,j.updated_at,j.activation_stage,
+                      j.expected_input_generation,j.expected_pointer_generation
                FROM jobs AS j JOIN projects AS p ON p.id=j.project_id WHERE j.id=?""",
             (job_id,),
         ).fetchone()
         if row is None:
             raise JobNotFound
         attempts = connection.execute(
-            """SELECT id,attempt_no,schema_version,status,started_at,ended_at,error_code,retryable,progress_json,completion_evidence_json
+            """SELECT id,attempt_no,schema_version,status,started_at,ended_at,error_code,retryable,progress_json,completion_evidence_json,activation_outcome
                FROM job_attempts WHERE job_id=? ORDER BY attempt_no""",
             (job_id,),
         ).fetchall()
@@ -120,6 +131,7 @@ class JobService:
                 "error_code": attempt["error_code"],
                 "retryable": bool(attempt["retryable"]),
                 "progress": self._progress_value(attempt["progress_json"]),
+                "activation_outcome": attempt["activation_outcome"],
             }
             for attempt in attempts
         ]
@@ -139,19 +151,63 @@ class JobService:
             "attempts": values,
             "progress": latest["progress"] if latest else None,
             "error_code": latest["error_code"] if latest else None,
+            "activation_stage": row["activation_stage"],
+            "expected_input_generation": row["expected_input_generation"],
+            "expected_pointer_generation": row["expected_pointer_generation"],
         }
 
-    def create_job(self, project_id: str, kind: str, input_snapshot: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
+    def set_stage_input(self, project_id: str, stage: str, input_snapshot: dict[str, Any]) -> dict[str, Any]:
+        project_id = self._uuid(project_id, "project_id")
+        if not isinstance(stage, str) or not _STAGE.fullmatch(stage) or stage not in _STAGES:
+            raise JobInputError("invalid_activation_stage")
+        if not isinstance(input_snapshot, dict) or type(input_snapshot.get("schema_version")) is not int or input_snapshot["schema_version"] < 1:
+            raise JobInputError("invalid_input_snapshot")
+        snapshot_json = self._canonical(input_snapshot)
+        if len(snapshot_json.encode("utf-8")) > MAX_SNAPSHOT_BYTES:
+            raise JobInputError("input_snapshot_too_large")
+        fingerprint = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+        with self._write() as connection:
+            if connection.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone() is None:
+                raise JobNotFound
+            row = connection.execute(
+                "SELECT input_fingerprint,input_generation,pointer_generation,active_artifact_id FROM stage_pointers WHERE project_id=? AND stage=?",
+                (project_id, stage),
+            ).fetchone()
+            stamp = utc_now()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO stage_pointers(project_id,stage,input_fingerprint,input_generation,pointer_generation,updated_at) VALUES(?,?,?,1,0,?)",
+                    (project_id, stage, fingerprint, stamp),
+                )
+                return {"stage": stage, "input_fingerprint": fingerprint, "input_generation": 1, "pointer_generation": 0, "active_artifact_id": None}
+            generation = row["input_generation"] + int(row["input_fingerprint"] != fingerprint)
+            if generation != row["input_generation"]:
+                connection.execute(
+                    "UPDATE stage_pointers SET input_fingerprint=?,input_generation=?,updated_at=? WHERE project_id=? AND stage=?",
+                    (fingerprint, generation, stamp, project_id, stage),
+                )
+            return {"stage": stage, "input_fingerprint": fingerprint, "input_generation": generation,
+                    "pointer_generation": row["pointer_generation"], "active_artifact_id": row["active_artifact_id"]}
+
+    def create_job(
+        self, project_id: str, kind: str, input_snapshot: dict[str, Any], idempotency_key: str,
+        *, activation_stage: ActivationStage | str | None = None,
+    ) -> dict[str, Any]:
         project_id = self._uuid(project_id, "project_id")
         self.validate_idempotency_key(idempotency_key)
         if not isinstance(kind, str) or not _KIND.fullmatch(kind):
             raise JobInputError("invalid_job_kind")
         if not isinstance(input_snapshot, dict) or type(input_snapshot.get("schema_version")) is not int or input_snapshot["schema_version"] < 1:
             raise JobInputError("invalid_input_snapshot")
+        if activation_stage is not None:
+            if isinstance(activation_stage, ActivationStage):
+                activation_stage = activation_stage.value
+            if not isinstance(activation_stage, str) or not _STAGE.fullmatch(activation_stage) or activation_stage not in _STAGES:
+                raise JobInputError("invalid_activation_stage")
         snapshot_json = self._canonical(input_snapshot)
         if len(snapshot_json.encode("utf-8")) > MAX_SNAPSHOT_BYTES:
             raise JobInputError("input_snapshot_too_large")
-        request_digest = self._digest({"project_id": project_id, "kind": kind, "input_snapshot": input_snapshot})
+        request_digest = self._digest({"project_id": project_id, "kind": kind, "input_snapshot": input_snapshot, "activation_stage": activation_stage})
         input_fingerprint = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
         scope = f"job:create:{project_id}:{kind}"
         with self._write() as connection:
@@ -168,13 +224,27 @@ class JobService:
                 prior_job_id = json.loads(previous["response_json"])["job_id"]
                 return self._job_detail(connection, prior_job_id)
 
+            expected_input_generation = None
+            expected_pointer_generation = None
+            if activation_stage is not None:
+                stage = connection.execute(
+                    "SELECT input_fingerprint,input_generation,pointer_generation FROM stage_pointers WHERE project_id=? AND stage=?",
+                    (project_id, activation_stage),
+                ).fetchone()
+                if stage is None or stage["input_fingerprint"] != input_fingerprint:
+                    raise JobConflict("stage_input_not_current")
+                expected_input_generation = stage["input_generation"]
+                expected_pointer_generation = stage["pointer_generation"]
+
             job_id = str(uuid.uuid4())
             stamp = utc_now()
             connection.execute(
                 """INSERT INTO jobs(id,project_id,kind,input_snapshot,input_fingerprint,idempotency_key,request_digest,
-                                     status,cancel_requested,lock_version,created_at,updated_at)
-                   VALUES(?,?,?,?,?,?,?,'QUEUED',0,1,?,?)""",
-                (job_id, project_id, kind, snapshot_json, input_fingerprint, idempotency_key, request_digest, stamp, stamp),
+                                     status,cancel_requested,lock_version,created_at,updated_at,activation_stage,
+                                     expected_input_generation,expected_pointer_generation)
+                   VALUES(?,?,?,?,?,?,?,'QUEUED',0,1,?,?,?,?,?)""",
+                (job_id, project_id, kind, snapshot_json, input_fingerprint, idempotency_key, request_digest,
+                 stamp, stamp, activation_stage, expected_input_generation, expected_pointer_generation),
             )
             connection.execute(
                 """INSERT INTO idempotency_records(scope,idempotency_key,request_digest,project_id,response_json,created_at)
@@ -193,7 +263,11 @@ class JobService:
         return detail
 
     def claim_next_job(self) -> dict[str, Any] | None:
+        if not self._recovery_complete:
+            raise JobConflict("startup_recovery_required")
         with self._write() as connection:
+            if connection.execute("SELECT 1 FROM jobs WHERE status IN ('RUNNING','CANCEL_REQUESTED') LIMIT 1").fetchone():
+                return None
             row = connection.execute(
                 "SELECT id FROM jobs WHERE status='QUEUED' ORDER BY created_at,id LIMIT 1"
             ).fetchone()
@@ -260,7 +334,10 @@ class JobService:
         scope = f"job:retry:{job_id}"
         digest = self._digest({"job_id": job_id, "action": "retry", "expected_status": expected_status})
         with self._write() as connection:
-            job = connection.execute("SELECT project_id,status FROM jobs WHERE id=?", (job_id,)).fetchone()
+            job = connection.execute(
+                "SELECT project_id,status,activation_stage,expected_input_generation,expected_pointer_generation,input_fingerprint FROM jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
             if job is None:
                 raise JobNotFound
             previous = connection.execute(
@@ -281,6 +358,15 @@ class JobService:
             attempt_count = connection.execute("SELECT COUNT(*) FROM job_attempts WHERE job_id=?", (job_id,)).fetchone()[0]
             if attempt_count >= MAX_ATTEMPTS:
                 raise JobConflict("retry_limit_reached")
+            if job["activation_stage"] is not None:
+                pointer = connection.execute(
+                    "SELECT input_fingerprint,input_generation,pointer_generation FROM stage_pointers WHERE project_id=? AND stage=?",
+                    (job["project_id"], job["activation_stage"]),
+                ).fetchone()
+                if (pointer is None or pointer["input_fingerprint"] != job["input_fingerprint"] or
+                    pointer["input_generation"] != job["expected_input_generation"] or
+                    pointer["pointer_generation"] != job["expected_pointer_generation"]):
+                    raise JobConflict("job_stale")
             stamp = utc_now()
             connection.execute(
                 "UPDATE jobs SET status='QUEUED',cancel_requested=0,lock_version=lock_version+1,updated_at=? WHERE id=? AND status=?",
@@ -327,11 +413,21 @@ class JobService:
     def complete_attempt(self, job_id: str, attempt_id: str, evidence: CompletionEvidence) -> dict[str, Any]:
         job_id = self._uuid(job_id, "job_id")
         attempt_id = self._uuid(attempt_id, "attempt_id")
-        if not isinstance(evidence, CompletionEvidence) or not evidence.executor_completed or not evidence.required_outputs_verified or not _CODE.fullmatch(evidence.evidence_code):
-            raise JobConflict("completion_unverified")
-        evidence_json = self._canonical(asdict(evidence))
+        with closing(self.database.connect()) as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM job_attempts WHERE id=? AND job_id=?", (attempt_id, job_id)
+            ).fetchone()
+        if exists is None:
+            raise JobNotFound
+        try:
+            evidence_json = self.artifact_service.validate_completion_evidence(evidence, job_id, attempt_id)
+        except ArtifactError as exc:
+            raise JobConflict(exc.code) from exc
         with self._write() as connection:
-            job = connection.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+            job = connection.execute(
+                "SELECT status,project_id,input_fingerprint,activation_stage,expected_input_generation,expected_pointer_generation FROM jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
             attempt = connection.execute("SELECT status FROM job_attempts WHERE id=? AND job_id=?", (attempt_id, job_id)).fetchone()
             if job is None or attempt is None:
                 raise JobNotFound
@@ -340,17 +436,47 @@ class JobService:
             stamp = utc_now()
             if job["status"] == "CANCEL_REQUESTED":
                 connection.execute(
-                    "UPDATE job_attempts SET status='CANCELLED',ended_at=?,completion_evidence_json=? WHERE id=?",
-                    (stamp, evidence_json, attempt_id),
+                    "UPDATE job_attempts SET status='CANCELLED',ended_at=?,completion_evidence_json=?,activation_outcome=? WHERE id=?",
+                    (stamp, evidence_json, "CANCELLED" if job["activation_stage"] is not None else "NOT_APPLICABLE", attempt_id),
                 )
                 connection.execute(
                     "UPDATE jobs SET status='CANCELLED',lock_version=lock_version+1,updated_at=? WHERE id=? AND status='CANCEL_REQUESTED'",
                     (stamp, job_id),
                 )
             elif job["status"] == "RUNNING":
+                activation_outcome = "NOT_APPLICABLE"
+                if job["activation_stage"] is not None:
+                    if len(evidence.artifact_ids) != 1:
+                        raise JobConflict("stage_activation_requires_one_artifact")
+                    artifact_id = evidence.artifact_ids[0]
+                    pointer = connection.execute(
+                        "SELECT input_fingerprint,input_generation,pointer_generation,active_artifact_id FROM stage_pointers WHERE project_id=? AND stage=?",
+                        (job["project_id"], job["activation_stage"]),
+                    ).fetchone()
+                    snapshot_matches = (
+                        pointer is not None and pointer["input_fingerprint"] == job["input_fingerprint"] and
+                        pointer["input_generation"] == job["expected_input_generation"] and
+                        pointer["pointer_generation"] == job["expected_pointer_generation"]
+                    )
+                    if snapshot_matches:
+                        if pointer["active_artifact_id"] == artifact_id:
+                            activation_outcome = "ACTIVE"
+                        else:
+                            changed = connection.execute(
+                                """UPDATE stage_pointers SET active_artifact_id=?,pointer_generation=pointer_generation+1,updated_at=?
+                                   WHERE project_id=? AND stage=? AND input_fingerprint=? AND input_generation=? AND pointer_generation=?
+                                     AND EXISTS(SELECT 1 FROM artifacts a WHERE a.id=? AND a.project_id=stage_pointers.project_id
+                                       AND a.status='READY' AND a.input_fingerprint=? AND a.producer_job_id=? AND a.producer_attempt_id=?)""",
+                                (artifact_id, stamp, job["project_id"], job["activation_stage"], job["input_fingerprint"],
+                                 job["expected_input_generation"], job["expected_pointer_generation"], artifact_id,
+                                 job["input_fingerprint"], job_id, attempt_id),
+                            ).rowcount
+                            activation_outcome = "ACTIVE" if changed == 1 else "STALE"
+                    else:
+                        activation_outcome = "STALE"
                 connection.execute(
-                    "UPDATE job_attempts SET status='SUCCEEDED',ended_at=?,completion_evidence_json=? WHERE id=?",
-                    (stamp, evidence_json, attempt_id),
+                    "UPDATE job_attempts SET status='SUCCEEDED',ended_at=?,completion_evidence_json=?,activation_outcome=? WHERE id=?",
+                    (stamp, evidence_json, activation_outcome, attempt_id),
                 )
                 connection.execute(
                     "UPDATE jobs SET status='READY',lock_version=lock_version+1,updated_at=? WHERE id=? AND status='RUNNING'",

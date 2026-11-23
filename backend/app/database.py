@@ -14,7 +14,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 BUSY_TIMEOUT_MS = 5000
 
 
@@ -168,6 +168,122 @@ class Database:
                         connection.execute(statement)
                     connection.execute(
                         "INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (2, utc_now())
+                    )
+                    current = 2
+                if current < 3 and target_version >= 3:
+                    statements = (
+                        "CREATE UNIQUE INDEX jobs_project_id_id_unique_idx ON jobs(project_id,id)",
+                        "CREATE UNIQUE INDEX job_attempts_job_id_id_unique_idx ON job_attempts(job_id,id)",
+                        """CREATE TABLE artifacts (
+                            id TEXT PRIMARY KEY NOT NULL,
+                            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+                            producer_job_id TEXT NOT NULL,
+                            producer_attempt_id TEXT NOT NULL,
+                            kind TEXT NOT NULL CHECK(length(kind) BETWEEN 1 AND 64),
+                            input_fingerprint TEXT NOT NULL CHECK(length(input_fingerprint)=64),
+                            fingerprint_version INTEGER NOT NULL CHECK(fingerprint_version >= 1),
+                            staging_relative_path TEXT NOT NULL UNIQUE,
+                            managed_relative_path TEXT NOT NULL UNIQUE,
+                            sha256 TEXT CHECK(sha256 IS NULL OR (length(sha256)=64 AND sha256 NOT GLOB '*[^a-f0-9]*')),
+                            file_size INTEGER CHECK(file_size IS NULL OR file_size >= 0),
+                            verification_metadata_json TEXT CHECK(verification_metadata_json IS NULL OR (length(verification_metadata_json)<=4096 AND json_valid(verification_metadata_json))),
+                            verification_version TEXT,
+                            status TEXT NOT NULL CHECK(status IN ('STAGING','VERIFIED','READY','FAILED','MISSING','CORRUPT')),
+                            error_code TEXT CHECK(error_code IS NULL OR (length(error_code) BETWEEN 1 AND 80 AND substr(error_code,1,1) GLOB '[a-z]' AND error_code NOT GLOB '*[^a-z0-9_]*')),
+                            schema_version INTEGER NOT NULL DEFAULT 1 CHECK(schema_version >= 1),
+                            created_at TEXT NOT NULL,
+                            verified_at TEXT,
+                            published_at TEXT,
+                            UNIQUE(project_id,id),
+                            FOREIGN KEY(project_id,producer_job_id) REFERENCES jobs(project_id,id) ON DELETE RESTRICT,
+                            FOREIGN KEY(producer_job_id,producer_attempt_id) REFERENCES job_attempts(job_id,id) ON DELETE RESTRICT,
+                            CHECK(status NOT IN ('VERIFIED','READY','MISSING','CORRUPT') OR (sha256 IS NOT NULL AND file_size IS NOT NULL AND verification_metadata_json IS NOT NULL AND verification_version IS NOT NULL AND verified_at IS NOT NULL)),
+                            CHECK(status <> 'READY' OR published_at IS NOT NULL),
+                            CHECK(status <> 'STAGING' OR (sha256 IS NULL AND file_size IS NULL AND verification_metadata_json IS NULL AND verified_at IS NULL AND published_at IS NULL))
+                        )""",
+                        "CREATE INDEX artifacts_job_attempt_idx ON artifacts(project_id,producer_job_id,producer_attempt_id)",
+                        """CREATE TRIGGER artifacts_status_transition_guard BEFORE UPDATE OF status ON artifacts
+                            WHEN OLD.status <> NEW.status AND NOT (
+                                (OLD.status='STAGING' AND NEW.status IN ('VERIFIED','FAILED')) OR
+                                (OLD.status='VERIFIED' AND NEW.status IN ('READY','FAILED')) OR
+                                (OLD.status='READY' AND NEW.status IN ('MISSING','CORRUPT'))
+                            ) BEGIN SELECT RAISE(ABORT, 'invalid artifact state transition'); END""",
+                        """CREATE TRIGGER artifacts_manifest_immutable BEFORE UPDATE OF id,project_id,producer_job_id,producer_attempt_id,kind,input_fingerprint,fingerprint_version,staging_relative_path,managed_relative_path,created_at ON artifacts
+                            BEGIN SELECT RAISE(ABORT, 'artifact publication manifest is immutable'); END""",
+                        """CREATE TRIGGER ready_artifact_content_immutable BEFORE UPDATE OF sha256,file_size,verification_metadata_json,verification_version,verified_at,published_at ON artifacts
+                            WHEN OLD.status IN ('READY','MISSING','CORRUPT')
+                            BEGIN SELECT RAISE(ABORT, 'verified artifact content is immutable'); END""",
+                    )
+                    for statement in statements:
+                        connection.execute(statement)
+                    connection.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (3, utc_now())
+                    )
+                    current = 3
+                if current < 4 and target_version >= 4:
+                    statements = (
+                        "ALTER TABLE jobs ADD COLUMN activation_stage TEXT CHECK(activation_stage IS NULL OR activation_stage IN ('asr','translation','tts','sync','render'))",
+                        "ALTER TABLE jobs ADD COLUMN expected_input_generation INTEGER CHECK(expected_input_generation IS NULL OR expected_input_generation >= 1)",
+                        "ALTER TABLE jobs ADD COLUMN expected_pointer_generation INTEGER CHECK(expected_pointer_generation IS NULL OR expected_pointer_generation >= 0)",
+                        "ALTER TABLE job_attempts ADD COLUMN activation_outcome TEXT NOT NULL DEFAULT 'NOT_APPLICABLE' CHECK(activation_outcome IN ('NOT_APPLICABLE','ACTIVE','STALE','CANCELLED'))",
+                        "DROP TRIGGER jobs_input_immutable",
+                        "DROP TRIGGER jobs_status_transition_guard",
+                        """CREATE TRIGGER jobs_input_immutable BEFORE UPDATE OF id,project_id,kind,input_snapshot,input_fingerprint,idempotency_key,request_digest,activation_stage,expected_input_generation,expected_pointer_generation,created_at ON jobs
+                            BEGIN SELECT RAISE(ABORT, 'job input snapshot is immutable'); END""",
+                        """CREATE TRIGGER jobs_status_transition_guard BEFORE UPDATE OF status ON jobs
+                            WHEN OLD.status <> NEW.status AND NOT (
+                                (OLD.status='QUEUED' AND NEW.status IN ('RUNNING','CANCELLED','INTERRUPTED')) OR
+                                (OLD.status='RUNNING' AND NEW.status IN ('CANCEL_REQUESTED','READY','FAILED','INTERRUPTED')) OR
+                                (OLD.status='CANCEL_REQUESTED' AND NEW.status IN ('CANCELLED','INTERRUPTED')) OR
+                                (OLD.status IN ('CANCELLED','READY','FAILED') AND NEW.status='INTERRUPTED') OR
+                                (OLD.status IN ('FAILED','INTERRUPTED') AND NEW.status='QUEUED')
+                            ) BEGIN SELECT RAISE(ABORT, 'invalid job state transition'); END""",
+                        """CREATE TRIGGER jobs_activation_snapshot_guard BEFORE INSERT ON jobs
+                            WHEN NOT ((NEW.activation_stage IS NULL AND NEW.expected_input_generation IS NULL AND NEW.expected_pointer_generation IS NULL) OR
+                                      (NEW.activation_stage IN ('asr','translation','tts','sync','render') AND NEW.expected_input_generation IS NOT NULL AND NEW.expected_pointer_generation IS NOT NULL))
+                            BEGIN SELECT RAISE(ABORT, 'invalid activation snapshot'); END""",
+                        """CREATE TABLE stage_pointers (
+                            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+                            stage TEXT NOT NULL CHECK(stage IN ('asr','translation','tts','sync','render')),
+                            input_fingerprint TEXT NOT NULL CHECK(length(input_fingerprint)=64 AND input_fingerprint NOT GLOB '*[^a-f0-9]*'),
+                            input_generation INTEGER NOT NULL CHECK(input_generation >= 1),
+                            pointer_generation INTEGER NOT NULL DEFAULT 0 CHECK(pointer_generation >= 0),
+                            active_artifact_id TEXT,
+                            updated_at TEXT NOT NULL,
+                            PRIMARY KEY(project_id,stage),
+                            FOREIGN KEY(project_id,active_artifact_id) REFERENCES artifacts(project_id,id) ON DELETE RESTRICT
+                        )""",
+                        """CREATE TRIGGER stage_pointer_generation_guard BEFORE UPDATE OF input_fingerprint,input_generation,pointer_generation,active_artifact_id ON stage_pointers
+                            WHEN (OLD.input_fingerprint=NEW.input_fingerprint AND OLD.input_generation<>NEW.input_generation) OR
+                                 (OLD.input_fingerprint<>NEW.input_fingerprint AND NEW.input_generation<>OLD.input_generation+1) OR
+                                 (OLD.active_artifact_id IS NEW.active_artifact_id AND OLD.pointer_generation<>NEW.pointer_generation) OR
+                                 (OLD.active_artifact_id IS NOT NEW.active_artifact_id AND NEW.pointer_generation<>OLD.pointer_generation+1)
+                            BEGIN SELECT RAISE(ABORT, 'invalid stage pointer generation'); END""",
+                        """CREATE TABLE recovery_findings (
+                            id TEXT PRIMARY KEY NOT NULL,
+                            relative_path TEXT NOT NULL CHECK(length(relative_path) BETWEEN 1 AND 4096 AND substr(relative_path,1,1)<>'/' AND instr(relative_path,'\\')=0 AND instr('/'||relative_path||'/','/../')=0),
+                            finding_code TEXT NOT NULL CHECK(length(finding_code) BETWEEN 1 AND 80 AND finding_code NOT GLOB '*[^a-z0-9_]*'),
+                            created_at TEXT NOT NULL,
+                            status TEXT NOT NULL DEFAULT 'OPEN' CHECK(status IN ('OPEN','RESOLVED')),
+                            UNIQUE(relative_path,finding_code)
+                        )""",
+                        "CREATE INDEX recovery_findings_open_idx ON recovery_findings(status,created_at)",
+                        """CREATE TRIGGER attempt_activation_outcome_guard BEFORE UPDATE OF activation_outcome ON job_attempts
+                            WHEN OLD.status<>'RUNNING' AND OLD.activation_outcome<>NEW.activation_outcome
+                            BEGIN SELECT RAISE(ABORT, 'terminal activation outcome is immutable'); END""",
+                        """CREATE TRIGGER artifacts_status_transition_guard_v4 BEFORE UPDATE OF status ON artifacts
+                            WHEN OLD.status <> NEW.status AND NOT (
+                                (OLD.status='STAGING' AND NEW.status IN ('VERIFIED','FAILED')) OR
+                                (OLD.status='VERIFIED' AND NEW.status IN ('READY','FAILED','MISSING','CORRUPT')) OR
+                                (OLD.status='READY' AND NEW.status IN ('MISSING','CORRUPT'))
+                            ) BEGIN SELECT RAISE(ABORT, 'invalid artifact state transition'); END""",
+                        "DROP TRIGGER artifacts_status_transition_guard",
+                    )
+                    for statement in statements[:-1]:
+                        connection.execute(statement)
+                    connection.execute(statements[-1])
+                    connection.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (4, utc_now())
                     )
                 connection.commit()
             except BaseException:

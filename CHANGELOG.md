@@ -1,5 +1,19 @@
 # CHANGELOG — AutoDub Local vNext
 
+## 2026-11-23 15:56 UTC+7 — CORE-01D — Startup Recovery & G1 Verification
+- Thêm migration v4 giữ nguyên v1–v3: stage pointer theo stage với input/pointer generation, Job activation snapshot bất biến, Attempt activation outcome và bảng recovery findings bền vững. Thêm `StartupRecovery` vào FastAPI lifespan sau migration và trước khi bật Job claims.
+- Reconcile RUNNING/CANCEL_REQUESTED thành INTERRUPTED, giữ attempt history, retry tường minh có giới hạn/idempotency; claim bị khóa trước recovery và một local supervisor không claim Job thứ hai khi còn Job active. Không kill process theo PID cũ.
+- Đối chiếu Artifact READY bằng hash/validator; phục hồi STAGING/VERIFIED candidate chỉ khi đủ bằng chứng, nhận diện orphan qua manifest/inventory, không xóa candidate. Mất/hỏng Artifact bỏ active pointer nhưng giữ record; thiếu validator cho READY sẽ fail closed trước claim. Thêm typed stage activation với CAS theo input fingerprint/generation và pointer generation; stale/cancelled output giữ lịch sử nhưng không thay pointer.
+- Backend unittest **PASS** (46 tests: CORE-01A/B/C regression, migration v1→v4 giữ Project/Job/Attempt, recovery idempotency, crash-point recovery, orphan không xóa, Job A/B CAS, cancel/completion và retry). Windows hard process termination harness **PASS** tại điểm sau rename/trước DB READY commit. Frontend build **PASS**; Windows launcher smoke **PASS** (2 tests). `git diff --check` và UTF-8 strict decode **PASS**.
+- Windows process-tree cancellation của worker thật **NOT RUN** vì chưa có worker/executor trong slice; cross-volume copy không được dùng/hỗ trợ và không có media/provider validator. G1 **READY FOR PO REVIEW**, chưa được PO nghiệm thu.
+
+## 2026-11-23 15:20 UTC+7 — CORE-01C — Atomic Artifact Publication
+- Thêm migration v3 (giữ nguyên v1/v2) với manifest `artifacts`, FK ownership Project/Job/Attempt, fingerprint, relative paths, SHA-256, size, validator metadata/version, trạng thái publication và trigger khóa manifest/nội dung đã xác minh. Migration v3 được kiểm tra bảo toàn Project, Job và Attempt có sẵn.
+- Thêm `ArtifactPublicationService` nội bộ: streaming vào staging, flush/fsync, validator theo kind, ghi nhận VERIFIED, publish đường dẫn bất biến không ghi đè, hash lại file đích rồi mới commit READY. Completion evidence được seal và kiểm tra lại artifacts; Job/Attempt phải còn hợp lệ. Không có API artifact công khai, validator media production hay activation/current pointer.
+- Backend unittest **PASS** (35 tests, gồm artifact, CORE-01A/B regression, migration, đồng thời, Windows Unicode/no-overwrite, fault injection sau manifest/staging/verification/rename/DB commit, lỗi commit, mất/hỏng file, cancel và artifact lịch sử khi attempt lỗi/stale). `git diff --check` và UTF-8 strict decode **PASS**.
+- Frontend `npm run build` **PASS**; Windows `scripts/windows/dev.ps1 -SmokeTest` **PASS** (2 proxy/session security tests). Không có thay đổi UI hoặc artifact endpoint.
+- Startup reconciliation/orphan recovery và stale activation **NOT RUN / CORE-01D**; FFmpeg/TTS/media validators **NOT RUN / ngoài phạm vi**; G1 chưa nghiệm thu.
+
 ## 2026-11-23 14:55 UTC+7 — CORE-01B — Durable Job & Attempt lifecycle
 - Thêm migration v2 (không sửa migration v1): `jobs`, `job_attempts`, FK/UNIQUE/CHECK, one-active-Attempt index, immutable input-snapshot và state-transition guards; giữ nguyên Project cũ. Dùng chung bảng `idempotency_records` theo scope; Job lưu snapshot JSON, fingerprint, request digest và khóa idempotency.
 - Thêm `JobService` nội bộ: tạo, đọc, claim `BEGIN IMMEDIATE` cùng insert Attempt, progress có whitelist, cancel, complete có `CompletionEvidence`, fail với error code đã sanitize và retry có điều kiện (tối đa 3 Attempts). Thêm session/CSRF-protected GET/cancel/retry API; không có public Job creation hay executor/provider.

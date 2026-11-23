@@ -43,7 +43,7 @@ The launcher binds both services to `127.0.0.1`, creates/uses `backend/.venv`, i
 
 Project API and UI currently support local Project create/list/read. The SQLite file defaults to `%LOCALAPPDATA%\AutoDub-Local\autodub.sqlite3` on Windows, or to `AUTODUB_DATA_ROOT` when set to a local folder outside the source tree. WAL is enabled; UNC and mapped network drives are rejected. The frontend cannot choose a database path. Backend session cookies remain in memory and are reset when the backend restarts; use the launcher's new bootstrap link to establish a session again.
 
-CORE-01B adds internal durable Job creation/claim/failure/completion/progress/retry/cancel service operations and session-protected `GET /api/v1/jobs/{id}`, `POST .../cancel`, and `POST .../retry`. No public Job creation or worker executor is enabled. A Job left `RUNNING` across restart remains visible for CORE-01D reconciliation; this app does not yet recover it or terminate Windows process trees. Explicit retries require a retryable failure and are capped at three Attempts.
+CORE-01B adds internal durable Job creation/claim/failure/completion/progress/retry/cancel service operations and session-protected `GET /api/v1/jobs/{id}`, `POST .../cancel`, and `POST .../retry`. CORE-01C/D add atomic Artifact publication, startup reconciliation, typed stage input/pointer generations and activation CAS. Startup changes pre-restart RUNNING/CANCEL_REQUESTED Jobs to INTERRUPTED, verifies managed Artifact candidates, and inventories unowned files without deleting them. Retry remains explicit and is capped at three Attempts. This build has no media/provider executor or worker process-tree cancellation; it never kills a process using a persisted PID.
 
 Project persistence checks use an isolated temporary database:
 
@@ -52,7 +52,7 @@ Push-Location backend; .\.venv\Scripts\python.exe -m unittest discover -s tests 
 npm --prefix frontend run build
 ```
 
-The Project panel uses the real API; no sample Projects are embedded. Media access, providers, Jobs, import and render remain unimplemented. G0/G1 remain pending their broader acceptance and Product Owner decisions.
+The Project panel uses the real API; no sample Projects are embedded. Job lifecycle and Artifact recovery are internal/backend-only; there is no Job dashboard, media import, provider or render implementation. G0/G1 remain pending broader acceptance and Product Owner decisions.
 
 The working media directory is **outside the repository**, chosen by the owner. Do not create or commit actual user data under the source tree.
 

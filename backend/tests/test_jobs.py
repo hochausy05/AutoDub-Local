@@ -1,6 +1,9 @@
 import tempfile
 import sqlite3
 import unittest
+import hashlib
+import json
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
@@ -9,11 +12,21 @@ from threading import Barrier
 from fastapi.testclient import TestClient
 
 from app.database import Database, IdempotencyConflict
-from app.jobs import CompletionEvidence, JobConflict, JobInputError, JobNotFound, JobService
+from app.artifacts import ArtifactError, CompletionEvidence
+from app.jobs import JobConflict, JobInputError, JobNotFound, JobService
 from app.main import create_app
 
 
 class DurableJobTests(unittest.TestCase):
+    class TestValidator:
+        version = "test-blob-v1"
+
+        def validate(self, path):
+            content = path.read_bytes()
+            if not content.startswith(b"ADTEST-v1\n"):
+                raise ArtifactError("invalid_test_blob")
+            return {"format": "ADTEST-v1", "payload_size": len(content) - 10}
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.data_root = Path(self.temp.name) / "data"
@@ -40,6 +53,8 @@ class DurableJobTests(unittest.TestCase):
         self.assertEqual(project.status_code, 201)
         self.project_id = project.json()["id"]
         self.service: JobService = self.app.state.job_service
+        self.artifacts = self.app.state.artifact_service
+        self.artifacts.validators["test_blob"] = self.TestValidator()
 
     def tearDown(self):
         self.client.__exit__(None, None, None)
@@ -59,28 +74,51 @@ class DurableJobTests(unittest.TestCase):
         self.assertEqual(claimed["id"], job["id"])
         return claimed
 
-    @staticmethod
-    def evidence():
-        # This test-only executor kind is not an ASR/TTS/render success claim.
-        return CompletionEvidence(True, True, "controlled_test_executor_verified")
+    def evidence(self, job, claimed):
+        artifact = self.artifacts.publish(
+            project_id=self.project_id,
+            job_id=job["id"],
+            attempt_id=claimed["attempt"]["id"],
+            kind="test_blob",
+            input_fingerprint=job["input_fingerprint"],
+            fingerprint_version=1,
+            source=b"ADTEST-v1\npayload",
+        )
+        return self.artifacts.completion_evidence(job["id"], claimed["attempt"]["id"], [artifact["id"]])
 
-    def test_migration_v2_preserves_core_01a_project_data(self):
+    def test_migration_v4_preserves_core_01a_b_c_data(self):
         legacy_root = Path(self.temp.name) / "legacy"
         legacy = Database(legacy_root)
         legacy.initialize(target_version=1)
         project, _ = legacy.create_project("Pre-v2 project", "legacy-project-idem-key-01")
+        legacy.initialize(target_version=2)
+        job_id = str(uuid.uuid4())
+        attempt_id = str(uuid.uuid4())
+        snapshot = '{"schema_version":1}'
+        fingerprint = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
         with closing(legacy.connect()) as connection:
-            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 1)
+            connection.execute(
+                "INSERT INTO jobs(id,project_id,kind,input_snapshot,input_fingerprint,idempotency_key,request_digest,status,cancel_requested,lock_version,created_at,updated_at) VALUES(?,?,?, ?,?,'legacy-job-idem-key-01',?,'RUNNING',0,2,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                (job_id, project["id"], "migration_test", snapshot, fingerprint, fingerprint),
+            )
+            connection.execute(
+                "INSERT INTO job_attempts(id,job_id,attempt_no,status,started_at) VALUES(?,?,1,'RUNNING','2026-01-01T00:00:00Z')",
+                (attempt_id, job_id),
+            )
+        legacy.initialize(target_version=3)
+        with closing(legacy.connect()) as connection:
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 3)
         legacy.initialize()
         with closing(legacy.connect()) as connection:
-            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 2)
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 4)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM projects WHERE id=?", (project["id"],)).fetchone()[0], 1)
-            self.assertEqual(connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM jobs WHERE id=?", (job_id,)).fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM job_attempts WHERE id=?", (attempt_id,)).fetchone()[0], 1)
         legacy.initialize()
         with closing(legacy.connect()) as connection:
-            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 2)
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 4)
 
-    def test_job_and_running_attempt_survive_backend_restart_without_reconciliation(self):
+    def test_running_job_and_attempt_are_interrupted_on_backend_restart(self):
         job = self.create_job()
         claimed = self.claim(job)
         attempt_id = claimed["attempt"]["id"]
@@ -91,9 +129,9 @@ class DurableJobTests(unittest.TestCase):
             self.assertEqual(reopened.post("/api/v1/session/bootstrap", headers=headers, json={}).status_code, 200)
             response = reopened.get(f"/api/v1/jobs/{job['id']}", headers=self.headers)
             self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.json()["status"], "RUNNING")
+            self.assertEqual(response.json()["status"], "INTERRUPTED")
             self.assertEqual(response.json()["attempt"]["id"], attempt_id)
-            self.assertEqual(response.json()["attempt"]["status"], "RUNNING")
+            self.assertEqual(response.json()["attempt"]["status"], "INTERRUPTED")
             self.assertNotIn("input_snapshot", response.json())
 
     def test_job_creation_idempotency_replays_same_job_and_conflicts_on_changed_payload(self):
@@ -132,7 +170,7 @@ class DurableJobTests(unittest.TestCase):
         claimed = self.claim(job)
         pending = self.service.request_cancel(job["id"], "job-cancel-running-key-01")
         self.assertEqual(pending["status"], "CANCEL_REQUESTED")
-        stopped = self.service.complete_attempt(job["id"], claimed["attempt"]["id"], self.evidence())
+        stopped = self.service.complete_attempt(job["id"], claimed["attempt"]["id"], self.evidence(job, claimed))
         self.assertEqual(stopped["status"], "CANCELLED")
         self.assertEqual(stopped["attempt"]["status"], "CANCELLED")
 
@@ -147,7 +185,7 @@ class DurableJobTests(unittest.TestCase):
 
         def complete():
             gate.wait()
-            return self.service.complete_attempt(job["id"], claimed["attempt"]["id"], self.evidence())
+            return self.service.complete_attempt(job["id"], claimed["attempt"]["id"], self.evidence(job, claimed))
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             cancel_future = pool.submit(cancel)
@@ -224,10 +262,12 @@ class DurableJobTests(unittest.TestCase):
         with self.assertRaises(JobConflict):
             self.service.retry_job(job["id"], "FAILED", "invalid-retry-key-000001")
         with self.assertRaises(JobNotFound):
-            self.service.complete_attempt(job["id"], "00000000-0000-4000-8000-000000000000", self.evidence())
+            self.service.complete_attempt(job["id"], "00000000-0000-4000-8000-000000000000", object())
         claimed = self.claim(job)
         with self.assertRaises(JobConflict):
-            self.service.complete_attempt(job["id"], claimed["attempt"]["id"], CompletionEvidence(False, False, "not_verified"))
+            self.service.complete_attempt(job["id"], claimed["attempt"]["id"], object())
+        with self.assertRaises(TypeError):
+            CompletionEvidence(job["id"], claimed["attempt"]["id"], (), job["input_fingerprint"], _seal=object())
         self.assertEqual(self.service.get_job(job["id"])["status"], "RUNNING")
 
     def test_progress_is_bounded_and_reported_by_api_service(self):

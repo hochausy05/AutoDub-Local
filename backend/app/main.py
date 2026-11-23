@@ -19,7 +19,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from fastapi.responses import JSONResponse
 
 from app.database import Database, IdempotencyConflict
+from app.artifacts import ArtifactPublicationService
 from app.jobs import JobConflict, JobInputError, JobNotFound, JobService
+from app.recovery import StartupRecovery
 
 
 SESSION_COOKIE = "autodub_session"
@@ -128,11 +130,14 @@ def create_app(
     if port != 8000 or allowed_origin != "http://127.0.0.1:5173":
         raise ValueError("The development skeleton uses fixed backend and UI ports/origin.")
     database = Database(data_root)
-    job_service = JobService(database)
+    artifact_service = ArtifactPublicationService(database)
+    job_service = JobService(database, artifact_service)
+    startup_recovery = StartupRecovery(database, job_service, artifact_service)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         database.initialize()
+        _app.state.recovery_report = startup_recovery.reconcile()
         yield
 
     app = FastAPI(
@@ -143,7 +148,9 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.database = database
+    app.state.artifact_service = artifact_service
     app.state.job_service = job_service
+    app.state.startup_recovery = startup_recovery
     expected_host = f"{host}:{port}"
     sessions: dict[str, Session] = {}
     secret_deadline = clock() + BOOTSTRAP_TTL_SECONDS

@@ -13,6 +13,8 @@
 ### CORE-01 — SQLite + FastAPI
 - [x] **CORE-01A Project persistence slice:** SQLite WAL/migration foundation, Project create/list/read API and UI; ten backend tests, frontend build and local launcher smoke pass (see CHANGELOG).
 - [x] **CORE-01B durable Job/Attempt slice:** migration v2, internal lifecycle service, session-protected get/cancel/retry API; tested by 14 Job tests plus CORE-01A regression suite (see CHANGELOG).
+- [x] **CORE-01C atomic artifact publication slice:** migration v3 manifest, validator-gated streaming publication, no-overwrite immutable paths, integrity recheck and sealed Job completion evidence; backend suite and crash-state tests pass (see CHANGELOG).
+- [x] **CORE-01D startup recovery slice:** migration v4, idempotent Job/Artifact reconciliation, durable orphan inventory, typed stage activation CAS and Windows subprocess crash verification; G1 remains pending PO acceptance (see CHANGELOG).
 - [ ] SQLite WAL/foreign keys/migrations, API errors, loopback-only API and local settings.
 - [ ] Minimal single-machine durable Job/Attempt status, cancellation and startup reconciliation.
 - [ ] Atomic file staging → validation → publish, no orphan files misreported as READY.
