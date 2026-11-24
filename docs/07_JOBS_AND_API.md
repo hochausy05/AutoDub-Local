@@ -25,6 +25,11 @@ FastAPI on `http://127.0.0.1:8000/api/v1`, strictly local. Responses JSON valida
 | `GET/PATCH` | `/projects/{id}/asr/runs/{run_id}` | List and review transcript |
 | `POST` | `/projects/{id}/translations/jobs` | Start Gemini translation |
 | `PATCH` | `/projects/{id}/translations/runs/{run_id}/units` | Bulk optimistic edits |
+| `GET` | `/projects/{id}/translations/runs/{run_id}/editor` | Read immutable provider output, draft and active accepted revision |
+| `POST` | `/projects/{id}/translations/runs/{run_id}/drafts` | Create/reuse a draft from provider output or active accepted revision |
+| `PATCH` | `/projects/{id}/translations/runs/{run_id}/drafts/{revision_id}/units` | Atomic bulk edit with expected lock version and idempotency key |
+| `POST` | `/projects/{id}/translations/runs/{run_id}/drafts/{revision_id}/accept` | CAS-accept immutable draft revision |
+| `POST` | `/projects/{id}/translations/runs/{run_id}/accept-original` | Accept immutable provider output as a revision |
 | `GET` | `/tts/voices?provider=edge` | Current voice options (cacheable) |
 | `POST` | `/tts/previews` | Cached sample by config |
 | `POST` | `/projects/{id}/tts/jobs` | Generate selected/all stale Units |
@@ -43,6 +48,8 @@ FastAPI on `http://127.0.0.1:8000/api/v1`, strictly local. Responses JSON valida
 | `POST` | `/storage/cleanup/execute` | Confirmed scoped cleanup only |
 
 ## 3. API payload sketches
+
+The translation editor routes above are implemented in the TRANS-01B slice. Mutations require the existing local session, exact Host/Origin and CSRF guards, plus an `Idempotency-Key`; bulk save includes `expected_lock_version` and the complete edit list. Stale locks or active-revision races return a conflict; invalid/duplicate/unknown Unit IDs reject the whole transaction. Drafts are mutable only through bulk save. Provider output and accepted revisions are immutable. The editor GET is read-only and returns source Units, current draft (if any), and active accepted revision separately. This does not implement a TTS endpoint or mark G4 accepted.
 
 Translation Run responses include an immutable `pass_strategy` (`SINGLE_PASS` for new production Runs, `TWO_PASS` for existing Runs) and Unit `final_text`. Single-Pass results leave `pass1_text` and `pass2_text` null; clients render `final_text` and must not infer a second generation. The create request continues to require `privacy_consent_confirmed: true`; local UI remembers consent but sends that assertion on each Job creation request.
 

@@ -29,8 +29,11 @@ export type ASRRunSummary = { id: string; project_id: string; source_asset_id: s
 export type ASRRun = ASRRunSummary & { model_revision: string; input_fingerprint: string; timing: Record<string, unknown>; provenance: { requested_device: string; actual_device: string; compute_type: string; fallback_reason: string | null; language_probability: number | null }; segments: ASRSegment[] };
 export type TranscriptSegment = { row_id: string; stable_segment_key: string; position: number; text: string; start_us: number; end_us: number; parent_keys: string[]; coverage_group_id: string | null; coverage_status: "PENDING" | "REVIEWED" | null; source_segment_ids: string[]; source_texts: string[]; timing_warning: boolean };
 export type TranscriptRevision = { id: string; project_id: string; run_id: string; source_asset_id: string; parent_revision_id: string | null; revision_no: number; status: "DRAFT" | "ACCEPTED"; lock_version: number; created_at: string; accepted_at: string | null; is_active: boolean; is_current: boolean; active_generation: number; run_status: string; duration_us: number; segments: TranscriptSegment[] };
-export type TranslationUnit = { unit_id: string; position: number; revision_segment_ids: string[]; source_segment_ids: string[]; source_text: string; start_us: number; end_us: number; pass1_text: string | null; pass2_text: string | null; final_text: string | null; final_notes: string[]; status: string; error_code: string | null; review_flags: string[] };
+export type TranslationUnit = { unit_id: string; logical_unit_key: string; position: number; revision_segment_ids: string[]; source_segment_ids: string[]; source_text: string; start_us: number; end_us: number; pass1_text: string | null; pass2_text: string | null; final_text: string | null; final_notes: string[]; status: string; error_code: string | null; review_flags: string[] };
 export type TranslationRun = { id: string; project_id: string; producer_job_id: string; transcript_revision_id: string; source_asset_id: string; status: string; pass_strategy: "SINGLE_PASS" | "TWO_PASS"; error_code: string | null; is_active: boolean; units: TranslationUnit[] };
+export type TranslationRevisionUnit = Pick<TranslationUnit, "unit_id" | "logical_unit_key" | "position" | "revision_segment_ids" | "source_segment_ids" | "source_text" | "start_us" | "end_us"> & { final_text: string; unit_fingerprint: string; text_origin: "PROVIDER_OUTPUT" | "USER_EDIT" };
+export type TranslationRevision = { id: string; project_id: string; run_id: string; parent_revision_id: string | null; source_revision_id: string | null; source_kind: "PROVIDER_OUTPUT" | "ACCEPTED_REVISION"; revision_no: number; status: "DRAFT" | "ACCEPTED"; lock_version: number; fingerprint: string; fingerprint_version: number; provenance: Record<string, unknown>; created_at: string; accepted_at: string | null; is_active: boolean; units: TranslationRevisionUnit[] };
+export type TranslationEditorState = { project_id: string; run_id: string; source_asset_id: string; transcript_revision_id: string; run_is_current: boolean; active_revision_id: string | null; active_generation: number; original_units: TranslationRevisionUnit[]; draft: TranslationRevision | null; accepted: TranslationRevision | null; latest_accepted: TranslationRevision | null };
 
 async function checked(response: Response) {
   if (response.ok) return;
@@ -70,6 +73,14 @@ async function checked(response: Response) {
       cuda_initialization_failed: "CUDA khởi tạo thất bại; CPU fallback không thành công.",
       asr_inference_failed: "Faster-Whisper không hoàn tất nhận diện.",
       transcript_revision_conflict: "Bản nháp đã thay đổi ở nơi khác. Nội dung bạn đang nhập vẫn được giữ; tải phiên bản mới và so sánh trước khi lưu lại.",
+      translation_revision_conflict: "Bản dịch đã được cập nhật ở nơi khác. Nội dung đang nhập vẫn được giữ; tải lại để đối chiếu.",
+      translation_active_revision_conflict: "Bản đã duyệt vừa thay đổi. Tải lại trạng thái rồi kiểm tra trước khi duyệt tiếp.",
+      translation_run_stale: "Kết quả dịch đã cũ do nguồn hoặc Run thay đổi. Hãy tải lại kết quả hiện hành.",
+      translation_revision_coverage_invalid: "Không thể xác minh đầy đủ các Unit của bản dịch.",
+      translation_unit_not_found: "Một Unit không thuộc bản dịch hiện hành. Bản nháp chưa được lưu.",
+      duplicate_translation_unit: "Danh sách thay đổi có Unit bị lặp. Không có thay đổi nào được lưu.",
+      invalid_translation_text: "Nội dung cần có chữ hợp lệ và không được để trống.",
+      translation_revision_immutable: "Bản đã duyệt chỉ có thể xem. Hãy sửa bản nháp mới.",
       transcript_active_revision_conflict: "Một phiên bản khác vừa được duyệt. Tải lại lịch sử rồi kiểm tra trước khi duyệt tiếp.",
       transcript_input_stale: "Video hoặc kết quả nhận diện đã thay đổi. Bản nháp được giữ lại nhưng cần kiểm tra trên kết quả hiện hành.",
       transcript_review_required: "Hãy kiểm tra và xác nhận các câu vừa tách hoặc gộp trước khi duyệt.",
@@ -296,4 +307,36 @@ export async function fetchTranslationRun(projectId: string, runId: string) {
   const response = await fetch(`/api/v1/projects/${projectId}/translations/runs/${runId}`, { credentials: "same-origin", cache: "no-store" });
   await checked(response);
   return await response.json() as TranslationRun;
+}
+
+async function translationRevisionMutation<T>(url: string, method: "POST" | "PATCH", body: unknown) {
+  const csrf = currentCsrfToken();
+  if (!csrf) throw new Error("Phiên cục bộ chưa sẵn sàng.");
+  const response = await fetch(url, { method, credentials: "same-origin", headers: {
+    "Content-Type": "application/json", "X-CSRF-Token": csrf, "Idempotency-Key": crypto.randomUUID(),
+  }, body: JSON.stringify(body) });
+  await checked(response);
+  return await response.json() as T;
+}
+
+export async function fetchTranslationEditor(projectId: string, runId: string) {
+  const response = await fetch(`/api/v1/projects/${projectId}/translations/runs/${runId}/editor`, { credentials: "same-origin", cache: "no-store" });
+  await checked(response);
+  return await response.json() as TranslationEditorState;
+}
+
+export async function createTranslationDraft(projectId: string, runId: string, baseAcceptedRevisionId: string | null) {
+  return translationRevisionMutation<TranslationRevision>(`/api/v1/projects/${projectId}/translations/runs/${runId}/drafts`, "POST", { base_accepted_revision_id: baseAcceptedRevisionId });
+}
+
+export async function saveTranslationDraft(projectId: string, runId: string, revisionId: string, expectedLockVersion: number, edits: { unit_id: string; text: string }[]) {
+  return translationRevisionMutation<TranslationRevision>(`/api/v1/projects/${projectId}/translations/runs/${runId}/drafts/${revisionId}/units`, "PATCH", { expected_lock_version: expectedLockVersion, edits });
+}
+
+export async function acceptTranslationDraft(projectId: string, runId: string, revisionId: string, expectedLockVersion: number, expectedActiveRevisionId: string | null) {
+  return translationRevisionMutation<TranslationRevision>(`/api/v1/projects/${projectId}/translations/runs/${runId}/drafts/${revisionId}/accept`, "POST", { expected_lock_version: expectedLockVersion, expected_active_revision_id: expectedActiveRevisionId });
+}
+
+export async function acceptOriginalTranslation(projectId: string, runId: string, expectedActiveRevisionId: string | null) {
+  return translationRevisionMutation<TranslationRevision>(`/api/v1/projects/${projectId}/translations/runs/${runId}/accept-original`, "POST", { expected_active_revision_id: expectedActiveRevisionId });
 }

@@ -27,10 +27,11 @@ MODEL_ID = "gemini-3.1-flash-lite"
 API_TYPE = "generate_content"
 API_VERSION = "v1beta"
 PROMPT_VERSION = "translation-vi-two-pass-v2"
-SINGLE_PASS_PROMPT_VERSION = "translation-vi-single-pass-v4-compact"
+SINGLE_PASS_PROMPT_VERSION = "translation-vi-single-pass-v5-compact-duration"
 PASS_STRATEGY = "SINGLE_PASS"
 NORMALIZATION_POLICY_VERSION = "terminal-punctuation-v1"
-WIRE_PROTOCOL_VERSION = "translation-wire-v2"
+WIRE_PROTOCOL_VERSION = "translation-wire-v3"
+LEGACY_TWO_PASS_WIRE_PROTOCOL_VERSION = "translation-wire-v2"
 CHUNK_POLICY_VERSION = "adaptive-token-estimate-v3"
 # These are conservative local planning budgets, not claims about Google's hard limits.
 # We reserve room for prompt/schema/context and estimate the larger Vietnamese Pass 2.
@@ -96,7 +97,7 @@ class PassResponse(BaseModel):
 
 
 class TranslationProvider(Protocol):
-    def translate(self, *, pass_number: int, chunk_id: str, units: list[dict[str, Any]], context: list[dict[str, Any]], pass_strategy: str = "TWO_PASS") -> dict[str, Any]: ...
+    def translate(self, *, pass_number: int, chunk_id: str, units: list[dict[str, Any]], context: list[dict[str, Any]], pass_strategy: str = "TWO_PASS", wire_protocol_version: str = WIRE_PROTOCOL_VERSION) -> dict[str, Any]: ...
 
 
 class GeminiProvider:
@@ -292,7 +293,7 @@ class GeminiProvider:
                   diagnostic_context: dict[str, Any] | None = None,
                   cancelled: Callable[[], bool] | None = None,
                   retrying: Callable[[float, str], None] | None = None,
-                  pass_strategy: str = "TWO_PASS") -> dict[str, Any]:
+                  pass_strategy: str = "TWO_PASS", wire_protocol_version: str = WIRE_PROTOCOL_VERSION) -> dict[str, Any]:
         if not self._key:
             raise TranslationError("gemini_api_key_missing", status=503)
         task = ("Translate each source Unit into Vietnamese for dubbing. Follow this priority order: (1) preserve exact meaning and context, including negation, names, terminology, numbers, humor and tone; (2) maximize brevity; (3) fit the available utterance duration, when duration information is supplied; (4) sound natural when spoken. Produce the shortest wording that preserves meaning and context. When alternatives convey the same meaning, always choose fewer syllables, even if the longer alternative sounds more natural or polished. Remove filler, particles, repetition, redundant pronouns and any phrase that can be omitted without changing meaning. Do not add words merely to sound smooth or polished. Elliptical phrasing is acceptable if accurate. Do not paraphrase, explain or expand. Review every Unit within this same generation and remove dispensable wording before returning it. Be especially concise for brief Units. Do not impose a fixed character or syllable limit, and do not omit important information to shorten. Never use terminal punctuation on a Unit; keep internal punctuation only when needed for comprehension. Apply these rules across genres and source languages. Decide what is dispensable from context; do not use a fixed forbidden-word list." if pass_strategy == "SINGLE_PASS"
@@ -304,9 +305,14 @@ class GeminiProvider:
             wire_map[wire_id] = {"unit_id": unit["unit_id"],
                                  "revision_segment_ids": unit.get("revision_segment_ids", [])}
             value: dict[str, Any] = {"id": wire_id, "source": unit["source_text"]}
+            if pass_strategy == "SINGLE_PASS" or pass_number == 2:
+                start_us, end_us = unit.get("start_us"), unit.get("end_us")
+                if (not isinstance(start_us, int) or isinstance(start_us, bool) or start_us < 0
+                        or not isinstance(end_us, int) or isinstance(end_us, bool) or end_us <= start_us):
+                    raise TranslationError("translation_invalid_unit_timing")
+                value["duration_ms"] = max(1, round((end_us - start_us) / 1000))
             if pass_number == 2:
                 value["draft_vi"] = unit["draft_vi"]
-                value["duration_ms"] = max(1, round((unit["end_us"] - unit["start_us"]) / 1000))
             wire_units.append(value)
         owned_positions = [unit.get("position", index) for index, unit in enumerate(units)]
         first_position, last_position = min(owned_positions), max(owned_positions)
@@ -330,7 +336,7 @@ class GeminiProvider:
         if self._credential is not None:
             request_info.update({"credential_alias": self._credential.alias, "quota_group_alias": self._credential.quota_group})
         request_info.update({"api_type": self.api_type, "api_version": API_VERSION, "sdk_version": SDK_VERSION,
-                             "wire_protocol_version": WIRE_PROTOCOL_VERSION, "model_id": self.model_id})
+                             "wire_protocol_version": wire_protocol_version, "model_id": self.model_id})
         physical_before = self.physical_http_request_count
         sdk_before = self._sdk_call_count
         physical_recorded = physical_before
@@ -434,7 +440,7 @@ class GeminiProvider:
                                          "text": by_id[wire_id], "notes": []}
                                         for wire_id in wire_map]}
                     self.last_call_metadata = {"model_id": self.model_id, "api_type": self.api_type, "api_version": API_VERSION,
-                        "sdk_version": SDK_VERSION, "wire_protocol_version": WIRE_PROTOCOL_VERSION,
+                        "sdk_version": SDK_VERSION, "wire_protocol_version": wire_protocol_version,
                         "credential_alias": self._credential.alias if self._credential else None,
                         "quota_group_alias": self._credential.quota_group if self._credential else None,
                         "sdk_call_count": self._sdk_call_count - sdk_before,
@@ -463,7 +469,7 @@ class GeminiProvider:
                     return result
                 except TranslationError as exc:
                     self.last_call_metadata = {"model_id": self.model_id, "api_type": self.api_type, "api_version": API_VERSION,
-                        "sdk_version": SDK_VERSION, "wire_protocol_version": WIRE_PROTOCOL_VERSION,
+                        "sdk_version": SDK_VERSION, "wire_protocol_version": wire_protocol_version,
                         "credential_alias": self._credential.alias if self._credential else None,
                         "quota_group_alias": self._credential.quota_group if self._credential else None,
                         "sdk_call_count": self._sdk_call_count - sdk_before,
@@ -513,7 +519,7 @@ class GeminiProvider:
                     physical_delta = max(0, self.physical_http_request_count - physical_recorded)
                     sdk_delta = max(0, self._sdk_call_count - sdk_recorded)
                     self.call_history.append({"model_id": self.model_id, "api_type": self.api_type, "api_version": API_VERSION,
-                        "sdk_version": SDK_VERSION, "wire_protocol_version": WIRE_PROTOCOL_VERSION,
+                        "sdk_version": SDK_VERSION, "wire_protocol_version": wire_protocol_version,
                         "credential_alias": self._credential.alias if self._credential else None,
                         "quota_group_alias": self._credential.quota_group if self._credential else None,
                         "sdk_call_count": sdk_delta, "physical_http_request_count": physical_delta,
@@ -745,7 +751,7 @@ class TranslationService:
                 "transcript_generation": revision["transcript_generation"], "asr_artifact_id": revision["asr_artifact_id"],
                 "asr_input_fingerprint": revision["asr_fingerprint"], "target_language": "vi", "provider": "gemini",
                 "model_id": MODEL_ID, "api_type": API_TYPE, "api_version": API_VERSION,
-                "wire_protocol_version": WIRE_PROTOCOL_VERSION, "provider_sdk_version": SDK_VERSION,
+                "wire_protocol_version": WIRE_PROTOCOL_VERSION if self.pass_strategy == "SINGLE_PASS" else LEGACY_TWO_PASS_WIRE_PROTOCOL_VERSION, "provider_sdk_version": SDK_VERSION,
                 "pass_strategy": self.pass_strategy, "normalization_policy_version": NORMALIZATION_POLICY_VERSION,
                 "prompt_version": prompt_version, "chunk_policy_version": CHUNK_POLICY_VERSION}
             return result, units
@@ -783,7 +789,7 @@ class TranslationService:
                 raise TranslationError("accepted_transcript_stale")
             prompt_version = SINGLE_PASS_PROMPT_VERSION if self.pass_strategy == "SINGLE_PASS" else PROMPT_VERSION
             connection.execute("""INSERT INTO translation_runs(id,project_id,producer_job_id,transcript_revision_id,source_asset_id,input_fingerprint,provider,model_id,provider_sdk_version,prompt_version,status,created_at,api_type,api_version,wire_protocol_version,pass_strategy,normalization_policy_version)
-                VALUES(?,?,?,?,?,?,?,?,?,?,'QUEUED',?,?,?,?,?,?)""", (run_id, project_id, job_id, revision_id, snapshot["source_asset_id"], hashlib.sha256(self._json(snapshot).encode()).hexdigest(), "gemini", MODEL_ID, SDK_VERSION, prompt_version, utc_now(), API_TYPE, API_VERSION, WIRE_PROTOCOL_VERSION, self.pass_strategy, NORMALIZATION_POLICY_VERSION))
+                VALUES(?,?,?,?,?,?,?,?,?,?,'QUEUED',?,?,?,?,?,?)""", (run_id, project_id, job_id, revision_id, snapshot["source_asset_id"], hashlib.sha256(self._json(snapshot).encode()).hexdigest(), "gemini", MODEL_ID, SDK_VERSION, prompt_version, utc_now(), API_TYPE, API_VERSION, snapshot["wire_protocol_version"], self.pass_strategy, NORMALIZATION_POLICY_VERSION))
             for chunk_no, chunk in enumerate(chunks):
                 chunk_id_list = [item["unit_id"] for item in chunk]
                 chunk_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"autodub:{run_id}:chunk:{chunk_no}"))
@@ -955,7 +961,7 @@ class TranslationWorker:
         if not history:
             return
         with closing(self.database.connect()) as connection:
-            run = connection.execute("SELECT prompt_version FROM translation_runs WHERE id=?", (run_id,)).fetchone()
+            run = connection.execute("SELECT prompt_version,wire_protocol_version,provider_sdk_version,api_version,api_type,model_id FROM translation_runs WHERE id=?", (run_id,)).fetchone()
             prompt_version = run["prompt_version"] if run else PROMPT_VERSION
             for call in history:
                 connection.execute("""INSERT INTO translation_provider_calls(
@@ -965,9 +971,9 @@ class TranslationWorker:
                     latency_ms,finish_reason,provider_request_id,status,error_code,created_at,http_status,request_characters,estimated_input_tokens)
                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (str(uuid.uuid4()), run_id, attempt_id, call.get("chunk_id", "unknown"), call.get("pass_number", 1),
-                     call.get("model_id", getattr(provider, "model_id", MODEL_ID)), call.get("api_type", getattr(provider, "api_type", API_TYPE)),
-                     call.get("api_version", API_VERSION), call.get("sdk_version", SDK_VERSION), prompt_version,
-                     call.get("wire_protocol_version", WIRE_PROTOCOL_VERSION), call.get("credential_alias"), call.get("quota_group_alias"),
+                     run["model_id"] if run else call.get("model_id", getattr(provider, "model_id", MODEL_ID)), run["api_type"] if run else call.get("api_type", getattr(provider, "api_type", API_TYPE)),
+                     run["api_version"] if run else call.get("api_version", API_VERSION), run["provider_sdk_version"] if run else call.get("sdk_version", SDK_VERSION), prompt_version,
+                     run["wire_protocol_version"] if run else call.get("wire_protocol_version", WIRE_PROTOCOL_VERSION), call.get("credential_alias"), call.get("quota_group_alias"),
                      int(call.get("sdk_call_count", 0)), int(call.get("physical_http_request_count", 0)), call.get("input_tokens"),
                      call.get("output_tokens"), int(call.get("unit_count_requested", 0)), call.get("unit_count_received"),
                      int(call.get("latency_ms", 0)), call.get("finish_reason"), call.get("provider_request_id"),
@@ -1016,10 +1022,23 @@ class TranslationWorker:
                 job_row = connection.execute("SELECT input_snapshot FROM jobs WHERE id=?", (job["id"],)).fetchone()
             if row is None or attempt is None: raise TranslationError("translation_run_missing")
             run_id, attempt_id = row["id"], attempt["id"]
-            if row["wire_protocol_version"] != WIRE_PROTOCOL_VERSION:
-                raise TranslationError("translation_protocol_version_incompatible")
-            self._set_run(run_id, "RUNNING", None)
             snapshot = json.loads(job_row["input_snapshot"])
+            expected_prompt = SINGLE_PASS_PROMPT_VERSION if row["pass_strategy"] == "SINGLE_PASS" else PROMPT_VERSION
+            expected_wire = WIRE_PROTOCOL_VERSION if row["pass_strategy"] == "SINGLE_PASS" else LEGACY_TWO_PASS_WIRE_PROTOCOL_VERSION
+            if (row["pass_strategy"] not in {"SINGLE_PASS", "TWO_PASS"}
+                    or row["prompt_version"] != expected_prompt
+                    or row["wire_protocol_version"] != expected_wire
+                    or row["normalization_policy_version"] != NORMALIZATION_POLICY_VERSION
+                    or row["provider_sdk_version"] != SDK_VERSION
+                    or row["api_version"] != API_VERSION
+                    or row["api_type"] not in {"generate_content", "interactions"}
+                    or snapshot.get("chunk_policy_version") != CHUNK_POLICY_VERSION
+                    or any(snapshot.get(key) != row[value] for key, value in (("prompt_version", "prompt_version"),
+                        ("wire_protocol_version", "wire_protocol_version"), ("provider_sdk_version", "provider_sdk_version"),
+                        ("api_version", "api_version"), ("api_type", "api_type"), ("model_id", "model_id"),
+                        ("pass_strategy", "pass_strategy"), ("normalization_policy_version", "normalization_policy_version")))):
+                raise TranslationError("translation_execution_contract_incompatible")
+            self._set_run(run_id, "RUNNING", None)
             with closing(self.database.connect()) as connection:
                 input_units = connection.execute("SELECT unit_id,logical_unit_key,position,revision_segment_ids_json,source_segment_ids_json,source_text,start_us,end_us,chunk_no FROM translation_units WHERE run_id=? ORDER BY position", (run_id,)).fetchall()
             fingerprint_units = [{"unit_id": unit["unit_id"], "logical_unit_key": unit["logical_unit_key"], "position": unit["position"],
@@ -1072,6 +1091,7 @@ class TranslationWorker:
                     try:
                         result = provider.translate(pass_number=1, pass_strategy="SINGLE_PASS", chunk_id=chunk_id,
                             units=[self._provider_unit(u) for u in units], context=context, diagnostic_context=provider_context,
+                            wire_protocol_version=row["wire_protocol_version"],
                             cancelled=lambda: self._cancelled(job["id"]), retrying=on_retry)
                     finally:
                         self._persist_provider_calls(provider, run_id, attempt_id, history_start)
@@ -1085,6 +1105,7 @@ class TranslationWorker:
                     try:
                         result = provider.translate(pass_number=1, chunk_id=chunk_id, units=[self._provider_unit(u) for u in units], context=context,
                                                    diagnostic_context=provider_context,
+                                                   wire_protocol_version=row["wire_protocol_version"],
                                                    cancelled=lambda: self._cancelled(job["id"]), retrying=on_retry)
                     finally:
                         self._persist_provider_calls(provider, run_id, attempt_id, history_start)
@@ -1117,6 +1138,7 @@ class TranslationWorker:
                         try:
                             result = provider.translate(pass_number=2, chunk_id=chunk_id, units=batch, context=pass2_context,
                                                        diagnostic_context=provider_context,
+                                                       wire_protocol_version=row["wire_protocol_version"],
                                                        cancelled=lambda: self._cancelled(job["id"]), retrying=on_retry)
                         finally:
                             self._persist_provider_calls(provider, run_id, attempt_id, history_start)
@@ -1131,13 +1153,15 @@ class TranslationWorker:
                 self.jobs.update_attempt_progress(job["id"], attempt_id, {"phase": "translating", "completed_units": sum(len(json.loads(c["unit_ids_json"])) for c in chunks if c["chunk_no"] <= chunk_no), "total_units": sum(len(json.loads(c["unit_ids_json"])) for c in chunks)})
             with closing(self.database.connect()) as connection:
                 unit_rows = connection.execute("SELECT * FROM translation_units WHERE run_id=? ORDER BY position", (run_id,)).fetchall()
+            with closing(self.database.connect()) as connection:
+                provider_calls = [dict(call) for call in connection.execute("SELECT * FROM translation_provider_calls WHERE run_id=? ORDER BY rowid", (run_id,)).fetchall()]
             manifest = {"schema_version": 1, "run_id": run_id, "input_fingerprint": job["input_fingerprint"],
-                "provider": "gemini", "model_id": getattr(provider, "model_id", MODEL_ID), "provider_sdk_version": SDK_VERSION,
+                "provider": "gemini", "model_id": row["model_id"], "provider_sdk_version": row["provider_sdk_version"],
                 "api_type": row["api_type"], "api_version": row["api_version"],
                 "wire_protocol_version": row["wire_protocol_version"],
-                "prompt_version": row["prompt_version"], "chunk_policy_version": CHUNK_POLICY_VERSION,
+                "prompt_version": row["prompt_version"], "chunk_policy_version": snapshot.get("chunk_policy_version", CHUNK_POLICY_VERSION),
                 "pass_strategy": row["pass_strategy"], "normalization_policy_version": row["normalization_policy_version"],
-                "provider_calls": getattr(provider, "call_history", []),
+                "provider_calls": provider_calls,
                 "target_language": "vi", "source_asset_id": snapshot["source_asset_id"],
                 "transcript_revision_id": snapshot["transcript_revision_id"], "units": [
                     {"unit_id": u["unit_id"], "logical_unit_key": u["logical_unit_key"], "position": u["position"],

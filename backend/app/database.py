@@ -14,7 +14,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 BUSY_TIMEOUT_MS = 5000
 
 
@@ -642,6 +642,81 @@ class Database:
                     connection.execute("CREATE TRIGGER translation_unit_final_result_immutable BEFORE UPDATE OF final_text,final_notes_json ON translation_units WHEN OLD.final_text IS NOT NULL AND (OLD.final_text IS NOT NEW.final_text OR OLD.final_notes_json IS NOT NEW.final_notes_json) BEGIN SELECT RAISE(ABORT, 'verified translation output is immutable'); END")
                     connection.execute("CREATE TRIGGER translation_run_strategy_immutable BEFORE UPDATE OF pass_strategy,normalization_policy_version ON translation_runs BEGIN SELECT RAISE(ABORT, 'translation run strategy is immutable'); END")
                     connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (16, utc_now()))
+                    current = 16
+                if current < 17 and target_version >= 17:
+                    connection.execute("CREATE UNIQUE INDEX translation_units_project_lookup_idx ON translation_units(project_id,run_id,unit_id)")
+                    connection.execute("""CREATE TABLE translation_revisions (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        project_id TEXT NOT NULL,
+                        run_id TEXT NOT NULL,
+                        parent_revision_id TEXT,
+                        source_revision_id TEXT,
+                        source_kind TEXT NOT NULL CHECK(source_kind IN ('PROVIDER_OUTPUT','ACCEPTED_REVISION')),
+                        revision_no INTEGER NOT NULL CHECK(revision_no>=1),
+                        status TEXT NOT NULL CHECK(status IN ('DRAFT','ACCEPTED')),
+                        lock_version INTEGER NOT NULL DEFAULT 1 CHECK(lock_version>=1),
+                        schema_version INTEGER NOT NULL DEFAULT 1 CHECK(schema_version>=1),
+                        fingerprint TEXT NOT NULL CHECK(length(fingerprint)=64),
+                        fingerprint_version INTEGER NOT NULL CHECK(fingerprint_version>=1),
+                        provenance_json TEXT NOT NULL CHECK(json_valid(provenance_json)),
+                        created_at TEXT NOT NULL,
+                        accepted_at TEXT,
+                        UNIQUE(project_id,id),
+                        UNIQUE(run_id,revision_no),
+                        FOREIGN KEY(project_id,run_id) REFERENCES translation_runs(project_id,id) ON DELETE RESTRICT,
+                        FOREIGN KEY(project_id,parent_revision_id) REFERENCES translation_revisions(project_id,id) ON DELETE RESTRICT,
+                        FOREIGN KEY(project_id,source_revision_id) REFERENCES translation_revisions(project_id,id) ON DELETE RESTRICT,
+                        CHECK((status='DRAFT' AND accepted_at IS NULL) OR (status='ACCEPTED' AND accepted_at IS NOT NULL))
+                    )""")
+                    connection.execute("CREATE UNIQUE INDEX translation_revisions_one_draft_idx ON translation_revisions(run_id) WHERE status='DRAFT'")
+                    connection.execute("CREATE INDEX translation_revisions_latest_idx ON translation_revisions(project_id,run_id,status,revision_no DESC)")
+                    connection.execute("""CREATE TABLE translation_revision_units (
+                        project_id TEXT NOT NULL,
+                        revision_id TEXT NOT NULL,
+                        run_id TEXT NOT NULL,
+                        unit_id TEXT NOT NULL,
+                        logical_unit_key TEXT NOT NULL,
+                        position INTEGER NOT NULL CHECK(position>=0),
+                        revision_segment_ids_json TEXT NOT NULL CHECK(json_valid(revision_segment_ids_json)),
+                        source_segment_ids_json TEXT NOT NULL CHECK(json_valid(source_segment_ids_json)),
+                        source_text TEXT NOT NULL,
+                        start_us INTEGER NOT NULL CHECK(start_us>=0),
+                        end_us INTEGER NOT NULL CHECK(end_us>start_us),
+                        final_text TEXT NOT NULL CHECK(length(trim(final_text))>0),
+                        unit_fingerprint TEXT NOT NULL CHECK(length(unit_fingerprint)=64),
+                        text_origin TEXT NOT NULL CHECK(text_origin IN ('PROVIDER_OUTPUT','USER_EDIT')),
+                        PRIMARY KEY(revision_id,unit_id),
+                        UNIQUE(revision_id,position),
+                        FOREIGN KEY(project_id,revision_id) REFERENCES translation_revisions(project_id,id) ON DELETE RESTRICT,
+                        FOREIGN KEY(project_id,run_id,unit_id) REFERENCES translation_units(project_id,run_id,unit_id) ON DELETE RESTRICT
+                    )""")
+                    connection.execute("""CREATE TABLE project_active_translation_revisions (
+                        project_id TEXT PRIMARY KEY NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+                        revision_id TEXT NOT NULL,
+                        generation INTEGER NOT NULL CHECK(generation>=1),
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY(project_id,revision_id) REFERENCES translation_revisions(project_id,id) ON DELETE RESTRICT
+                    )""")
+                    connection.execute("""CREATE TRIGGER accepted_translation_revision_immutable BEFORE UPDATE ON translation_revisions
+                        WHEN OLD.status='ACCEPTED' BEGIN SELECT RAISE(ABORT, 'accepted translation revision is immutable'); END""")
+                    connection.execute("""CREATE TRIGGER accepted_translation_revision_delete_guard BEFORE DELETE ON translation_revisions
+                        WHEN OLD.status='ACCEPTED' BEGIN SELECT RAISE(ABORT, 'accepted translation revision cannot be deleted'); END""")
+                    connection.execute("""CREATE TRIGGER translation_revision_status_guard BEFORE UPDATE OF status ON translation_revisions
+                        WHEN NOT (OLD.status='DRAFT' AND NEW.status='ACCEPTED') BEGIN SELECT RAISE(ABORT, 'invalid translation revision transition'); END""")
+                    connection.execute("""CREATE TRIGGER translation_revision_units_mapping_immutable BEFORE UPDATE OF project_id,revision_id,run_id,unit_id,logical_unit_key,position,revision_segment_ids_json,source_segment_ids_json,source_text,start_us,end_us ON translation_revision_units
+                        BEGIN SELECT RAISE(ABORT, 'translation revision unit mapping is immutable'); END""")
+                    connection.execute("""CREATE TRIGGER translation_revision_units_draft_insert BEFORE INSERT ON translation_revision_units
+                        WHEN (SELECT status FROM translation_revisions WHERE id=NEW.revision_id)<>'DRAFT'
+                        BEGIN SELECT RAISE(ABORT, 'translation revision units can only be inserted into a draft'); END""")
+                    connection.execute("""CREATE TRIGGER accepted_translation_revision_units_immutable BEFORE UPDATE ON translation_revision_units
+                        WHEN (SELECT status FROM translation_revisions WHERE id=OLD.revision_id)='ACCEPTED'
+                        BEGIN SELECT RAISE(ABORT, 'accepted translation revision unit is immutable'); END""")
+                    connection.execute("""CREATE TRIGGER accepted_translation_revision_units_delete_guard BEFORE DELETE ON translation_revision_units
+                        WHEN (SELECT status FROM translation_revisions WHERE id=OLD.revision_id)='ACCEPTED'
+                        BEGIN SELECT RAISE(ABORT, 'accepted translation revision unit cannot be deleted'); END""")
+                    connection.execute("CREATE TRIGGER active_translation_revision_accepted_insert BEFORE INSERT ON project_active_translation_revisions WHEN (SELECT status FROM translation_revisions WHERE id=NEW.revision_id)<>'ACCEPTED' BEGIN SELECT RAISE(ABORT, 'active translation revision must be accepted'); END")
+                    connection.execute("CREATE TRIGGER active_translation_revision_accepted_update BEFORE UPDATE ON project_active_translation_revisions WHEN (SELECT status FROM translation_revisions WHERE id=NEW.revision_id)<>'ACCEPTED' BEGIN SELECT RAISE(ABORT, 'active translation revision must be accepted'); END")
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (17, utc_now()))
                 connection.commit()
             except BaseException:
                 connection.rollback()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import shutil
 import subprocess
 import tempfile
@@ -26,10 +27,11 @@ from app.transcripts import TranscriptService
 from app.translation import TranslationArtifactValidator, TranslationError, TranslationService, TranslationWorker, normalize_translation_unit
 from app.translation import GeminiProvider
 from app.gemini_credentials import GeminiCredentialManager
+from app.translation_revisions import TranslationRevisionError, TranslationRevisionService
 
 
 class TranslationMigrationTests(unittest.TestCase):
-    def test_v16_adds_strategy_and_final_text_repeatably_without_losing_project(self):
+    def test_v17_adds_translation_revision_contract_repeatably_without_losing_project(self):
         with tempfile.TemporaryDirectory() as temporary:
             database = Database(Path(temporary) / "data")
             database.initialize(target_version=15)
@@ -39,11 +41,13 @@ class TranslationMigrationTests(unittest.TestCase):
             with closing(database.connect()) as connection:
                 run_columns = {row["name"] for row in connection.execute("PRAGMA table_info(translation_runs)")}
                 unit_columns = {row["name"] for row in connection.execute("PRAGMA table_info(translation_units)")}
+                revision_tables = {row["name"] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 applied = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
                 preserved = connection.execute("SELECT id FROM projects WHERE id=?", (project["id"],)).fetchone()
             self.assertTrue({"pass_strategy", "normalization_policy_version"}.issubset(run_columns))
             self.assertTrue({"final_text", "final_notes_json"}.issubset(unit_columns))
-            self.assertEqual(applied, 16)
+            self.assertTrue({"translation_revisions", "translation_revision_units", "project_active_translation_revisions"}.issubset(revision_tables))
+            self.assertEqual(applied, 17)
             self.assertIsNotNone(preserved)
 
 
@@ -155,15 +159,36 @@ class GeminiWireContractTests(unittest.TestCase):
         captured = self.ContentClient()
         provider = GeminiProvider("fixture-key", api_type="generate_content", client_factory=lambda _key: captured)
         output = provider.translate(pass_number=1, pass_strategy="SINGLE_PASS", chunk_id="internal", units=[
-            {"unit_id": "durable-a", "revision_segment_ids": ["rev-a"], "source_text": "你好"}], context=[])
+            {"unit_id": "durable-a", "revision_segment_ids": ["rev-a"], "source_text": "你好", "start_us": 100_000, "end_us": 1_234_500}], context=[])
         config = captured.models.request["config"]
         self.assertEqual(config.response_mime_type, "application/json")
         self.assertIsNotNone(config.response_json_schema)
         self.assertEqual(output["items"][0]["unit_id"], "durable-a")
         self.assertEqual(provider.last_call_metadata["provider_request_id"], "synthetic-request")
         self.assertEqual(provider.last_call_metadata["input_tokens"], 10)
-        self.assertIn("concise, natural Vietnamese", captured.models.request["contents"])
-        self.assertIn("Do not add terminal punctuation", captured.models.request["contents"])
+        request_payload = json.loads(captured.models.request["contents"].split("INPUT_JSON:\n", 1)[1])
+        self.assertEqual(request_payload["units"][0]["duration_ms"], 1134)
+        self.assertIn("maximize brevity", captured.models.request["contents"])
+        self.assertIn("Never use terminal punctuation", captured.models.request["contents"])
+
+    def test_single_pass_requires_valid_timing_before_request(self):
+        captured = self.ContentClient()
+        provider = GeminiProvider("fixture-key", api_type="generate_content", client_factory=lambda _key: captured)
+        with self.assertRaisesRegex(TranslationError, "translation_invalid_unit_timing"):
+            provider.translate(pass_number=1, pass_strategy="SINGLE_PASS", chunk_id="internal", units=[
+                {"unit_id": "durable-a", "revision_segment_ids": ["rev-a"], "source_text": "你好", "start_us": 5, "end_us": 5}], context=[])
+        self.assertIsNone(captured.models.request)
+
+    def test_legacy_two_pass_pass_two_keeps_draft_and_duration_contract(self):
+        client = CapturingGeminiClient("fixture-key")
+        provider = GeminiProvider("fixture-key", api_type="interactions", client_factory=lambda _key: client)
+        provider.translate(pass_number=2, chunk_id="legacy", units=[{"unit_id": "durable-a", "revision_segment_ids": ["rev-a"],
+            "source_text": "你好", "draft_vi": "Chào bạn", "start_us": 100, "end_us": 1_000_100}], context=[],
+            pass_strategy="TWO_PASS", wire_protocol_version="translation-wire-v2")
+        payload = json.loads(client.request["input"].split("INPUT_JSON:\n", 1)[1])
+        self.assertEqual(payload["units"][0]["draft_vi"], "Chào bạn")
+        self.assertEqual(payload["units"][0]["duration_ms"], 1000)
+        self.assertEqual(provider.call_history[0]["wire_protocol_version"], "translation-wire-v2")
 
     def test_multigenre_multilingual_fixture_keeps_exact_wire_mapping(self):
         fixture = [
@@ -252,6 +277,127 @@ class TranslationTests(unittest.TestCase):
         self.artifacts.validators["translation_json"] = __import__("app.translation", fromlist=["TranslationArtifactValidator"]).TranslationArtifactValidator(self.db)
 
     def tearDown(self): self.temp.cleanup()
+
+    def _ready_single_pass_translation(self):
+        self.service.pass_strategy = "SINGLE_PASS"
+        provider = FakeGemini()
+        worker = TranslationWorker(self.service, self.artifacts, provider_factory=lambda: provider)
+        with patch.dict(os.environ, {"AUTODUB_GEMINI_API_KEY": "NOT-LOGGED"}):
+            created = self.service.create_job(self.project["id"], self.accepted["id"], True, f"translation-editor-{uuid.uuid4().hex[:20]}")
+            self.assertTrue(worker.run_once())
+        self.assertEqual(self.service.get_run(self.project["id"], created["run_id"])["status"], "READY")
+        return created["run_id"], provider
+
+    def test_translation_bulk_draft_approval_restart_and_unit_identity(self):
+        run_id, provider = self._ready_single_pass_translation()
+        revisions = TranslationRevisionService(self.db)
+        editor = revisions.editor_state(self.project["id"], run_id)
+        self.assertTrue(editor["run_is_current"])
+        original = editor["original_units"]
+        draft = revisions.create_draft(self.project["id"], run_id)
+        self.assertEqual(draft["source_kind"], "PROVIDER_OUTPUT")
+        edits = [{"unit_id": original[0]["unit_id"], "text": "  Bản dịch đã sửa.  "},
+                 {"unit_id": original[2]["unit_id"], "text": "Câu cuối mới?!"}]
+        saved = revisions.save_draft(self.project["id"], run_id, draft["id"], draft["lock_version"], edits, "translation-bulk-save-key-0001")
+        self.assertEqual(saved["lock_version"], 2)
+        self.assertEqual(saved["units"][0]["final_text"], "Bản dịch đã sửa")
+        self.assertEqual(saved["units"][2]["final_text"], "Câu cuối mới")
+        self.assertEqual(saved["units"][1]["final_text"], original[1]["final_text"])
+        with closing(self.db.connect()) as connection:
+            provider_output = connection.execute("SELECT final_text FROM translation_units WHERE run_id=? AND unit_id=?", (run_id, original[0]["unit_id"])).fetchone()[0]
+        self.assertEqual(provider_output, original[0]["final_text"])
+        restarted = TranslationRevisionService(Database(self.db.data_root)).editor_state(self.project["id"], run_id)
+        self.assertEqual(restarted["draft"]["units"][0]["final_text"], "Bản dịch đã sửa")
+        tts_pointer = self.jobs.set_stage_input(self.project["id"], "tts", {"schema_version": 1, "voice": "fixture"})
+        accepted = revisions.accept_draft(self.project["id"], run_id, draft["id"], saved["lock_version"], None, "translation-accept-draft-key-01")
+        self.assertEqual(accepted["status"], "ACCEPTED")
+        self.assertTrue(accepted["is_active"])
+        self.assertEqual(accepted["units"][0]["logical_unit_key"], original[0]["logical_unit_key"])
+        self.assertEqual(accepted["units"][1]["unit_fingerprint"], original[1]["unit_fingerprint"])
+        with closing(self.db.connect()) as connection:
+            after = connection.execute("SELECT input_generation,input_fingerprint FROM stage_pointers WHERE project_id=? AND stage='tts'", (self.project["id"],)).fetchone()
+            accepted_count = connection.execute("SELECT COUNT(*) FROM translation_revisions WHERE run_id=? AND status='ACCEPTED'", (run_id,)).fetchone()[0]
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("UPDATE translation_revision_units SET final_text='Tampered' WHERE revision_id=? AND unit_id=?", (accepted["id"], original[0]["unit_id"]))
+        self.assertEqual(after["input_generation"], tts_pointer["input_generation"] + 1)
+        self.assertEqual(accepted_count, 1)
+        draft2 = revisions.create_draft(self.project["id"], run_id, accepted["id"])
+        self.assertEqual(draft2["source_kind"], "ACCEPTED_REVISION")
+        self.assertEqual(draft2["units"][0]["final_text"], accepted["units"][0]["final_text"])
+        self.assertEqual(revisions.editor_state(self.project["id"], run_id)["accepted"]["id"], accepted["id"])
+        saved2 = revisions.save_draft(self.project["id"], run_id, draft2["id"], draft2["lock_version"],
+            [{"unit_id": original[1]["unit_id"], "text": "Thay đổi câu hai."}], "translation-bulk-save-key-0002")
+        accepted2 = revisions.accept_draft(self.project["id"], run_id, draft2["id"], saved2["lock_version"], accepted["id"], "translation-accept-draft-key-02")
+        self.assertNotEqual(accepted2["id"], accepted["id"])
+        self.assertEqual(revisions.editor_state(self.project["id"], run_id)["accepted"]["id"], accepted2["id"])
+        self.assertEqual(provider.calls.__len__(), 1)
+
+    def test_translation_bulk_save_rolls_back_invalid_batch_and_rejects_stale_or_duplicate_units(self):
+        run_id, _provider = self._ready_single_pass_translation()
+        revisions = TranslationRevisionService(self.db)
+        draft = revisions.create_draft(self.project["id"], run_id)
+        before = [unit["final_text"] for unit in draft["units"]]
+        with self.assertRaisesRegex(TranslationRevisionError, "gemini_response_empty_translation"):
+            revisions.save_draft(self.project["id"], run_id, draft["id"], draft["lock_version"], [
+                {"unit_id": draft["units"][0]["unit_id"], "text": "Không được commit"},
+                {"unit_id": draft["units"][1]["unit_id"], "text": "   "}], "translation-bulk-rollback-key-01")
+        unchanged = revisions.editor_state(self.project["id"], run_id)["draft"]
+        self.assertEqual([unit["final_text"] for unit in unchanged["units"]], before)
+        self.assertEqual(unchanged["lock_version"], draft["lock_version"])
+        with self.assertRaisesRegex(TranslationRevisionError, "duplicate_translation_unit"):
+            revisions.save_draft(self.project["id"], run_id, draft["id"], draft["lock_version"], [
+                {"unit_id": draft["units"][0]["unit_id"], "text": "Một"}, {"unit_id": draft["units"][0]["unit_id"], "text": "Hai"}], "translation-bulk-duplicate-key-01")
+        saved = revisions.save_draft(self.project["id"], run_id, draft["id"], draft["lock_version"], [
+            {"unit_id": draft["units"][0]["unit_id"], "text": "Đã lưu"}], "translation-bulk-cas-first-key-01")
+        with self.assertRaisesRegex(TranslationRevisionError, "translation_revision_conflict"):
+            revisions.save_draft(self.project["id"], run_id, draft["id"], draft["lock_version"], [
+                {"unit_id": draft["units"][0]["unit_id"], "text": "Ghi đè"}], "translation-bulk-cas-stale-key-01")
+        self.assertEqual(saved["units"][0]["final_text"], "Đã lưu")
+        no_change = revisions.save_draft(self.project["id"], run_id, draft["id"], saved["lock_version"], [], "translation-bulk-nochange-key-01")
+        self.assertEqual(no_change["lock_version"], saved["lock_version"])
+
+    def test_bulk_save_handles_100_500_and_1000_unit_fixtures(self):
+        run_id, _provider = self._ready_single_pass_translation()
+        with closing(self.db.connect()) as connection:
+            for position in range(3, 1000):
+                unit_id = str(uuid.uuid4())
+                connection.execute("""INSERT INTO translation_units(run_id,project_id,unit_id,logical_unit_key,position,chunk_no,
+                    revision_segment_ids_json,source_segment_ids_json,source_text,start_us,end_us,final_text,status)
+                    VALUES(?,?,?,?,?,0,?,?,?,?,?,?, 'READY')""", (run_id, self.project["id"], unit_id, str(uuid.uuid4()), position,
+                    json.dumps([str(uuid.uuid4())]), json.dumps([str(uuid.uuid4())]), f"fixture source {position}", position * 1000 + 1,
+                    position * 1000 + 2, f"Fixture {position}"))
+        revisions = TranslationRevisionService(self.db)
+        draft = revisions.create_draft(self.project["id"], run_id)
+        self.assertEqual(len(draft["units"]), 1000)
+        for batch_size in (100, 500, 1000):
+            edits = [{"unit_id": unit["unit_id"], "text": f"Fixture edit {index}"} for index, unit in enumerate(draft["units"][:batch_size])]
+            draft = revisions.save_draft(self.project["id"], run_id, draft["id"], draft["lock_version"], edits,
+                f"translation-scale-batch-{batch_size:04d}-key")
+            self.assertEqual(sum(unit["text_origin"] == "USER_EDIT" for unit in draft["units"]), batch_size)
+
+    def test_translation_revision_api_requires_session_csrf_and_bulk_saves_once(self):
+        run_id, _provider = self._ready_single_pass_translation()
+        app = create_app("translation-revision-api-secret", data_root=self.db.data_root)
+        with TestClient(app, client=("127.0.0.1", 54322)) as client:
+            headers = {"host": "127.0.0.1:8000", "origin": "http://127.0.0.1:5173", "sec-fetch-site": "same-origin"}
+            base_url = f"/api/v1/projects/{self.project['id']}/translations/runs/{run_id}"
+            self.assertEqual(client.get(base_url + "/editor", headers=headers).status_code, 401)
+            boot = client.post("/api/v1/session/bootstrap", headers={**headers, "x-local-bootstrap": "translation-revision-api-secret"}, json={})
+            csrf = boot.json()["csrf_token"]
+            denied = client.post(base_url + "/drafts", headers=headers, json={"base_accepted_revision_id": None})
+            self.assertEqual(denied.status_code, 403)
+            write_headers = {**headers, "x-csrf-token": csrf, "idempotency-key": "translation-api-create-draft-key-01"}
+            created = client.post(base_url + "/drafts", headers=write_headers, json={"base_accepted_revision_id": None})
+            self.assertEqual(created.status_code, 201)
+            draft = created.json()
+            patch_headers = {**headers, "x-csrf-token": csrf, "idempotency-key": "translation-api-bulk-save-key-0001"}
+            saved = client.patch(base_url + f"/drafts/{draft['id']}/units", headers=patch_headers, json={
+                "expected_lock_version": draft["lock_version"], "edits": [
+                    {"unit_id": draft["units"][0]["unit_id"], "text": "API sửa câu một."},
+                    {"unit_id": draft["units"][2]["unit_id"], "text": "API sửa câu ba."}]})
+            self.assertEqual(saved.status_code, 200, saved.text)
+            self.assertEqual(saved.json()["lock_version"], draft["lock_version"] + 1)
+            self.assertEqual(saved.json()["units"][0]["final_text"], "API sửa câu một")
 
     def test_requires_privacy_consent_and_never_embeds_secret_in_snapshot(self):
         with patch.dict(os.environ, {"AUTODUB_GEMINI_API_KEY": "SAMPLE-SECRET-FOR-TEST"}):
@@ -420,7 +566,7 @@ class TranslationTests(unittest.TestCase):
         with closing(self.db.connect()) as connection:
             calls = connection.execute("SELECT pass_number,model_id,status FROM translation_provider_calls WHERE run_id=? ORDER BY pass_number", (created["run_id"],)).fetchall()
         self.assertEqual([(item["pass_number"], item["model_id"], item["status"]) for item in calls],
-                         [(1, "synthetic-fake", "COMPLETED"), (2, "synthetic-fake", "COMPLETED")])
+                         [(1, "gemini-3.1-flash-lite", "COMPLETED"), (2, "gemini-3.1-flash-lite", "COMPLETED")])
 
     def test_single_pass_persists_only_final_output_and_uses_one_generation(self):
         self.service.pass_strategy = "SINGLE_PASS"
@@ -439,6 +585,18 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(len(provider.calls), 1)
         self.assertTrue(all(unit["pass1_text"] is None and unit["pass2_text"] is None for unit in run["units"]))
         self.assertTrue(all(unit["final_text"] for unit in run["units"]))
+
+    def test_incompatible_unfinished_run_fails_before_provider_factory(self):
+        provider_called = []
+        worker = TranslationWorker(self.service, self.artifacts, provider_factory=lambda: provider_called.append(True))
+        with patch.dict(os.environ, {"AUTODUB_GEMINI_API_KEY": "NOT-LOGGED"}):
+            created = self.service.create_job(self.project["id"], self.accepted["id"], True, "translation-incompatible-contract-001")
+        with closing(self.db.connect()) as connection:
+            connection.execute("DROP TRIGGER translation_run_input_immutable")
+            connection.execute("UPDATE translation_runs SET provider_sdk_version='2.34.0' WHERE id=?", (created["run_id"],))
+        self.assertTrue(worker.run_once())
+        self.assertEqual(provider_called, [])
+        self.assertEqual(self.service.get_run(self.project["id"], created["run_id"])["error_code"], "translation_execution_contract_incompatible")
 
     def test_invalid_or_duplicate_provider_ids_rejected(self):
         worker = TranslationWorker(self.service, self.artifacts, provider_factory=FakeGemini)
@@ -641,14 +799,25 @@ class TranslationTests(unittest.TestCase):
         provider.close()
 
     def test_failed_pass2_retry_keeps_verified_pass1(self):
+        failed_once = [False]
         class FailPass2Once(FakeGemini):
             def translate(self, **kwargs):
-                if kwargs["pass_number"] == 2 and sum(call[0] == 2 for call in self.calls) == 0:
+                if kwargs["pass_number"] == 2 and not failed_once[0]:
+                    failed_once[0] = True
                     self.calls.append((2, kwargs["chunk_id"], [u["unit_id"] for u in kwargs["units"]], kwargs["context"]))
+                    self.call_history.append({"model_id": "synthetic-fake", "api_type": "test", "api_version": "local",
+                        "sdk_version": "test", "wire_protocol_version": "test", "chunk_id": kwargs["chunk_id"],
+                        "pass_number": 2, "sdk_call_count": 0, "physical_http_request_count": 0,
+                        "unit_count_requested": len(kwargs["units"]), "unit_count_received": 0, "latency_ms": 0,
+                        "status": "FAILED", "error_code": "gemini_network_error"})
                     raise TranslationError("gemini_network_error", retryable=True, status=503)
                 return FakeGemini.translate(self, **kwargs)
-        provider = FailPass2Once()
-        worker = TranslationWorker(self.service, self.artifacts, provider_factory=lambda: provider)
+        providers = []
+        def factory():
+            provider = FailPass2Once()
+            providers.append(provider)
+            return provider
+        worker = TranslationWorker(self.service, self.artifacts, provider_factory=factory)
         with patch.dict(os.environ, {"AUTODUB_GEMINI_API_KEY": "NOT-LOGGED"}):
             created = self.service.create_job(self.project["id"], self.accepted["id"], True, "translation-retry-pass2-001")
             worker.run_once()
@@ -658,8 +827,19 @@ class TranslationTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM translation_units WHERE run_id=? AND pass1_text IS NOT NULL", (created["run_id"],)).fetchone()[0], 3)
         self.jobs.retry_job(job["id"], "FAILED", "translation-retry-key-0001")
         self.assertTrue(worker.run_once())
-        self.assertEqual([call[0] for call in provider.calls], [1, 2, 2])
+        self.assertEqual([call[0] for provider in providers for call in provider.calls], [1, 2, 2])
         self.assertEqual(self.service.get_run(self.project["id"], created["run_id"])["status"], "READY")
+        with closing(self.db.connect()) as connection:
+            calls = connection.execute("SELECT * FROM translation_provider_calls WHERE run_id=? ORDER BY rowid", (created["run_id"],)).fetchall()
+            artifact = connection.execute("SELECT managed_relative_path FROM artifacts WHERE id=(SELECT artifact_id FROM translation_runs WHERE id=?)", (created["run_id"],)).fetchone()
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([call["pass_number"] for call in calls], [1, 2, 2])
+        self.assertEqual(len({call["job_attempt_id"] for call in calls}), 2)
+        self.assertTrue(all(call["model_id"] == "gemini-3.1-flash-lite" and call["api_type"] == "generate_content"
+            and call["api_version"] == "v1beta" and call["sdk_version"] == "3.6.1"
+            and call["prompt_version"] == "translation-vi-two-pass-v2" and call["wire_protocol_version"] == "translation-wire-v2" for call in calls))
+        manifest = json.loads((self.db.data_root / artifact["managed_relative_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["provider_calls"], [dict(call) for call in calls])
 
     def test_changed_upstream_pointer_keeps_result_stale_and_inactive(self):
         provider = FakeGemini()

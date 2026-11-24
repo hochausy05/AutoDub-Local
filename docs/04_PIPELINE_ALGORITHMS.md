@@ -71,6 +71,8 @@ Grouping is translation input management, not a guarantee of natural semantics. 
 
 **Inputs:** accepted translation revision, chosen voice (default `vi-VN-NamMinhNeural` from legacy), rate%, pitch/volume if supported, output format, provider version. Edge-TTS requires Internet and is not under the same local CPU/GPU performance optimization as ASR/FFmpeg.
 
+The TRANS-01B editor distinguishes mutable drafts from accepted immutable revisions. A future TTS Run may consume only the active accepted revision for the current Translation Run; a draft or stale/non-active revision is not eligible. Text edits retain the logical Unit key, and the per-Unit artifact fingerprint is based on the key and effective text/configuration, not the revision ID, so unchanged Units remain reusable. TTS itself is not implemented in TRANS-01B.
+
 1. Compute artifact key from `unit_id + text hash + voice + rate/pitch/volume + provider/version + synthesis version`.
 2. Reuse valid matching cached artifact. If not, create TTS Job for that Unit; use bounded async semaphore (start 2-3, tune based on real error/network data, not automatically 5).
 3. Sanitize only unsupported control characters. **Never shorten, truncate or rewrite the user's accepted text** behind their back.

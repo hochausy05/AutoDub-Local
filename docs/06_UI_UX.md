@@ -39,12 +39,12 @@ Buttons: `Chạy`, `Hủy`, `Chạy lại`, `Lưu nháp`, `Duyệt kết quả`,
 - Show source text, final Vietnamese and timestamps in one Unit table; clicking a timestamp seeks the selected video. A Pass 1 view is available only for legacy Two-Pass Runs.
 - Show inline notice: “Lời thoại văn bản được gửi đến Gemini để dịch. Video và âm thanh vẫn được lưu trên máy tính.” The user can consent once for the versioned provider/data scope and revoke it. The API still requires a true consent field for each create request; UI consent does not bypass backend validation.
 
-## 5.1. Translation editor (future)
+## 5.1. Translation editor (TRANS-01B implementation slice)
 
-- Table columns: start/end, source, Pass 1, Pass 2, final editable Vietnamese, flags, read fit.
-- Multi-row edit -> `Lưu tất cả` using optimistic revision. Undo, restore previous draft, terminology glossary, regenerate selected lines and preview changed count.
-- Controls: context genre, style, pronouns, formality, target length, punctuation strategy. Do not force a period at end of every short Unit. Missing/uncertain translations are visibly blocked for TTS unless user approves.
-- Future bulk editing, glossary and regeneration controls require their own approved scope; they are not part of this UX correction.
+- The current editor uses two tabs: immutable provider output (`Bản dịch gốc`) and the current accepted revision (`Bản đã duyệt`); an unapproved editable draft is explicitly labelled. If no accepted revision exists, the approved tab offers the source output for approval.
+- Rows show source text, final Vietnamese, and timing. A dedicated timestamp button seeks playback; editing text does not seek. Multiple rows save with one `Lưu tất cả` request and optimistic `lock_version`; edits are transactional and all-or-nothing.
+- Accepting a draft creates an immutable revision. Re-editing creates/updates a separate draft; prior accepted revisions and provider output remain unchanged. The UI warns before discarding unsaved changes or changing Project/source/run context.
+- Pass 1/Pass 2 columns, glossary, undo, line regeneration and fit controls are not part of this implementation slice. TTS is not implemented; only an accepted current revision is the defined future TTS input.
 
 ## 6. TTS editor and player
 

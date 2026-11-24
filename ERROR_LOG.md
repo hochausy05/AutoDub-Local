@@ -1,5 +1,17 @@
 # ERROR_LOG — Reproducible Incidents in the New Project
 
+## TRANS-01B — Draft editor retained leading whitespace
+- **Date/time:** 2026-11-24 19:40 UTC+7
+- **Observed:** The focused translation-revision test submitted an edited Unit with surrounding spaces; the saved response retained leading spaces while trailing spaces were removed by the existing punctuation normalizer.
+- **Correction:** Trim surrounding whitespace at the draft-save boundary before invoking the shared punctuation normalizer; provider output normalization behavior remains unchanged.
+- **Verification:** The focused migration, revision integrity, atomic save, 100/500/1000-unit fixture, and API session/CSRF tests passed after correction; the full backend suite (144 tests) and frontend production build also passed.
+
+## TRANS-01A-FINAL-FIX — Translation resume and provenance contract defects
+- **Date/time:** 2026-11-24 19:04 UTC+7
+- **Observed:** Code review found Single-Pass omitted the Unit duration from its provider payload; worker resume checked only the current wire version; the final artifact used only the current provider object's in-memory call history. Translation request/persistence tests now verify these failure paths with captured payloads and simulated retries across two provider instances. No live Gemini call or user-data incident is claimed.
+- **Correction:** Validate timing and include `duration_ms` for Single-Pass; version the changed wire contract; gate unfinished Runs against their immutable execution snapshot before provider creation; build manifest call provenance from the ordered SQLite ledger and Run configuration. Frontend async commits now validate selected Project/media/revision/run/job identity and respect consent state.
+- **Verification:** Six focused backend regression tests **PASS**; frontend production build **PASS**. Real Gemini and browser interaction **NOT RUN**.
+
 ## TRANS-01A-UX-REFINE-001 — ASR result requires browser reload to appear
 - **Date/time:** 2026-11-24 18:06 UTC+7
 - **Observed:** Product Owner reported that a newly completed ASR Job showed no transcript until browser reload. The same report requested checking translation completion synchronization.

@@ -26,6 +26,7 @@ from app.media import FFprobe, LinkManifestValidator, MediaError, MediaImportSer
 from app.asr import ASRConfig, ASRError, ASRService, ASRWorker, TranscriptArtifactValidator
 from app.transcripts import TranscriptError, TranscriptService
 from app.translation import TranslationError, TranslationService, TranslationWorker, TranslationArtifactValidator
+from app.translation_revisions import TranslationRevisionError, TranslationRevisionService
 
 
 SESSION_COOKIE = "autodub_session"
@@ -188,6 +189,34 @@ class TranslationJobRequest(BaseModel):
     privacy_consent_confirmed: bool
 
 
+class TranslationDraftCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    base_accepted_revision_id: uuid.UUID | None = None
+
+
+class TranslationUnitEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    unit_id: uuid.UUID
+    text: str = Field(max_length=200000)
+
+
+class TranslationDraftSaveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_lock_version: int = Field(ge=1)
+    edits: list[TranslationUnitEdit] = Field(max_length=10000)
+
+
+class TranslationDraftAcceptRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_lock_version: int = Field(ge=1)
+    expected_active_revision_id: uuid.UUID | None = None
+
+
+class TranslationAcceptOriginalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_active_revision_id: uuid.UUID | None = None
+
+
 def _is_loopback(address: str | None) -> bool:
     if not address:
         return False
@@ -224,6 +253,7 @@ def create_app(
     transcript_service = TranscriptService(database)
     artifact_service.validators["translation_json"] = TranslationArtifactValidator(database)
     translation_service = TranslationService(database, job_service)
+    translation_revision_service = TranslationRevisionService(database)
     translation_worker = TranslationWorker(translation_service, artifact_service)
     startup_recovery = StartupRecovery(database, job_service, artifact_service)
 
@@ -251,6 +281,7 @@ def create_app(
     )
     app.state.transcript_service = transcript_service
     app.state.translation_service = translation_service
+    app.state.translation_revision_service = translation_revision_service
     app.state.database = database
     app.state.artifact_service = artifact_service
     app.state.job_service = job_service
@@ -369,6 +400,29 @@ def create_app(
             "gemini_network_error": "Không kết nối được Gemini. Hãy kiểm tra mạng rồi thử lại.",
             "gemini_model_unsupported": "Model Gemini hiện không hỗ trợ yêu cầu này.",
         }.get(exc.code, "Không thể tạo hoặc tải kết quả dịch."))
+
+    def translation_revision_exception(exc: TranslationRevisionError | IdempotencyConflict) -> JSONResponse:
+        code = exc.code if isinstance(exc, TranslationRevisionError) else "idempotency_key_reused"
+        if isinstance(exc, IdempotencyConflict):
+            status = 409
+        elif code in {"translation_run_not_found", "translation_revision_not_found", "translation_unit_not_found"}:
+            status = 404
+        elif code in {"translation_run_not_complete", "translation_run_stale", "translation_revision_conflict",
+                      "translation_revision_immutable", "translation_active_revision_conflict", "translation_draft_must_be_reviewed"}:
+            status = 409
+        else:
+            status = 422
+        messages = {
+            "translation_run_not_complete": "Bản dịch chưa hoàn tất; chưa thể sửa hoặc duyệt.",
+            "translation_run_stale": "Đầu vào dịch không còn hiện hành. Hãy tải lại kết quả mới nhất.",
+            "translation_revision_conflict": "Bản nháp đã được cập nhật ở nơi khác. Nội dung đang nhập vẫn được giữ; hãy tải lại để đối chiếu.",
+            "translation_active_revision_conflict": "Bản đã duyệt hiện hành vừa thay đổi. Hãy tải lại trước khi duyệt.",
+            "translation_revision_coverage_invalid": "Không thể xác minh đủ các Unit của bản dịch.",
+            "invalid_translation_text": "Mỗi Unit cần có nội dung hợp lệ và không được để trống.",
+            "translation_text_too_large": "Nội dung Unit quá dài để lưu trong một lần.",
+            "translation_revision_immutable": "Bản đã duyệt không thể sửa trực tiếp. Hãy tạo bản nháp mới.",
+        }
+        return api_error(status, code, messages.get(code, "Không thể lưu hoặc duyệt bản dịch. Bản nháp đã lưu trước đó vẫn được giữ."))
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, exc: RequestValidationError):
@@ -780,6 +834,83 @@ def create_app(
         if result is None:
             return api_error(404, "translation_run_not_found", "Không tìm thấy kết quả dịch.")
         return result
+
+    @app.get("/api/v1/projects/{project_id}/translations/runs/{run_id}/editor")
+    def get_translation_editor_state(project_id: str, run_id: str, request: Request):
+        current = require_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project, run = uuid.UUID(project_id), uuid.UUID(run_id)
+            if str(project) != project_id.lower() or str(run) != run_id.lower(): raise ValueError
+            return translation_revision_service.editor_state(str(project), str(run))
+        except ValueError:
+            return api_error(422, "invalid_translation_id", "Project hoặc kết quả dịch không hợp lệ.")
+        except TranslationRevisionError as exc:
+            return translation_revision_exception(exc)
+
+    @app.post("/api/v1/projects/{project_id}/translations/runs/{run_id}/drafts", status_code=201)
+    def create_translation_draft(project_id: str, run_id: str, body: TranslationDraftCreateRequest, request: Request):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project, run = uuid.UUID(project_id), uuid.UUID(run_id)
+            if str(project) != project_id.lower() or str(run) != run_id.lower(): raise ValueError
+            return translation_revision_service.create_draft(str(project), str(run), str(body.base_accepted_revision_id) if body.base_accepted_revision_id else None)
+        except ValueError:
+            return api_error(422, "invalid_translation_id", "Project hoặc kết quả dịch không hợp lệ.")
+        except TranslationRevisionError as exc:
+            return translation_revision_exception(exc)
+
+    @app.patch("/api/v1/projects/{project_id}/translations/runs/{run_id}/drafts/{revision_id}/units")
+    def save_translation_draft(project_id: str, run_id: str, revision_id: str, body: TranslationDraftSaveRequest, request: Request):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project, run, revision = uuid.UUID(project_id), uuid.UUID(run_id), uuid.UUID(revision_id)
+            if str(project) != project_id.lower() or str(run) != run_id.lower() or str(revision) != revision_id.lower(): raise ValueError
+            edits = [{"unit_id": str(edit.unit_id), "text": edit.text} for edit in body.edits]
+            return translation_revision_service.save_draft(str(project), str(run), str(revision), body.expected_lock_version,
+                edits, request.headers.get("idempotency-key", ""))
+        except ValueError:
+            return api_error(422, "invalid_translation_id", "Project, Run hoặc Revision ID không hợp lệ.")
+        except (TranslationRevisionError, IdempotencyConflict) as exc:
+            return translation_revision_exception(exc)
+
+    @app.post("/api/v1/projects/{project_id}/translations/runs/{run_id}/drafts/{revision_id}/accept")
+    def accept_translation_draft(project_id: str, run_id: str, revision_id: str, body: TranslationDraftAcceptRequest, request: Request):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project, run, revision = uuid.UUID(project_id), uuid.UUID(run_id), uuid.UUID(revision_id)
+            if str(project) != project_id.lower() or str(run) != run_id.lower() or str(revision) != revision_id.lower(): raise ValueError
+            result = translation_revision_service.accept_draft(str(project), str(run), str(revision), body.expected_lock_version,
+                str(body.expected_active_revision_id) if body.expected_active_revision_id else None,
+                request.headers.get("idempotency-key", ""))
+            return result
+        except ValueError:
+            return api_error(422, "invalid_translation_id", "Project, Run hoặc Revision ID không hợp lệ.")
+        except (TranslationRevisionError, IdempotencyConflict) as exc:
+            return translation_revision_exception(exc)
+
+    @app.post("/api/v1/projects/{project_id}/translations/runs/{run_id}/accept-original")
+    def accept_original_translation(project_id: str, run_id: str, body: TranslationAcceptOriginalRequest, request: Request):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project, run = uuid.UUID(project_id), uuid.UUID(run_id)
+            if str(project) != project_id.lower() or str(run) != run_id.lower(): raise ValueError
+            return translation_revision_service.accept_original(str(project), str(run),
+                str(body.expected_active_revision_id) if body.expected_active_revision_id else None,
+                request.headers.get("idempotency-key", ""))
+        except ValueError:
+            return api_error(422, "invalid_translation_id", "Project hoặc kết quả dịch không hợp lệ.")
+        except (TranslationRevisionError, IdempotencyConflict) as exc:
+            return translation_revision_exception(exc)
 
     @app.get("/api/v1/projects/{project_id}/transcripts/revisions/{revision_id}")
     def get_transcript_revision(project_id: str, revision_id: str, request: Request):
