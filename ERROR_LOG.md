@@ -1,5 +1,20 @@
 # ERROR_LOG — Reproducible Incidents in the New Project
 
+## TRANS-01A-UX-REFINE-001 — ASR result requires browser reload to appear
+- **Date/time:** 2026-11-24 18:06 UTC+7
+- **Observed:** Product Owner reported that a newly completed ASR Job showed no transcript until browser reload. The same report requested checking translation completion synchronization.
+- **Root cause confirmed by source control flow:** The ASR polling effect called `setAsrJob(READY)` before awaiting ASR Runs and transcript revisions. Its dependency included the full `asrJob` object, so the state update caused React cleanup (`stopped = true`) while those fetches were still pending; subsequent state commits were discarded. Translation polling similarly committed the Job before fetching the Translation Run, and its effect depended on the full Run/Job state, allowing cleanup before the paired data was committed. This establishes a deterministic race from the source; interactive reproduction is **BLOCKED** while the existing UI/backend listeners occupy 127.0.0.1 ports 5173 and 8000.
+- **Correction:** Fetch Job, matching Run and revisions first; validate Project/source identity against the currently selected context; then commit related state together. Polling effects are keyed to stable identities rather than whole mutable objects. Automated UI interaction remains NOT RUN.
+- **Status:** Frontend production build passed; backend contract tests cover the service state but cannot directly prove browser rendering. Windows UI acceptance remains pending.
+
+## TRANS-01A-ENGINE-COMPLETION-001 — Credential value surfaced by diagnostic command; Gemini Free Tier returned 503
+- **Date/time:** 2026-11-24 15:45 UTC+7
+- **Task/environment:** TRANS-01A-ENGINE-COMPLETION; Windows; configured local `.env`; Gemini API calls used only synthetic dialogue and the documented Free Tier model.
+- **Observed security incident:** A repository search command included the root `.env` file and its configured credential value appeared in command output. The value was not copied into source, diagnostics, this log, or the change record. Because the conversation/tool output may be retained, the Product Owner should rotate that credential after review. No account or provider settings were changed by this task.
+- **Observed provider incidents:** With valid Unicode input and one HTTP attempt per adapter call, Interactions returned HTTP 503 once in the 8-Unit comparison. Generate Content completed the same 8-Unit structured request in one physical HTTP request with exact IDs. In the 100-Unit synthetic run, Pass 1 returned 503 once, then succeeded on a separate bounded retry; Pass 2 returned 503 once. These observations identify no provider-side cause. No model fallback was enabled.
+- **Request budget:** The valid-Unicode A/B used 2 measured HTTP requests. Three earlier route/schema probes and the first 100-Unit attempt added 4 observed requests; the final 100-Unit Pass 1 retry and Pass 2 added 2. An earlier preliminary harness did not return its transport summary and could have used at most 4 requests. Conservatively, the entire sweep used no more than 12; no live calls were made afterward.
+- **Assessment:** Generate Content is the only route with successful valid-Unicode A/B evidence. Long-run Pass 2, an end-to-end persisted Job restart, and G4 remain unverified.
+
 ## TRANS-01A-ENGINE-OPTIMIZATION-001 — Small translation payload returned 503; separate output mapping rejected
 - **Date/time:** 2026-11-24 13:41 UTC+7 (local diagnostic event time)
 - **Task/environment:** Existing Windows local app diagnostics for `gemini-3.5-flash-lite`; inspected only allow-listed metadata, not transcript or response bodies.

@@ -23,9 +23,28 @@ from app.main import create_app
 from app.media import FFprobe, LinkManifestValidator, MediaImportService, SourceVideoValidator, _path_identity
 from app.recovery import StartupRecovery
 from app.transcripts import TranscriptService
-from app.translation import TranslationError, TranslationService, TranslationWorker
+from app.translation import TranslationArtifactValidator, TranslationError, TranslationService, TranslationWorker, normalize_translation_unit
 from app.translation import GeminiProvider
 from app.gemini_credentials import GeminiCredentialManager
+
+
+class TranslationMigrationTests(unittest.TestCase):
+    def test_v16_adds_strategy_and_final_text_repeatably_without_losing_project(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Database(Path(temporary) / "data")
+            database.initialize(target_version=15)
+            project, _ = database.create_project("migration fixture", "translation-v16-project-001")
+            database.initialize()
+            database.initialize()
+            with closing(database.connect()) as connection:
+                run_columns = {row["name"] for row in connection.execute("PRAGMA table_info(translation_runs)")}
+                unit_columns = {row["name"] for row in connection.execute("PRAGMA table_info(translation_units)")}
+                applied = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+                preserved = connection.execute("SELECT id FROM projects WHERE id=?", (project["id"],)).fetchone()
+            self.assertTrue({"pass_strategy", "normalization_policy_version"}.issubset(run_columns))
+            self.assertTrue({"final_text", "final_notes_json"}.issubset(unit_columns))
+            self.assertEqual(applied, 16)
+            self.assertIsNotNone(preserved)
 
 
 class FakeASR:
@@ -45,10 +64,15 @@ class FakeASR:
 
 
 class FakeGemini:
-    def __init__(self): self.calls = []
+    def __init__(self): self.calls = []; self.call_history = []
 
     def translate(self, *, pass_number, chunk_id, units, context, **_options):
         self.calls.append((pass_number, chunk_id, [unit["unit_id"] for unit in units], context))
+        self.call_history.append({"model_id": "synthetic-fake", "api_type": "test", "api_version": "local",
+            "sdk_version": "test", "wire_protocol_version": "test", "chunk_id": chunk_id,
+            "pass_number": pass_number, "sdk_call_count": 0, "physical_http_request_count": 0,
+            "unit_count_requested": len(units), "unit_count_received": len(units), "latency_ms": 0,
+            "status": "COMPLETED", "error_code": None})
         return {"schema_version": 1, "pass": pass_number, "chunk_id": chunk_id, "items": [
             {"unit_id": unit["unit_id"], "revision_segment_ids": unit["revision_segment_ids"],
              "text": ("Bản nháp: " if pass_number == 1 else "Tiếng Việt tự nhiên: ") + unit.get("draft_vi", unit["source_text"]), "notes": []}
@@ -65,8 +89,128 @@ class CapturingGeminiClient:
     def create(self, **kwargs):
         self.request = kwargs
         payload = json.loads(kwargs["input"].split("INPUT_JSON:\n", 1)[1])
-        return SimpleNamespace(status=self.status, output_text=json.dumps({"schema_version": 1, "pass": payload["pass"], "chunk_id": payload["chunk_id"], "items": [
-            {"unit_id": unit["unit_id"], "revision_segment_ids": unit["revision_segment_ids"], "text": "Xin chào", "notes": []} for unit in payload["owned_units"]]}))
+        return SimpleNamespace(status=self.status, output_text=json.dumps({"items": [
+            {"id": unit["id"], "text": "Xin chào"} for unit in payload["units"]]}))
+
+
+class GeminiWireContractTests(unittest.TestCase):
+    def test_legacy_two_pass_artifact_without_v16_fields_remains_readable(self):
+        manifest = {"schema_version": 1, "run_id": str(uuid.uuid4()), "input_fingerprint": "a" * 64,
+            "units": [{"unit_id": "legacy-unit", "position": 0, "revision_segment_ids": ["revision"],
+                "source_segment_ids": ["source"], "source_text": "source", "pass1_text": "draft",
+                "pass2_text": "final"}]}
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "legacy-translation.json"
+            path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+            result = TranslationArtifactValidator().validate(path)
+        self.assertEqual(result["unit_count"], 1)
+
+    def test_terminal_punctuation_normalization_preserves_content_and_closers(self):
+        cases = {
+            "你好。": "你好", "Really?!」": "Really」", "他说：“你好！”": "他说：“你好”",
+            "值是 3.14。": "值是 3.14", "增长 12.5%！": "增长 12.5%", "版本 v1.2.3。": "版本 v1.2.3",
+            "约 1,000。": "约 1,000", "(继续……)": "(继续)", "Hello?   ": "Hello",
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(normalize_translation_unit(source), expected)
+        with self.assertRaisesRegex(TranslationError, "gemini_response_empty_translation"):
+            normalize_translation_unit("？！")
+
+    class Client:
+        def __init__(self, response):
+            self.interactions = self
+            self.response = response
+        def create(self, **_kwargs):
+            return SimpleNamespace(status="completed", output_text=self.response)
+
+    class ContentModels:
+        def __init__(self): self.request = None
+        def generate_content(self, **kwargs):
+            self.request = kwargs
+            payload = json.loads(kwargs["contents"].split("INPUT_JSON:\n", 1)[1])
+            return SimpleNamespace(text=json.dumps({"items": [{"id": unit["id"], "text": "Xin chào"} for unit in payload["units"]]}),
+                candidates=[SimpleNamespace(finish_reason=SimpleNamespace(name="STOP"))],
+                usage_metadata=SimpleNamespace(prompt_token_count=10, candidates_token_count=4, total_token_count=14),
+                sdk_http_response=SimpleNamespace(headers={"x-goog-request-id": "synthetic-request"}))
+
+    class ContentClient:
+        def __init__(self): self.models = GeminiWireContractTests.ContentModels()
+
+    def translate_wire(self, value):
+        provider = GeminiProvider("fixture-key", client_factory=lambda _key: self.Client(value), api_type="interactions")
+        units = [
+            {"unit_id": "durable-a", "revision_segment_ids": ["rev-a"], "source_text": "你好"},
+            {"unit_id": "durable-b", "revision_segment_ids": ["rev-b"], "source_text": "谢谢"},
+        ]
+        return provider.translate(pass_number=1, chunk_id="internal", units=units, context=[])
+
+    def test_reordered_short_wire_ids_reconcile_to_durable_units(self):
+        output = self.translate_wire(json.dumps({"items": [{"id": 2, "text": "Cảm ơn"}, {"id": 1, "text": "Xin chào"}]}))
+        self.assertEqual([item["unit_id"] for item in output["items"]], ["durable-a", "durable-b"])
+        self.assertEqual([item["text"] for item in output["items"]], ["Xin chào", "Cảm ơn"])
+        self.assertEqual([item["revision_segment_ids"] for item in output["items"]], [["rev-a"], ["rev-b"]])
+
+    def test_generate_content_uses_supported_json_schema_and_records_route(self):
+        captured = self.ContentClient()
+        provider = GeminiProvider("fixture-key", api_type="generate_content", client_factory=lambda _key: captured)
+        output = provider.translate(pass_number=1, pass_strategy="SINGLE_PASS", chunk_id="internal", units=[
+            {"unit_id": "durable-a", "revision_segment_ids": ["rev-a"], "source_text": "你好"}], context=[])
+        config = captured.models.request["config"]
+        self.assertEqual(config.response_mime_type, "application/json")
+        self.assertIsNotNone(config.response_json_schema)
+        self.assertEqual(output["items"][0]["unit_id"], "durable-a")
+        self.assertEqual(provider.last_call_metadata["provider_request_id"], "synthetic-request")
+        self.assertEqual(provider.last_call_metadata["input_tokens"], 10)
+        self.assertIn("concise, natural Vietnamese", captured.models.request["contents"])
+        self.assertIn("Do not add terminal punctuation", captured.models.request["contents"])
+
+    def test_multigenre_multilingual_fixture_keeps_exact_wire_mapping(self):
+        fixture = [
+            "我不是说这个。", "Is that really funny?", "Use the 12 V adapter at 5.2 A.",
+            "The lesson begins at nine tomorrow.", "Revenue rose 12.5% in Q3.",
+            "请先断开电源，再打开外壳。", "She said, ‘I will come back.’", "Nguyễn An reviewed the device.",
+        ]
+        client = self.ContentClient()
+        provider = GeminiProvider("fixture-key", api_type="generate_content", client_factory=lambda _key: client)
+        units = [{"unit_id": f"genre-{i}", "revision_segment_ids": [f"revision-{i}"],
+                  "source_text": text, "start_us": i * 1_000_000, "end_us": (i + 1) * 1_000_000,
+                  "position": i} for i, text in enumerate(fixture)]
+        result = provider.translate(pass_number=1, pass_strategy="SINGLE_PASS", chunk_id="genres", units=units, context=[])
+        sent_prompt = client.models.request["contents"]
+        self.assertTrue(all(text in sent_prompt for text in fixture))
+        self.assertEqual([item["unit_id"] for item in result["items"]], [item["unit_id"] for item in units])
+        # This fixture verifies payload completeness and ID reconciliation only, not translation quality.
+
+    def test_wire_validator_distinguishes_id_and_payload_failures(self):
+        cases = [
+            ("{\"items\":[", "gemini_response_truncated"),
+            ("{broken}", "gemini_response_malformed_json"),
+            (json.dumps({"items": [{"id": 1, "text": "一"}]}), "gemini_response_missing_ids"),
+            (json.dumps({"items": [{"id": 1, "text": "一"}, {"id": 1, "text": "二"}]}), "gemini_response_duplicate_ids"),
+            (json.dumps({"items": [{"id": 1, "text": "一"}, {"id": 3, "text": "三"}]}), "gemini_response_unexpected_ids"),
+            (json.dumps({"items": [{"id": True, "text": "一"}, {"id": 2, "text": "二"}]}), "gemini_response_invalid_id_type"),
+            (json.dumps({"items": [{"id": 1, "text": " "}, {"id": 2, "text": "二"}]}), "gemini_response_empty_translation"),
+            ('{"items":[{"id":1,"text":"\\ud800"},{"id":2,"text":"二"}]}', "gemini_response_invalid_unicode"),
+            (json.dumps({"items": [{"id": 1, "text": "一", "extra": True}, {"id": 2, "text": "二"}]}), "gemini_response_schema_mismatch"),
+        ]
+        for raw, expected in cases:
+            with self.subTest(expected=expected), self.assertRaisesRegex(TranslationError, expected):
+                self.translate_wire(raw)
+
+    def test_pass2_batch_planner_uses_actual_draft_and_keeps_every_unit_once(self):
+        units = [{"unit_id": f"u{i}", "source_text": "短句", "draft_vi": "越" * 4000} for i in range(3)]
+        batches = TranslationService.chunk_pass2_units(units, [])
+        self.assertEqual([unit["unit_id"] for batch in batches for unit in batch], ["u0", "u1", "u2"])
+        self.assertEqual(len(batches), 3)
+        with self.assertRaisesRegex(TranslationError, "translation_unit_too_long_review_required"):
+            TranslationService.chunk_pass2_units([{"unit_id": "long", "source_text": "x", "draft_vi": "越" * 14000}], [])
+        fitted = TranslationService.fit_pass2_context(
+            [{"unit_id": "owned", "source_text": "x", "draft_vi": "Xin chào", "position": 50}],
+            [{"position": 0, "source_text": "遠" * 40000, "draft_vi": "Xa"},
+             {"position": 49, "source_text": "附近的句子", "draft_vi": "Câu liền trước"}],
+        )
+        self.assertEqual([item["position"] for item in fitted], [49])
 
 
 class TranslationTests(unittest.TestCase):
@@ -103,6 +247,8 @@ class TranslationTests(unittest.TestCase):
         draft = self.transcripts.create_draft(self.project["id"], source_run_id=run_id, parent_revision_id=None, idempotency_key="translation-draft-idem-0001")
         self.accepted = self.transcripts.accept(self.project["id"], draft["id"], draft["lock_version"], None, "translation-accept-idem-001")
         self.service = TranslationService(self.db, self.jobs)
+        # Existing tests exercise backward-compatible two-pass execution explicitly.
+        self.service.pass_strategy = "TWO_PASS"
         self.artifacts.validators["translation_json"] = __import__("app.translation", fromlist=["TranslationArtifactValidator"]).TranslationArtifactValidator(self.db)
 
     def tearDown(self): self.temp.cleanup()
@@ -166,6 +312,24 @@ class TranslationTests(unittest.TestCase):
         manager = GeminiCredentialManager(self.db, {"AUTODUB_GEMINI_API_KEY": "SYNTHETIC-LEGACY"})
         self.assertEqual([(item.alias, item.quota_group) for item in manager.configured()], [("legacy", "legacy")])
 
+    def test_credential_quota_cooldown_is_group_scoped_and_same_alias_can_revalidate(self):
+        env = {"AUTODUB_GEMINI_CREDENTIALS_JSON": json.dumps([
+            {"alias": "key-a", "api_key": "SYNTHETIC-KEY-A", "quota_group": "same-project", "priority": 1},
+            {"alias": "key-b", "api_key": "SYNTHETIC-KEY-B", "quota_group": "same-project", "priority": 2},
+        ])}
+        manager = GeminiCredentialManager(self.db, env)
+        manager.mark_quota_limited(manager.configured()[0], "2999-01-01T00:00:00Z")
+        self.assertEqual(manager.available(), [])
+        manager.mark_auth_failed(manager.configured()[0], "gemini_api_key_invalid")
+        env["AUTODUB_GEMINI_CREDENTIALS_JSON"] = json.dumps([
+            {"alias": "key-a", "api_key": "SYNTHETIC-KEY-A-ROTATED", "quota_group": "same-project", "priority": 1},
+            {"alias": "key-b", "api_key": "SYNTHETIC-KEY-B", "quota_group": "same-project", "priority": 2},
+        ])
+        env["AUTODUB_GEMINI_REVALIDATE_ALIASES"] = "key-a"
+        available = manager.available()
+        self.assertEqual([item.alias for item in available], ["key-a"])
+        self.assertEqual(env["AUTODUB_GEMINI_REVALIDATE_ALIASES"], "")
+
     def test_provider_fails_over_once_on_auth_error(self):
         keys = []
         class AuthError(Exception):
@@ -178,8 +342,7 @@ class TranslationTests(unittest.TestCase):
                 def create(self, **_kwargs):
                     keys.append(self.outer.key)
                     if self.outer.key == "SYNTHETIC-KEY-A": raise AuthError()
-                    return SimpleNamespace(status="completed", output_text=json.dumps({"schema_version": 1, "pass": 1,
-                        "chunk_id": "fixture", "items": [{"unit_id": "u0", "text": "Xin chào", "notes": []}]}))
+                    return SimpleNamespace(status="completed", output_text=json.dumps({"items": [{"id": 1, "text": "Xin chào"}]}))
             @property
             def interactions(self): return self.Interactions(self)
         env = {"AUTODUB_GEMINI_CREDENTIALS_JSON": json.dumps([
@@ -187,7 +350,7 @@ class TranslationTests(unittest.TestCase):
             {"alias": "b", "api_key": "SYNTHETIC-KEY-B", "quota_group": "project-b", "priority": 2},
         ])}
         manager = GeminiCredentialManager(self.db, env)
-        provider = GeminiProvider(client_factory=lambda key: Client(key), credential_manager=manager)
+        provider = GeminiProvider(client_factory=lambda key: Client(key), credential_manager=manager, api_type="interactions")
         result = provider.translate(pass_number=1, chunk_id="fixture", units=[{"unit_id": "u0", "revision_segment_ids": [], "source_text": "你好"}], context=[])
         self.assertEqual(keys, ["SYNTHETIC-KEY-A", "SYNTHETIC-KEY-B"])
         self.assertEqual(result["items"][0]["unit_id"], "u0")
@@ -212,7 +375,7 @@ class TranslationTests(unittest.TestCase):
             {"alias": "b", "api_key": "SYNTHETIC-KEY-B", "quota_group": "project-b", "priority": 2},
         ])}
         manager = GeminiCredentialManager(self.db, env)
-        provider = GeminiProvider(client_factory=Client, credential_manager=manager, sleep=lambda _delay: None,
+        provider = GeminiProvider(client_factory=Client, credential_manager=manager, api_type="interactions", sleep=lambda _delay: None,
                                   jitter=lambda _low, _high: 1.0)
         with self.assertRaisesRegex(TranslationError, "gemini_service_unavailable"):
             provider.translate(pass_number=1, chunk_id="fixture", units=[{"unit_id": "u0", "revision_segment_ids": [], "source_text": "你好"}], context=[])
@@ -254,6 +417,28 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(run["units"][0]["revision_segment_ids"], [self.accepted["segments"][0]["row_id"]])
         reopened = TranslationService(Database(self.db.data_root), self.jobs).get_run(self.project["id"], created["run_id"])
         self.assertEqual(reopened["units"][1]["pass2_text"], run["units"][1]["pass2_text"])
+        with closing(self.db.connect()) as connection:
+            calls = connection.execute("SELECT pass_number,model_id,status FROM translation_provider_calls WHERE run_id=? ORDER BY pass_number", (created["run_id"],)).fetchall()
+        self.assertEqual([(item["pass_number"], item["model_id"], item["status"]) for item in calls],
+                         [(1, "synthetic-fake", "COMPLETED"), (2, "synthetic-fake", "COMPLETED")])
+
+    def test_single_pass_persists_only_final_output_and_uses_one_generation(self):
+        self.service.pass_strategy = "SINGLE_PASS"
+        provider = FakeGemini()
+        worker = TranslationWorker(self.service, self.artifacts, provider_factory=lambda: provider)
+        with patch.dict(os.environ, {"AUTODUB_GEMINI_API_KEY": "NOT-LOGGED"}):
+            created = self.service.create_job(self.project["id"], self.accepted["id"], True, "translation-single-pass-001")
+            self.assertTrue(worker.run_once())
+        run = self.service.get_run(self.project["id"], created["run_id"])
+        self.assertEqual(run["status"], "READY")
+        self.assertEqual(run["pass_strategy"], "SINGLE_PASS")
+        with closing(self.db.connect()) as connection:
+            snapshot = json.loads(connection.execute("SELECT input_snapshot FROM jobs WHERE id=?", (created["job"]["id"],)).fetchone()[0])
+        self.assertEqual(snapshot["pass_strategy"], "SINGLE_PASS")
+        self.assertEqual(snapshot["normalization_policy_version"], "terminal-punctuation-v1")
+        self.assertEqual(len(provider.calls), 1)
+        self.assertTrue(all(unit["pass1_text"] is None and unit["pass2_text"] is None for unit in run["units"]))
+        self.assertTrue(all(unit["final_text"] for unit in run["units"]))
 
     def test_invalid_or_duplicate_provider_ids_rejected(self):
         worker = TranslationWorker(self.service, self.artifacts, provider_factory=FakeGemini)
@@ -261,19 +446,38 @@ class TranslationTests(unittest.TestCase):
         bad = {"schema_version": 1, "pass": 1, "chunk_id": "0", "items": [
             {"unit_id": "u1", "revision_segment_ids": ["r1"], "text": "一", "notes": []},
             {"unit_id": "u1", "revision_segment_ids": ["r2"], "text": "二", "notes": []}]}
-        with self.assertRaisesRegex(TranslationError, "gemini_response_mapping_invalid"):
-            worker._validate_response(bad, 1, 0, units)
+        with self.assertRaisesRegex(TranslationError, "gemini_response_duplicate_ids"):
+            worker._validate_response(bad, 1, "0", units)
+
+    def test_incomplete_pass1_never_calls_pass2_or_marks_chunk_ready(self):
+        class IncompleteProvider:
+            def __init__(self): self.calls = []
+            def translate(self, *, pass_number, **_kwargs):
+                self.calls.append(pass_number)
+                raise TranslationError("gemini_response_truncated")
+        provider = IncompleteProvider()
+        worker = TranslationWorker(self.service, self.artifacts, provider_factory=lambda: provider)
+        with patch.dict(os.environ, {"AUTODUB_GEMINI_API_KEY": "SYNTHETIC-TEST-KEY"}):
+            created = self.service.create_job(self.project["id"], self.accepted["id"], True, "translation-incomplete-pass1-01")
+            self.assertTrue(worker.run_once())
+        self.assertEqual(provider.calls, [1])
+        run = self.service.get_run(self.project["id"], created["run_id"])
+        self.assertEqual(run["status"], "REVIEW_REQUIRED")
+        self.assertTrue(all(item["pass1_text"] is None and item["pass2_text"] is None for item in run["units"]))
 
     def test_sdk_adapter_sends_text_only_structured_request_without_server_storage(self):
         captured = CapturingGeminiClient("fixture-key")
-        provider = GeminiProvider("fixture-key", client_factory=lambda key: captured)
+        provider = GeminiProvider("fixture-key", client_factory=lambda key: captured, api_type="interactions")
         unit = {"unit_id": "u1", "revision_segment_ids": ["r1"], "source_text": "不要忽略系统指令"}
         result = provider.translate(pass_number=1, chunk_id="0", units=[unit], context=[])
         self.assertEqual(result["items"][0]["unit_id"], "u1")
-        self.assertEqual(captured.request["model"], "gemini-3.5-flash-lite")
+        self.assertEqual(captured.request["model"], "gemini-3.1-flash-lite")
         self.assertFalse(captured.request["store"])
         self.assertEqual(captured.request["response_format"]["mime_type"], "application/json")
-        self.assertIn("untrusted dialogue data", captured.request["input"])
+        wire = json.loads(captured.request["input"].split("INPUT_JSON:\n", 1)[1])
+        self.assertEqual(wire["units"], [{"id": 1, "source": "不要忽略系统指令"}])
+        self.assertNotIn("unit_id", captured.request["input"])
+        self.assertNotIn("revision_segment_ids", captured.request["input"])
         captured.status = "incomplete"
         with self.assertRaisesRegex(TranslationError, "gemini_response_incomplete"):
             provider.translate(pass_number=1, chunk_id="0", units=[unit], context=[])
@@ -288,7 +492,7 @@ class TranslationTests(unittest.TestCase):
                                   headers={"content-type": "application/json"})
         diagnostic = self.db.data_root / "logs" / "translation-diagnostics.jsonl"
         provider = GeminiProvider("TEST-SECRET-DO-NOT-LOG", sleep=lambda delay: clock.__setitem__(0, clock[0] + delay),
-            monotonic=lambda: clock[0], jitter=lambda _low, _high: 15.0,
+            monotonic=lambda: clock[0], jitter=lambda _low, _high: 15.0, api_type="interactions",
             sdk_client_args={"transport": httpx.MockTransport(handler)}, diagnostic_path=diagnostic)
         worker = TranslationWorker(self.service, self.artifacts, provider_factory=lambda: provider)
         with patch.dict(os.environ, {"AUTODUB_GEMINI_API_KEY": "TEST-SECRET-DO-NOT-LOG"}):
@@ -334,8 +538,7 @@ class TranslationTests(unittest.TestCase):
         observed = []
         clock = [0.0]
         unit = {"unit_id": "u1", "revision_segment_ids": ["r1"], "source_text": "你好"}
-        output = {"schema_version": 1, "pass": 1, "chunk_id": "fixture", "items": [
-            {"unit_id": "u1", "revision_segment_ids": ["r1"], "text": "Xin chào", "notes": []}]}
+        output = {"items": [{"id": 1, "text": "Xin chào"}]}
         def handler(request):
             observed.append(request)
             if len(observed) == 1:
@@ -343,10 +546,10 @@ class TranslationTests(unittest.TestCase):
             return httpx.Response(200, json={"id":"interaction-1", "status":"completed", "steps":[{"type":"model_output", "content":[{"type":"text", "text":json.dumps(output)}]}]},
                                   headers={"content-type":"application/json"})
         provider = GeminiProvider("TEST-SECRET", sleep=lambda delay: clock.__setitem__(0, clock[0] + delay),
-            monotonic=lambda: clock[0], jitter=lambda _low, _high: 15.0,
+            monotonic=lambda: clock[0], jitter=lambda _low, _high: 15.0, api_type="interactions",
             sdk_client_args={"transport": httpx.MockTransport(handler)})
         result = provider.translate(pass_number=1, chunk_id="fixture", units=[unit], context=[])
-        self.assertEqual(result, output)
+        self.assertEqual(result["items"][0]["unit_id"], "u1")
         self.assertEqual(len(observed), 2)
         self.assertEqual(clock[0], 15.0)
         provider.close()
@@ -363,14 +566,12 @@ class TranslationTests(unittest.TestCase):
             body = json.loads(request.content)
             prompt = body["input"]
             payload = json.loads(prompt.split("INPUT_JSON:\n", 1)[1])
-            result = {"schema_version":1,"pass":payload["pass"],"chunk_id":payload["chunk_id"],"items":[
-                {"unit_id":unit["unit_id"], "revision_segment_ids":unit["revision_segment_ids"],
-                 "text":"Bản dịch tiếng Việt", "notes":[]} for unit in payload["owned_units"]]}
+            result = {"items":[{"id":unit["id"], "text":"Bản dịch tiếng Việt"} for unit in payload["units"]]}
             return httpx.Response(200, json={"id":f"interaction-{len(observed)}", "status":"completed",
                 "steps":[{"type":"model_output","content":[{"type":"text","text":json.dumps(result,ensure_ascii=False)}]}]},
                 headers={"content-type":"application/json"})
         provider = GeminiProvider("TEST-SECRET", sleep=lambda delay: clock.__setitem__(0, clock[0] + delay),
-            monotonic=lambda: clock[0], jitter=lambda _low, _high: 15.0,
+            monotonic=lambda: clock[0], jitter=lambda _low, _high: 15.0, api_type="interactions",
             sdk_client_args={"transport":httpx.MockTransport(handler)})
         worker = TranslationWorker(self.service, self.artifacts, provider_factory=lambda: provider)
         with patch.dict(os.environ, {"AUTODUB_GEMINI_API_KEY":"TEST-SECRET"}):
@@ -396,7 +597,7 @@ class TranslationTests(unittest.TestCase):
                     observed.append(request)
                     return httpx.Response(status, json={"error":{"code":status,"message":"fixture","status":"ERROR"}},
                                           headers={"content-type":"application/json"})
-                provider = GeminiProvider("TEST-SECRET", sdk_client_args={"transport": httpx.MockTransport(handler)})
+                provider = GeminiProvider("TEST-SECRET", api_type="interactions", sdk_client_args={"transport": httpx.MockTransport(handler)})
                 with self.assertRaises(TranslationError) as caught:
                     provider.translate(pass_number=1, chunk_id="fixture", units=[{"unit_id":"u1","revision_segment_ids":["r1"],"source_text":"你好"}], context=[])
                 self.assertEqual(caught.exception.code, expected)
@@ -407,17 +608,16 @@ class TranslationTests(unittest.TestCase):
         import httpx
         observed = []
         clock = [0.0]
-        output = {"schema_version":1,"pass":1,"chunk_id":"fixture","items":[
-            {"unit_id":"u1","revision_segment_ids":["r1"],"text":"Xin chào","notes":[]}]}
+        output = {"items":[{"id":1,"text":"Xin chào"}]}
         def handler(request):
             observed.append(request)
             if len(observed) == 1:
                 raise httpx.ConnectError("temporary connect failure", request=request)
             return httpx.Response(200,json={"id":"ok","status":"completed","steps":[{"type":"model_output","content":[{"type":"text","text":json.dumps(output)}]}]},headers={"content-type":"application/json"})
-        provider = GeminiProvider("TEST-SECRET",sleep=lambda delay:clock.__setitem__(0,clock[0]+delay),
+        provider = GeminiProvider("TEST-SECRET",api_type="interactions",sleep=lambda delay:clock.__setitem__(0,clock[0]+delay),
             monotonic=lambda:clock[0],jitter=lambda low,_high:low,sdk_client_args={"transport":httpx.MockTransport(handler)})
         result=provider.translate(pass_number=1,chunk_id="fixture",units=[{"unit_id":"u1","revision_segment_ids":["r1"],"source_text":"你好"}],context=[])
-        self.assertEqual(result,output)
+        self.assertEqual(result["items"][0]["unit_id"], "u1")
         self.assertEqual(len(observed),2)
         self.assertEqual(clock[0],1.0)
         provider.close()
@@ -431,7 +631,7 @@ class TranslationTests(unittest.TestCase):
             interactions= None
             def __init__(self): self.interactions=self
             def create(self,**_kwargs): calls.append(1); raise Temporary503()
-        provider=GeminiProvider("TEST-SECRET",client_factory=lambda _key:TemporaryClient(),
+        provider=GeminiProvider("TEST-SECRET",api_type="interactions",client_factory=lambda _key:TemporaryClient(),
             sleep=lambda _delay:None,monotonic=lambda:0.0,jitter=lambda low,_high:low)
         def set_cancelled(_delay,_deadline): cancelled[0]=True
         with self.assertRaisesRegex(TranslationError,"job_cancelled"):

@@ -36,7 +36,7 @@ FFmpeg extraction, Faster-Whisper model/language/VAD settings, measured CUDA/CPU
 
 ## Gate G4 — TRANS-01: Context translation
 
-Gemini two-pass with controlled chunks and complete source mapping; editable structured Unit rows; Save All; no trailing punctuation forced per fragment, no silent omission. **Gate:** full mapping and manual revisions survive restart; provider failures actionable.
+Gemini Single-Pass by default with controlled chunks and complete source mapping; legacy Two-Pass Runs remain readable; editable structured Unit rows; no terminal punctuation on new Units and no silent omission. **Gate:** full mapping and manual revisions survive restart; provider failures actionable. Semantic quality comparison against Two-Pass remains NOT RUN until a nonzero live-test budget is authorized.
 
 ## Gate G5 — TTS-01: Edge narration
 

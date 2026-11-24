@@ -1,0 +1,9 @@
+# ADR-003 — Single-Pass Translation as Production Default
+
+- **Status:** Proposed; Single-Pass is implemented provisionally for review, semantic quality acceptance remains pending.
+- **Date:** 2026-11-24
+- **Context:** The previous default called Gemini twice for every successful chunk. Product Owner reported verbose dubbing text, terminal punctuation on each Unit, and no demonstrated quality benefit proportional to request count and latency. The live Gemini budget for this task is $0.
+- **Decision:** New production Translation Runs use versioned `SINGLE_PASS`. Each Unit receives one structured, exact-mapped translation intended for concise spoken Vietnamese. Apply a deterministic, versioned terminal-punctuation normalization after response validation. Do not truncate by duration. Keep existing `TWO_PASS` Runs immutable and readable, and never manufacture Pass 1/Pass 2 values from a Single-Pass result.
+- **Data contract:** Persist `pass_strategy`, `normalization_policy_version` and `final_text`; retain legacy pass columns for existing Runs. Publish all strategy and normalization provenance in the immutable artifact. New Jobs may resume verified Unit outputs only when their immutable strategy/fingerprint matches.
+- **Evidence and limits:** Automated contract tests can verify one generation per successful chunk, strict mapping, punctuation policy and migration compatibility. They cannot demonstrate semantic parity or superiority. Live quality comparison across genres and video/browser acceptance are **NOT RUN**; do not claim translation quality has been empirically validated.
+- **Consequences:** Single-Pass reduces expected generation count for new work. It places more responsibility on one generation to preserve context and tone; strict mapping, reviewable failures and user approval remain mandatory. A later product review may restore Two-Pass as default only through a new ADR backed by authorized comparative evidence.

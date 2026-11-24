@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from app.artifacts import ArtifactPublicationService
 from app.asr import ASRConfig, ASRService, TranscriptArtifactValidator
-from app.database import Database
+from app.database import Database, SCHEMA_VERSION
 from app.jobs import JobService
 from app.main import create_app
 from app.media import FFprobe, LinkManifestValidator, MediaImportService, SourceVideoValidator, _path_identity
@@ -104,7 +104,7 @@ class TranscriptTests(unittest.TestCase):
     def test_v10_migration_preserves_core_and_asr_and_is_repeatable(self):
         self.db.initialize()
         with closing(self.db.connect()) as c:
-            self.assertEqual(c.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 12)
+            self.assertEqual(c.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], SCHEMA_VERSION)
             self.assertEqual(c.execute("PRAGMA foreign_key_check").fetchall(), [])
             self.assertEqual(c.execute("SELECT COUNT(*) FROM segments WHERE run_id=?", (self.run,)).fetchone()[0], 3)
             self.assertEqual(c.execute("SELECT COUNT(*) FROM projects WHERE id=?", (self.project["id"],)).fetchone()[0], 1)

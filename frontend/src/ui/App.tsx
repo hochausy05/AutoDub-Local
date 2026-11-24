@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import { fetchBackendHealth, type BackendHealth } from "../api/health";
 import { createProject, fetchProjects, type Project } from "../api/projects";
 import { establishSession } from "../api/session";
-import { acceptTranscriptRevision, cancelLocalJob, chooseSource, createASRJob, createTranscriptDraft, createTranslationJob, fetchGeminiStatus, fetchTranslationRun, fetchTranslationRuns, fetchASRModels, fetchASRRun, fetchASRRuns, fetchMedia, fetchProcessingSource, fetchTranscriptRevision, fetchTranscriptRevisions, getImportJob, importSelected, mediaStreamUrl, relinkMedia, retryLocalJob, saveTranscriptDraft, selectProcessingSource, type ASRJob, type ASRRun, type ASRRunSummary, type ImportJob, type MediaAsset, type ProcessingSource, type TranscriptRevision, type TranslationRun } from "../api/media";
+import { acceptTranscriptRevision, cancelLocalJob, chooseSource, createASRJob, createTranscriptDraft, createTranslationJob, fetchGeminiStatus, fetchTranslationRun, fetchTranslationRuns, fetchASRModels, fetchASRRun, fetchASRRuns, fetchMedia, fetchProcessingSource, fetchTranscriptRevisions, getImportJob, importSelected, mediaStreamUrl, relinkMedia, retryLocalJob, saveTranscriptDraft, selectProcessingSource, type ASRJob, type ASRRun, type ASRRunSummary, type ImportJob, type MediaAsset, type ProcessingSource, type TranscriptRevision, type TranslationRun } from "../api/media";
 
 type Connection =
   | { state: "checking"; message: string; health: null }
@@ -116,9 +116,15 @@ export function App() {
   const [translationError, setTranslationError] = useState<string | null>(null);
   const [translationStarting, setTranslationStarting] = useState(false);
   const [translationRetrying, setTranslationRetrying] = useState(false);
+  const translationSubmissionLock = useRef(false);
   const [clockNow, setClockNow] = useState(Date.now());
   const [geminiConfigured, setGeminiConfigured] = useState(false);
   const [showPass1, setShowPass1] = useState(false);
+  const [transcriptTab, setTranscriptTab] = useState<"original" | "approved">("original");
+  const consentScope = "gemini-transcript-translation-v1";
+  const [translationConsent, setTranslationConsent] = useState(() => window.localStorage.getItem("autodub:translation-consent") === consentScope);
+  const selectedContext = useRef({ projectId: selectedProject, mediaId: selectedMediaId });
+  selectedContext.current = { projectId: selectedProject, mediaId: selectedMediaId };
   const savedTranscript = useRef<TranscriptRevision | null>(null);
   const cancelToOriginal = useRef(false);
   const [videoPlayheadUs, setVideoPlayheadUs] = useState(0);
@@ -238,9 +244,10 @@ export function App() {
       try {
         const job = await getImportJob(translationRun.producer_job_id, selectedProject);
         if (stopped) return;
-        setTranslationJob(job);
         const run = await fetchTranslationRun(selectedProject, translationRun.id);
-        if (stopped) return;
+        const context = selectedContext.current;
+        if (stopped || context.projectId !== selectedProject || context.mediaId !== translationRun.source_asset_id || run.project_id !== selectedProject || run.source_asset_id !== context.mediaId || run.id !== translationRun.id) return;
+        setTranslationJob(job);
         setTranslationRun(run);
         const stillActiveRun = ["QUEUED", "RUNNING", "PARTIAL", "WAITING_FOR_QUOTA"].includes(run.status) && ["QUEUED", "RUNNING", "CANCEL_REQUESTED"].includes(job.status);
         const stillCoolingDown = job.status === "FAILED" && job.retry_block_reason === "retry_cooldown";
@@ -250,9 +257,11 @@ export function App() {
     };
     timer = window.setTimeout(poll, 400);
     return () => { stopped = true; if (timer) window.clearTimeout(timer); };
-  }, [translationRun, selectedProject, translationJob?.id, translationJob?.status, translationJob?.retry_block_reason]);
+  }, [translationRun?.id, translationRun?.status, selectedProject, selectedMediaId]);
 
   const translationRetryDeadline = translationJob?.progress?.retry_after_at ?? translationJob?.attempt?.retry_after_at ?? null;
+  const activeTranscriptAccepted = transcriptRevisions.find((revision) => revision.run_id === selectedRun?.id && revision.status === "ACCEPTED" && revision.is_current) ?? null;
+  const approvedViewRevision = transcriptEditing ? transcriptRevision : transcriptRevision?.status === "DRAFT" ? activeTranscriptAccepted ?? transcriptRevision : transcriptRevision;
   useEffect(() => {
     if (!translationRetryDeadline) return;
     setClockNow(Date.now());
@@ -313,32 +322,30 @@ export function App() {
       try {
         const next = await getImportJob(asrJob.id, asrJob.project_id);
         if (stopped) return;
-        setAsrJob(next);
         if (next.status === "READY") {
-          void fetchASRModels().then((result) => setAsrModelCached(result.items.find((item) => item.id === "base")?.cached ?? false)).catch(() => undefined);
           const runs = await fetchASRRuns(next.project_id);
-          if (!stopped) {
-            const matching = runs.filter((run) => run.source_asset_id === asrJobSourceId);
-            if (selectedMediaId === asrJobSourceId) {
-              setAsrRuns(matching);
-              const active = matching.find((run) => run.is_active) ?? matching[0];
-              if (active) setSelectedRun(await fetchASRRun(next.project_id, active.id));
-              const revisions = await fetchTranscriptRevisions(next.project_id, asrJobSourceId);
-              if (!stopped) {
-                setTranscriptRevisions(revisions);
-                if (!transcriptDirty && !transcriptEditing) installTranscript(revisions.find((revision) => revision.status === "DRAFT") ?? revisions.find((revision) => revision.is_active) ?? null);
-              }
-            }
-          }
+          const matching = runs.filter((run) => run.source_asset_id === asrJobSourceId);
+          const active = matching.find((run) => run.is_active) ?? matching[0];
+          const detail = active ? await fetchASRRun(next.project_id, active.id) : null;
+          const revisions = await fetchTranscriptRevisions(next.project_id, asrJobSourceId);
+          const context = selectedContext.current;
+          if (stopped || context.projectId !== next.project_id || context.mediaId !== asrJobSourceId || detail && detail.source_asset_id !== context.mediaId) return;
+          setAsrJob(next);
+          setAsrRuns(matching);
+          setSelectedRun(detail);
+          setTranscriptRevisions(revisions);
+          if (!transcriptDirty && !transcriptEditing) installTranscript(revisions.find((revision) => revision.status === "DRAFT") ?? revisions.find((revision) => revision.is_active) ?? null);
+          void fetchASRModels().then((result) => setAsrModelCached(result.items.find((item) => item.id === "base")?.cached ?? false)).catch(() => undefined);
         } else if (["FAILED", "CANCELLED", "INTERRUPTED"].includes(next.status)) {
+          setAsrJob(next);
           setAsrError(asrFailureLabel(next.error_code));
           void fetchASRModels().then((result) => setAsrModelCached(result.items.find((item) => item.id === "base")?.cached ?? false)).catch(() => setAsrModelCached(false));
-        } else timer = window.setTimeout(poll, 800);
+        } else { setAsrJob(next); timer = window.setTimeout(poll, 800); }
       } catch (error) { if (!stopped) setAsrError(error instanceof Error ? error.message : "Không theo dõi được ASR Job."); }
     };
     timer = window.setTimeout(poll, 500);
     return () => { stopped = true; if (timer) window.clearTimeout(timer); };
-  }, [asrJob, asrJobSourceId, selectedMediaId, transcriptDirty, transcriptEditing, installTranscript]);
+  }, [asrJob?.id, asrJobSourceId, selectedProject, selectedMediaId, transcriptDirty, transcriptEditing, installTranscript]);
 
   const startImport = async () => {
     if (!selectedProject) return;
@@ -376,17 +383,17 @@ export function App() {
 
   const startTranslation = async () => {
     if (!selectedProject || !transcriptRevision?.id || transcriptRevision.status !== "ACCEPTED" || !transcriptRevision.is_current) return;
-    const consentText = "Lời thoại văn bản sẽ được gửi tới dịch vụ Gemini để dịch sang tiếng Việt. Video và file âm thanh vẫn được lưu trên máy tính.";
-    if (!window.confirm(consentText)) return;
+    if (!translationConsent || translationSubmissionLock.current) return;
+    translationSubmissionLock.current = true;
     setTranslationStarting(true); setTranslationError(null);
     try {
-      const result = await createTranslationJob(selectedProject, transcriptRevision.id);
+      const result = await createTranslationJob(selectedProject, transcriptRevision.id, translationConsent);
       setTranslationJob(result.job);
       setTranslationRun(await fetchTranslationRun(selectedProject, result.run_id));
     } catch (error) {
       setTranslationError(error instanceof Error ? error.message : "Không thể bắt đầu dịch.");
       try { setGeminiConfigured((await fetchGeminiStatus()).configured); } catch { /* keep current configuration status */ }
-    } finally { setTranslationStarting(false); }
+    } finally { translationSubmissionLock.current = false; setTranslationStarting(false); }
   };
 
   const startASR = async () => {
@@ -421,6 +428,7 @@ export function App() {
   };
 
   const editTranscript = () => {
+    setTranscriptTab("approved");
     if (transcriptRevision) {
       if (transcriptRevision.status === "ACCEPTED") {
         const existingDraft = transcriptRevisions.find((revision) => revision.run_id === transcriptRevision.run_id && revision.status === "DRAFT");
@@ -471,7 +479,9 @@ export function App() {
   };
 
   const cancelTranscriptEdit = () => {
-    installTranscript(cancelToOriginal.current ? null : savedTranscript.current);
+    const returnToOriginal = cancelToOriginal.current;
+    installTranscript(returnToOriginal ? null : savedTranscript.current);
+    setTranscriptTab(returnToOriginal ? "original" : "approved");
   };
 
   const acceptTranscript = async () => {
@@ -485,24 +495,24 @@ export function App() {
         installTranscript(currentAccepted);
         return;
       }
-      const draft = transcriptRevision?.id
+      const draftIsOriginal = transcriptRevision?.status === "DRAFT" && transcriptRevision.segments.every((segment) => segment.source_segment_ids.length === 1 && segment.text === segment.source_texts[0]);
+      const approveOriginal = transcriptTab === "original" && !draftIsOriginal;
+      const draft = transcriptRevision?.id && !approveOriginal
         ? transcriptRevision
         : await createTranscriptDraft(selectedProject, { source_run_id: selectedRun!.id });
       const expectedActive = transcriptRevisions.find((revision) => revision.is_active)?.id ?? null;
       const accepted = await acceptTranscriptRevision(selectedProject, draft, expectedActive);
       setTranscriptRevisions(await fetchTranscriptRevisions(selectedProject, selectedMediaId));
       installTranscript(accepted);
+      setTranscriptTab("approved");
     } catch (error) { setTranscriptError(error instanceof Error ? error.message : "Không thể duyệt lời thoại. Bản nháp đã lưu vẫn được giữ."); }
     finally { setTranscriptSaving(false); }
   };
 
-  const transcriptIsOriginal = (revision: TranscriptRevision) => revision.segments.every((segment) => segment.source_segment_ids.length === 1 && segment.text === segment.source_texts[0]);
-
-  const selectTranscriptHistory = async (revisionId: string) => {
-    if (transcriptDirty && !window.confirm("Bạn còn lời thoại chưa lưu. Đổi phiên bản sẽ bỏ các thay đổi đang nhập. Tiếp tục?")) return;
-    if (!selectedProject || !revisionId) return;
-    try { installTranscript(await fetchTranscriptRevision(selectedProject, revisionId)); }
-    catch (error) { setTranscriptError(error instanceof Error ? error.message : "Không tải được phiên bản lời thoại."); }
+  const rememberTranslationConsent = (accepted: boolean) => {
+    setTranslationConsent(accepted);
+    if (accepted) window.localStorage.setItem("autodub:translation-consent", consentScope);
+    else window.localStorage.removeItem("autodub:translation-consent");
   };
 
   const seekToTimestamp = (assetId: string, startUs: number) => {
@@ -668,45 +678,46 @@ export function App() {
                       <option value="">Chọn kết quả</option>{asrRuns.map((run) => <option key={run.id} value={run.id}>{run.status}{run.is_active ? " · active" : " · lịch sử"} · {run.model_id.split("/").at(-1)} · {new Date(run.created_at).toLocaleString()}</option>)}
                     </select>
                   </> : null}
-                  {selectedRun && selectedRun.project_id === selectedProject && selectedRun.source_asset_id === selectedMediaId ? <div className="asr-result">
-                    <p>{selectedRun.status === "NO_SPEECH" ? "Không tìm thấy lời thoại" : selectedRun.status === "REVIEW_REQUIRED" ? "Đã nhận diện · cần xem lại một số đoạn" : "Đã nhận diện lời thoại"}{selectedRun.language ? ` · ${selectedRun.language === "en" ? "Tiếng Anh" : selectedRun.language === "zh" ? "Tiếng Trung" : selectedRun.language}` : ""}</p>
-                    {selectedRun.provenance.language_probability !== null ? <small>Xác suất ngôn ngữ: {(selectedRun.provenance.language_probability * 100).toFixed(1)}%</small> : null}
-                    {selectedRun.status === "NO_SPEECH" ? <p>Không tìm thấy lời thoại; không tạo Segment giả.</p> : null}
-                    <ol className="asr-segments">{selectedRun.segments.map((segment) => <li key={segment.id}>
-                      <button type="button" onClick={() => seekToSegment(selectedRun, segment.start_us)} title="Tua video đến Segment">{(segment.start_us / 1_000_000).toFixed(2)}–{(segment.end_us / 1_000_000).toFixed(2)} s</button>
-                      <span>{segment.source_text}</span>{segment.flags.length ? <small>Review: {segment.flags.join(", ")}</small> : null}
-                    </li>)}</ol>
-                  </div> : null}
                   <section className="transcript-editor" aria-label="Kiểm tra lời thoại">
                     <header><div><h3>Kiểm tra lời thoại</h3><small>{mediaAssets.find((asset) => asset.id === selectedMediaId)?.display_name ?? "Chưa chọn video"}</small></div>
-                      {transcriptRevision ? <span className={`transcript-state transcript-${transcriptRevision.status.toLowerCase()}`}>{transcriptRevision.status === "ACCEPTED" ? (transcriptRevision.is_current ? (transcriptIsOriginal(transcriptRevision) ? "Đã xác nhận bản nhận diện gốc — Sẵn sàng dịch" : "Đã duyệt bản có chỉnh sửa — Sẵn sàng dịch") : "Bản lịch sử · chỉ xem") : "Bản nháp đã lưu"}</span> : null}
+                      {selectedRun?.status === "READY" ? <span className="transcript-state transcript-ready">Đã nhận diện</span> : null}
                     </header>
-                    {transcriptRevisions.length > 0 ? <label htmlFor="transcript-history">Phiên bản lời thoại</label> : null}
-                    {transcriptRevisions.length > 0 ? <select id="transcript-history" value={transcriptRevision?.id ?? ""} onChange={(event) => void selectTranscriptHistory(event.target.value)}><option value="">Chọn phiên bản</option>{transcriptRevisions.map((revision) => <option key={revision.id} value={revision.id}>Phiên bản {revision.revision_no} · {revision.status === "DRAFT" ? "Bản nháp" : revision.is_active && revision.is_current ? "Đã duyệt · đang dùng" : "Đã duyệt · lịch sử"}</option>)}</select> : null}
-                    {!transcriptRevision && selectedRun?.source_asset_id === selectedMediaId ? <p>Chưa có bản chỉnh sửa. Transcript nhận diện gốc vẫn được giữ nguyên.</p> : null}
-                    {selectedRun?.status === "NO_SPEECH" && !transcriptRevision ? <p>Không tìm thấy lời thoại; không tạo Segment giả.</p> : null}
-                    {transcriptRevision ? <>
-                      {transcriptEditing ? <p role="status">{transcriptDirty ? "Có thay đổi chưa lưu" : "Chưa có thay đổi"} · Thời điểm câu được giữ nguyên.</p> : null}
-                      {!transcriptEditing && transcriptRevision.status === "DRAFT" ? <p role="status">Bản nháp đã lưu. Có thể tiếp tục sửa hoặc duyệt để chuyển sang bước dịch.</p> : null}
-                      {transcriptRevision.segments.length === 0 ? <p>Phiên bản này chưa có câu lời thoại.</p> : <ol className="transcript-segments">{transcriptRevision.segments.map((segment, index) => {
-                        const highlighted = playingMediaId === transcriptRevision.source_asset_id && segment.start_us <= videoPlayheadUs && videoPlayheadUs < segment.end_us;
-                        return <li key={segment.row_id} className={highlighted ? "transcript-segment-active" : ""}>
-                          <div className="transcript-segment-heading"><button type="button" onClick={() => seekToTimestamp(transcriptRevision.source_asset_id, segment.start_us)} title="Phát video từ câu này">{formatSeconds(segment.start_us)}–{formatSeconds(segment.end_us)} s</button><span>Câu {index + 1}</span>{segment.timing_warning ? <small role="note">Thời gian chồng lấn — hãy kiểm tra</small> : null}</div>
-                          {transcriptEditing ? <>
-                            <label className="visually-hidden" htmlFor={`transcript-text-${segment.row_id}`}>Nội dung câu {index + 1}</label>
-                            <textarea id={`transcript-text-${segment.row_id}`} value={segment.text} rows={2} onChange={(event) => updateTranscriptText(segment.row_id, event.target.value)} />
-                          </> : <p className="transcript-readonly-text">{segment.text}</p>}
-                        </li>;
-                      })}</ol>}
-                    </> : null}
-                    {transcriptEditing ? <div className="transcript-footer"><button type="button" disabled={transcriptSaving} onClick={cancelTranscriptEdit}>Hủy</button><button type="button" disabled={!transcriptDirty || transcriptSaving} onClick={() => void saveTranscript()}>{transcriptSaving ? "Đang lưu…" : "Lưu chỉnh sửa"}</button></div> : transcriptRevision?.status === "ACCEPTED" ? <div className="transcript-footer">{transcriptRevision.is_current ? <button type="button" disabled={transcriptSaving} onClick={editTranscript}>Sửa lại lời thoại</button> : null}</div> : transcriptRevision?.status === "DRAFT" ? <div className="transcript-footer"><button type="button" disabled={transcriptSaving} onClick={editTranscript}>Sửa lời thoại</button><button type="button" disabled={transcriptSaving || transcriptRevision.segments.length === 0 || transcriptRevision.segments.some((segment) => segment.coverage_status !== "REVIEWED")} onClick={() => void acceptTranscript()}>{transcriptSaving ? "Đang duyệt…" : "Duyệt lời thoại"}</button></div> : selectedRun?.source_asset_id === selectedMediaId ? <div className="transcript-footer"><button type="button" disabled={!selectedRun.segments.length || transcriptSaving} onClick={editTranscript}>Sửa lời thoại</button><button type="button" disabled={!selectedRun.segments.length || transcriptSaving} onClick={() => void acceptTranscript()}>{transcriptSaving ? "Đang duyệt…" : "Duyệt lời thoại"}</button></div> : <p>Chưa có transcript cho video này. Chạy nhận diện để tạo nội dung cần kiểm tra.</p>}
+                    <div className="transcript-tabs" role="tablist" aria-label="Phiên bản lời thoại">
+                      <button type="button" role="tab" aria-selected={transcriptTab === "original"} onClick={() => setTranscriptTab("original")}>Bản gốc</button>
+                      <button type="button" role="tab" aria-selected={transcriptTab === "approved"} onClick={() => setTranscriptTab("approved")}>Bản đã duyệt</button>
+                    </div>
+                    {transcriptTab === "original" ? <>
+                      {selectedRun?.project_id === selectedProject && selectedRun.source_asset_id === selectedMediaId ? <>
+                        <p>{selectedRun.status === "NO_SPEECH" ? "Không tìm thấy lời thoại; không tạo Segment giả." : "Kết quả nhận diện gốc · chỉ đọc"}</p>
+                        <ol className="transcript-segments">{selectedRun.segments.map((segment, index) => <li key={segment.id}>
+                          <div className="transcript-segment-heading"><button type="button" onClick={() => seekToSegment(selectedRun, segment.start_us)}>{formatSeconds(segment.start_us)}–{formatSeconds(segment.end_us)} s</button><span>Câu {index + 1}</span></div>
+                          <p className="transcript-readonly-text">{segment.source_text}</p>
+                        </li>)}</ol>
+                        {!transcriptRevision?.is_current && !transcriptEditing ? <div className="transcript-footer"><button type="button" disabled={!selectedRun.segments.length || transcriptSaving} onClick={editTranscript}>Sửa lời thoại</button><button type="button" disabled={!selectedRun.segments.length || transcriptSaving} onClick={() => void acceptTranscript()}>{transcriptSaving ? "Đang duyệt…" : "Duyệt bản gốc"}</button></div> : null}
+                      </> : <p>Chưa có transcript cho video này. Chạy nhận diện để tạo nội dung cần kiểm tra.</p>}
+                    </> : <>
+                      {approvedViewRevision?.status === "DRAFT" ? <p role="status">Bản nháp chưa duyệt · {transcriptEditing && transcriptDirty ? "Có thay đổi chưa lưu" : "Thời điểm được giữ nguyên"}</p> : null}
+                      {approvedViewRevision?.status === "ACCEPTED" && approvedViewRevision.is_current && !transcriptEditing ? <p role="status">Đã duyệt · Bản hiện hành</p> : null}
+                      {approvedViewRevision && (transcriptEditing || approvedViewRevision.status === "ACCEPTED" && approvedViewRevision.is_current) ? <>
+                        <ol className="transcript-segments">{approvedViewRevision.segments.map((segment, index) => {
+                          const highlighted = playingMediaId === approvedViewRevision.source_asset_id && segment.start_us <= videoPlayheadUs && videoPlayheadUs < segment.end_us;
+                          return <li key={segment.row_id} className={highlighted ? "transcript-segment-active" : ""}>
+                            <div className="transcript-segment-heading"><button type="button" onClick={() => seekToTimestamp(approvedViewRevision.source_asset_id, segment.start_us)}>{formatSeconds(segment.start_us)}–{formatSeconds(segment.end_us)} s</button><span>Câu {index + 1}</span></div>
+                            {transcriptEditing ? <textarea aria-label={`Nội dung câu ${index + 1}`} value={segment.text} rows={2} onChange={(event) => updateTranscriptText(segment.row_id, event.target.value)} /> : <p className="transcript-readonly-text">{segment.text}</p>}
+                          </li>;
+                        })}</ol>
+                        {transcriptEditing ? <div className="transcript-footer"><button type="button" disabled={transcriptSaving} onClick={cancelTranscriptEdit}>Hủy</button><button type="button" disabled={!transcriptDirty || transcriptSaving} onClick={() => void saveTranscript()}>{transcriptSaving ? "Đang lưu…" : "Lưu chỉnh sửa"}</button></div> : <div className="transcript-footer"><button type="button" disabled={transcriptSaving} onClick={editTranscript}>{transcriptRevision?.status === "DRAFT" ? "Tiếp tục sửa bản nháp" : "Sửa lại lời thoại"}</button>{approvedViewRevision.status === "DRAFT" ? <button type="button" disabled={transcriptSaving || approvedViewRevision.segments.length === 0 || approvedViewRevision.segments.some((segment) => segment.coverage_status !== "REVIEWED")} onClick={() => void acceptTranscript()}>{transcriptSaving ? "Đang duyệt…" : "Duyệt lời thoại"}</button> : null}</div>}
+                      </> : <><p>Chưa có bản lời thoại được duyệt. Có thể sửa hoặc duyệt nguyên bản trong tab Bản gốc.</p>{transcriptRevision?.status === "DRAFT" ? <button type="button" onClick={editTranscript}>Tiếp tục sửa bản nháp</button> : null}</>}
+                    </>}
                     {transcriptError ? <p className="project-error" role="alert">{transcriptError}</p> : null}
                   </section>
                   <section className="translation-panel" aria-label="Dịch lời thoại">
                     <header><div><h3>Dịch lời thoại</h3><small>Ngôn ngữ đích: Tiếng Việt</small></div>
                       {translationRun ? <span className={`transcript-state transcript-${translationRun.status.toLowerCase()}`}>{translationStatusLabel(translationRun.status)}</span> : null}
                     </header>
-                    <p>Lời thoại văn bản sẽ được gửi tới dịch vụ Gemini để dịch sang tiếng Việt. Video và file âm thanh vẫn được lưu trên máy tính.</p>
+                    <p>Lời thoại văn bản được gửi đến Gemini để dịch. Video và âm thanh vẫn được lưu trên máy tính.</p>
+                    <label className="translation-consent"><input type="checkbox" checked={translationConsent} onChange={(event) => rememberTranslationConsent(event.target.checked)} /> Tôi đồng ý gửi lời thoại văn bản hiện hành đến Gemini để dịch.</label>
+                    {translationConsent ? <button type="button" className="text-button" onClick={() => rememberTranslationConsent(false)}>Thu hồi đồng ý</button> : <small>Chỉ cần xác nhận một lần cho phạm vi dịch lời thoại hiện tại. Có thể thu hồi bất cứ lúc nào.</small>}
                     {!transcriptRevision || transcriptRevision.status !== "ACCEPTED" || !transcriptRevision.is_current ? <p>Hãy duyệt lời thoại hiện hành trước khi dịch.</p> : null}
                     {transcriptRevision?.status === "ACCEPTED" && transcriptRevision.segments.length === 0 ? <p>Không có lời thoại cần dịch.</p> : null}
                     {!geminiConfigured ? <p role="note">Chưa cấu hình Gemini credentials ở backend. Hãy thêm `AUTODUB_GEMINI_API_KEY` hoặc `AUTODUB_GEMINI_CREDENTIALS_JSON` vào `.env` cục bộ rồi khởi động lại.</p> : null}
@@ -721,9 +732,9 @@ export function App() {
                     {translationRun?.error_code ? <p role="alert" className="project-error">{translationErrorLabel(translationRun.error_code)}</p> : null}
                     {translationError ? <p role="alert" className="project-error">{translationError}</p> : null}
                     {translationRun?.units?.length ? <>
-                      <label className="translation-pass-toggle"><input type="checkbox" checked={showPass1} onChange={(event) => setShowPass1(event.target.checked)} /> Xem bản dịch lượt đầu khi cần</label>
-                      <div className="translation-table-scroll"><table className="translation-table"><thead><tr><th>Thời gian</th><th>Lời thoại gốc</th><th>Bản dịch tiếng Việt</th>{showPass1 ? <th>Bản lượt đầu</th> : null}</tr></thead><tbody>{translationRun.units.map((unit) => <tr key={unit.unit_id} onClick={() => seekToTimestamp(translationRun.source_asset_id, unit.start_us)} tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") seekToTimestamp(translationRun.source_asset_id, unit.start_us); }}>
-                        <td>{formatSeconds(unit.start_us)}–{formatSeconds(unit.end_us)} s</td><td>{unit.source_text}</td><td>{unit.pass2_text ?? (unit.status === "FAILED" || unit.status === "REVIEW_REQUIRED" ? "Cần kiểm tra" : "Đang dịch…")}</td>{showPass1 ? <td>{unit.pass1_text ?? "—"}</td> : null}
+                      {translationRun.pass_strategy === "TWO_PASS" ? <label className="translation-pass-toggle"><input type="checkbox" checked={showPass1} onChange={(event) => setShowPass1(event.target.checked)} /> Xem bản dịch lượt đầu khi cần</label> : null}
+                      <div className="translation-table-scroll"><table className="translation-table"><thead><tr><th>Thời gian</th><th>Lời thoại gốc</th><th>Bản dịch tiếng Việt</th>{showPass1 && translationRun.pass_strategy === "TWO_PASS" ? <th>Bản lượt đầu</th> : null}</tr></thead><tbody>{translationRun.units.map((unit) => <tr key={unit.unit_id} onClick={() => seekToTimestamp(translationRun.source_asset_id, unit.start_us)} tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") seekToTimestamp(translationRun.source_asset_id, unit.start_us); }}>
+                        <td>{formatSeconds(unit.start_us)}–{formatSeconds(unit.end_us)} s</td><td>{unit.source_text}</td><td>{unit.final_text ?? unit.pass2_text ?? (unit.status === "FAILED" || unit.status === "REVIEW_REQUIRED" ? "Cần kiểm tra" : "Đang dịch…")}</td>{showPass1 && translationRun.pass_strategy === "TWO_PASS" ? <td>{unit.pass1_text ?? "—"}</td> : null}
                       </tr>)}</tbody></table></div>
                     </> : translationRun && ["FAILED", "REVIEW_REQUIRED", "WAITING_FOR_QUOTA"].includes(translationRun.status) ? <p>{translationRun.status === "READY" ? "" : "Bản dịch chưa hoàn tất. "}Kết quả đã lưu giữ lại các câu đã xác minh.</p> : null}
                   </section>

@@ -11,7 +11,7 @@ from threading import Barrier
 
 from fastapi.testclient import TestClient
 
-from app.database import Database, IdempotencyConflict
+from app.database import Database, IdempotencyConflict, SCHEMA_VERSION
 from app.artifacts import ArtifactError, CompletionEvidence
 from app.jobs import JobConflict, JobInputError, JobNotFound, JobService
 from app.main import create_app
@@ -128,13 +128,13 @@ class DurableJobTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 3)
         legacy.initialize()
         with closing(legacy.connect()) as connection:
-            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 12)
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], SCHEMA_VERSION)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM projects WHERE id=?", (project["id"],)).fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM jobs WHERE id=?", (job_id,)).fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM job_attempts WHERE id=?", (attempt_id,)).fetchone()[0], 1)
         legacy.initialize()
         with closing(legacy.connect()) as connection:
-            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 12)
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], SCHEMA_VERSION)
 
     def test_running_job_and_attempt_are_interrupted_on_backend_restart(self):
         job = self.create_job()

@@ -14,7 +14,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 16
 BUSY_TIMEOUT_MS = 5000
 
 
@@ -588,6 +588,60 @@ class Database:
                         updated_at TEXT NOT NULL
                     )""")
                     connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (12, utc_now()))
+                    current = 12
+                if current < 13 and target_version >= 13:
+                    connection.execute("""CREATE TABLE translation_provider_calls (
+                        call_id TEXT PRIMARY KEY NOT NULL,
+                        run_id TEXT NOT NULL REFERENCES translation_runs(id) ON DELETE RESTRICT,
+                        job_attempt_id TEXT NOT NULL REFERENCES job_attempts(id) ON DELETE RESTRICT,
+                        chunk_id TEXT NOT NULL,
+                        pass_number INTEGER NOT NULL CHECK(pass_number IN (1,2)),
+                        model_id TEXT NOT NULL,
+                        api_type TEXT NOT NULL,
+                        api_version TEXT NOT NULL,
+                        sdk_version TEXT NOT NULL,
+                        prompt_version TEXT NOT NULL,
+                        wire_protocol_version TEXT NOT NULL,
+                        credential_alias TEXT,
+                        quota_group_alias TEXT,
+                        sdk_call_count INTEGER NOT NULL CHECK(sdk_call_count>=0),
+                        physical_http_request_count INTEGER NOT NULL CHECK(physical_http_request_count>=0),
+                        input_tokens INTEGER,
+                        output_tokens INTEGER,
+                        requested_unit_count INTEGER NOT NULL CHECK(requested_unit_count>=0),
+                        received_unit_count INTEGER,
+                        latency_ms INTEGER NOT NULL CHECK(latency_ms>=0),
+                        finish_reason TEXT,
+                        provider_request_id TEXT,
+                        status TEXT NOT NULL CHECK(status IN ('COMPLETED','INVALID','FAILED')),
+                        error_code TEXT,
+                        created_at TEXT NOT NULL
+                    )""")
+                    connection.execute("CREATE INDEX translation_provider_calls_run_idx ON translation_provider_calls(run_id,chunk_id,pass_number,created_at)")
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (13, utc_now()))
+                    current = 13
+                if current < 14 and target_version >= 14:
+                    connection.execute("ALTER TABLE translation_runs ADD COLUMN api_type TEXT NOT NULL DEFAULT 'interactions'")
+                    connection.execute("ALTER TABLE translation_runs ADD COLUMN api_version TEXT NOT NULL DEFAULT 'v1beta'")
+                    connection.execute("ALTER TABLE translation_runs ADD COLUMN wire_protocol_version TEXT NOT NULL DEFAULT 'translation-wire-v1'")
+                    connection.execute("""CREATE TRIGGER translation_run_route_immutable BEFORE UPDATE OF model_id,api_type,api_version,wire_protocol_version ON translation_runs
+                        BEGIN SELECT RAISE(ABORT, 'translation run route is immutable'); END""")
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (14, utc_now()))
+                    current = 14
+                if current < 15 and target_version >= 15:
+                    connection.execute("ALTER TABLE translation_provider_calls ADD COLUMN http_status INTEGER")
+                    connection.execute("ALTER TABLE translation_provider_calls ADD COLUMN request_characters INTEGER")
+                    connection.execute("ALTER TABLE translation_provider_calls ADD COLUMN estimated_input_tokens INTEGER")
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (15, utc_now()))
+                    current = 15
+                if current < 16 and target_version >= 16:
+                    connection.execute("ALTER TABLE translation_runs ADD COLUMN pass_strategy TEXT NOT NULL DEFAULT 'TWO_PASS' CHECK(pass_strategy IN ('TWO_PASS','SINGLE_PASS'))")
+                    connection.execute("ALTER TABLE translation_runs ADD COLUMN normalization_policy_version TEXT NOT NULL DEFAULT 'terminal-punctuation-v1'")
+                    connection.execute("ALTER TABLE translation_units ADD COLUMN final_text TEXT")
+                    connection.execute("ALTER TABLE translation_units ADD COLUMN final_notes_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(final_notes_json))")
+                    connection.execute("CREATE TRIGGER translation_unit_final_result_immutable BEFORE UPDATE OF final_text,final_notes_json ON translation_units WHEN OLD.final_text IS NOT NULL AND (OLD.final_text IS NOT NEW.final_text OR OLD.final_notes_json IS NOT NEW.final_notes_json) BEGIN SELECT RAISE(ABORT, 'verified translation output is immutable'); END")
+                    connection.execute("CREATE TRIGGER translation_run_strategy_immutable BEFORE UPDATE OF pass_strategy,normalization_policy_version ON translation_runs BEGIN SELECT RAISE(ABORT, 'translation run strategy is immutable'); END")
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (16, utc_now()))
                 connection.commit()
             except BaseException:
                 connection.rollback()

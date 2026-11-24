@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from app.database import Database
+from app.database import Database, SCHEMA_VERSION
 
 
 class LocalApiSmokeTests(unittest.TestCase):
@@ -143,7 +143,7 @@ class LocalApiSmokeTests(unittest.TestCase):
         reopened = TestClient(create_app("next-secret", data_root=self.data_root), client=("127.0.0.1", 50001))
         with reopened:
             with closing(reopened.app.state.database.connect()) as connection:
-                self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 12)
+                self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], SCHEMA_VERSION)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 1)
                 self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
                 self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")

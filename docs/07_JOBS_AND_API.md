@@ -44,6 +44,8 @@ FastAPI on `http://127.0.0.1:8000/api/v1`, strictly local. Responses JSON valida
 
 ## 3. API payload sketches
 
+Translation Run responses include an immutable `pass_strategy` (`SINGLE_PASS` for new production Runs, `TWO_PASS` for existing Runs) and Unit `final_text`. Single-Pass results leave `pass1_text` and `pass2_text` null; clients render `final_text` and must not infer a second generation. The create request continues to require `privacy_consent_confirmed: true`; local UI remembers consent but sends that assertion on each Job creation request.
+
 ```json
 {
   "job_id": "uuid",

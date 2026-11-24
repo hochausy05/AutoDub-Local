@@ -53,17 +53,19 @@ assert covered_source_ids(groups) == expected_ids
 
 Grouping is translation input management, not a guarantee of natural semantics. User review stays available.
 
-## 4. Gemini two-pass translation
+## 4. Gemini translation
 
-**Pass 1 (context):** Translate grouped source into Vietnamese with whole-video summary/context, genre/glossary, pronoun consistency, stable IDs. Return schema-validated JSON. Preserve numbers/names/negation; no automatic "creative" insertion.
+**MVP production default (TRANS-01A-UX-REFINE): Single-Pass.** Each owned Translation Unit is translated once per successful chunk generation into concise, natural Vietnamese suitable for dubbing. The prompt requires faithful meaning, negation, names, terminology, numbers, humor and tone, and asks for no terminal punctuation. It does not impose duration-based truncation. This is an efficiency decision supported by local contract tests, not a claim of comparative semantic quality: live Gemini quality comparison is NOT RUN because the authorized live budget is $0.
 
-**Pass 2 (dubbing optimization):** Rewrite Pass 1 for natural spoken Vietnamese and target duration; preserve meaning, source IDs, named entities, pronunciation hints. Avoid padding words/automatic terminal periods that are not needed. Return exact schema.
+**Run contract:** `pass_strategy` is immutable (`SINGLE_PASS` or legacy `TWO_PASS`); `normalization_policy_version` is recorded. A Single-Pass Unit stores only `final_text` and final notes; `pass1_text`/`pass2_text` remain NULL. Existing Two-Pass Runs keep their stored fields and remain readable. Never duplicate a Single-Pass value into legacy pass columns.
 
-**Long input:** token-estimate -> context windows with overlap and carried glossary/summary -> output segments -> reconcile; never drop groups exceeding context. Pass 2 runs per bounded chunk after Pass 1 validated. Retry bounded transient errors only; quota exhausted returns `WAITING_FOR_QUOTA`, not fake success.
+**Normalization:** after strict response mapping and before immutable result save, remove repeated terminal sentence punctuation while retaining balanced closing quotes/brackets. Preserve decimal/grouping separators, percentages, units and operators. Reject empty output or invalid Unicode. The versioned policy never changes the source mapping or timestamps.
 
-**Validation:** exact ID set, no extra IDs, no missing/empty output unless explicitly approved, no impossible timestamps, Unicode valid, no invalid content type, drift/character ratio warnings, protected manual revision compare-and-swap. Do not use regex greedily to extract arbitrary JSON as trust boundary; prefer structured generation where available and strict parser.
+**Long input:** deterministic token-estimate chunking remains Bulk-First with ordered source context and up to three neighboring Units; completed preceding translations may provide continuity context. Chunk ownership stays disjoint. Validate exact ID coverage, order-independent reconciliation, no extra/missing/duplicate IDs, non-empty output and Unicode. A failed chunk cannot publish READY; resume skips verified final outputs. Retry stays bounded and 429 never triggers quota circumvention.
 
-**Edit UI:** source original, Pass 1, Pass 2, final text; Save All; role/style glossary; regenerate selected only; editorial approval needed for missing translations.
+**Legacy compatibility:** `TWO_PASS` Runs are read-only historical results for this slice. Their stored Pass 1/Pass 2 fields and artifacts remain valid; no rerun is required. New production Jobs use Single-Pass.
+
+**UI:** one transcript workspace has read-only `Bản gốc` and current `Bản đã duyệt` tabs; only the latest accepted revision for the selected ASR Run is shown. Drafts are editable in that same workspace and remain clearly unapproved. Translation consent is inline, remembered for versioned Gemini transcript scope and revocable. Translation output shows source, final Vietnamese and timestamps; Pass 1 toggle appears only for Two-Pass Runs.
 
 ## 5. Edge-TTS — per-Unit synthesis
 

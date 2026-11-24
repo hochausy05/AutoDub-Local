@@ -32,13 +32,19 @@ Buttons: `Chạy`, `Hủy`, `Chạy lại`, `Lưu nháp`, `Duyệt kết quả`,
 - Player with current Segment highlighted; click Segment -> seek; double-click text -> edit with timestamp view; split/merge constrained by positive durations.
 - Config: source language, model, device/compute, beam, VAD, optional vocabulary, quality preset.
 - Show uncertainty flags; user can run recognition again as a **new Run** without deleting corrected transcript.
+- Transcript review uses one bounded, scrollable workspace with `Bản gốc` (immutable and read-only) and `Bản đã duyệt` tabs. Show only the latest accepted revision for the active ASR Run; a draft is explicitly labeled and is never presented as accepted. Editing, save, cancel and accept stay in this workspace; acceptance switches to the approved tab.
 
-## 5. Translation editor
+## 5. Translation review (current MVP)
+
+- Show source text, final Vietnamese and timestamps in one Unit table; clicking a timestamp seeks the selected video. A Pass 1 view is available only for legacy Two-Pass Runs.
+- Show inline notice: “Lời thoại văn bản được gửi đến Gemini để dịch. Video và âm thanh vẫn được lưu trên máy tính.” The user can consent once for the versioned provider/data scope and revoke it. The API still requires a true consent field for each create request; UI consent does not bypass backend validation.
+
+## 5.1. Translation editor (future)
 
 - Table columns: start/end, source, Pass 1, Pass 2, final editable Vietnamese, flags, read fit.
 - Multi-row edit -> `Lưu tất cả` using optimistic revision. Undo, restore previous draft, terminology glossary, regenerate selected lines and preview changed count.
 - Controls: context genre, style, pronouns, formality, target length, punctuation strategy. Do not force a period at end of every short Unit. Missing/uncertain translations are visibly blocked for TTS unless user approves.
-- UI shows Gemini call count/quota stage and explicit consent that text is transmitted to Google.
+- Future bulk editing, glossary and regeneration controls require their own approved scope; they are not part of this UX correction.
 
 ## 6. TTS editor and player
 
