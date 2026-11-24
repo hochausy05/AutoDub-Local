@@ -11,6 +11,7 @@ from contextlib import closing, contextmanager
 from typing import Any, Iterator
 
 from app.database import Database, IdempotencyConflict, utc_now
+from app.jobs import invalidate_translation_input
 
 
 class TranscriptError(Exception):
@@ -529,7 +530,10 @@ class TranscriptService:
                 changed = connection.execute("UPDATE project_active_transcript_revisions SET revision_id=?,generation=generation+1,updated_at=? WHERE project_id=? AND revision_id=? AND generation=?", (revision_id, stamp, project_id, expected_active_revision_id, pointer["generation"])).rowcount
                 if changed != 1:
                     raise TranscriptError("transcript_active_revision_conflict")
+                pointer_generation = pointer["generation"] + 1
             else:
                 connection.execute("INSERT INTO project_active_transcript_revisions(project_id,revision_id,generation,updated_at) VALUES(?,?,1,?)", (project_id, revision_id, stamp))
+                pointer_generation = 1
+            invalidate_translation_input(connection, project_id, "accepted_transcript_changed", f"{revision_id}:{pointer_generation}")
             self._record(connection, scope, key, digest, project_id, revision_id)
             return self._detail(connection, revision_id)

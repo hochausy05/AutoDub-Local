@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import { fetchBackendHealth, type BackendHealth } from "../api/health";
 import { createProject, fetchProjects, type Project } from "../api/projects";
 import { establishSession } from "../api/session";
-import { acceptTranscriptRevision, cancelLocalJob, chooseSource, createASRJob, createTranscriptDraft, fetchASRModels, fetchASRRun, fetchASRRuns, fetchMedia, fetchProcessingSource, fetchTranscriptRevision, fetchTranscriptRevisions, getImportJob, importSelected, mediaStreamUrl, relinkMedia, retryLocalJob, saveTranscriptDraft, selectProcessingSource, type ASRJob, type ASRRun, type ASRRunSummary, type ImportJob, type MediaAsset, type ProcessingSource, type TranscriptRevision } from "../api/media";
+import { acceptTranscriptRevision, cancelLocalJob, chooseSource, createASRJob, createTranscriptDraft, createTranslationJob, fetchGeminiStatus, fetchTranslationRun, fetchTranslationRuns, fetchASRModels, fetchASRRun, fetchASRRuns, fetchMedia, fetchProcessingSource, fetchTranscriptRevision, fetchTranscriptRevisions, getImportJob, importSelected, mediaStreamUrl, relinkMedia, retryLocalJob, saveTranscriptDraft, selectProcessingSource, type ASRJob, type ASRRun, type ASRRunSummary, type ImportJob, type MediaAsset, type ProcessingSource, type TranscriptRevision, type TranslationRun } from "../api/media";
 
 type Connection =
   | { state: "checking"; message: string; health: null }
@@ -27,6 +27,30 @@ function asrFailureLabel(code?: string | null) {
     asset_changed: "Video nguồn đã thay đổi. Kiểm tra hoặc chọn lại file rồi thử lại.",
   };
   return code ? `${messages[code] ?? "Nhận diện chưa hoàn tất. Kiểm tra video rồi thử lại nếu được phép."} (${code})` : "Nhận diện chưa hoàn tất.";
+}
+
+function translationStatusLabel(status?: string) {
+  const labels: Record<string, string> = { QUEUED: "Đang chờ", RUNNING: "Đang dịch", PARTIAL: "Một số câu đã xong", WAITING_FOR_QUOTA: "Gemini đang giới hạn lượt gọi", REVIEW_REQUIRED: "Cần kiểm tra lại", FAILED: "Dịch thất bại", READY: "Đã dịch", STALE: "Kết quả thuộc phiên bản cũ", CANCELLED: "Đã hủy" };
+  return status ? labels[status] ?? "Chưa bắt đầu" : "Chưa bắt đầu";
+}
+
+function translationErrorLabel(code?: string | null) {
+  const labels: Record<string, string> = {
+    gemini_service_unavailable: "Dịch vụ Gemini đang tạm thời không khả dụng. Vui lòng thử lại sau.",
+    gemini_quota_exceeded: "Đã đạt giới hạn sử dụng Gemini. Vui lòng thử lại khi hạn mức được khôi phục.",
+    gemini_network_error: "Không thể kết nối tới Gemini. Hãy kiểm tra kết nối Internet.",
+    gemini_api_key_missing: "Chưa cấu hình Gemini API key. Kiểm tra AUTODUB_GEMINI_API_KEY trong .env rồi khởi động lại.",
+    gemini_api_key_invalid: "Gemini không chấp nhận API key. Kiểm tra key trong .env.",
+    gemini_permission_denied: "Tài khoản hoặc dự án chưa có quyền sử dụng Gemini API.",
+    gemini_model_unsupported: "Model Gemini hiện không khả dụng cho cấu hình này.",
+    gemini_request_invalid: "Cấu hình yêu cầu Gemini không hợp lệ. Bản dịch chưa hoàn tất.",
+    gemini_proxy_error: "Proxy được cấu hình không kết nối được tới Gemini.",
+    gemini_tls_error: "Không xác minh được chứng chỉ của Gemini. Kiểm tra cấu hình chứng chỉ hệ thống.",
+    gemini_transient_provider_error: "Dịch vụ Gemini đang tạm thời gặp sự cố. Vui lòng thử lại sau.",
+    gemini_response_schema_invalid: "Gemini trả về dữ liệu không đúng định dạng. Bản dịch chưa hoàn tất.",
+    gemini_response_mapping_invalid: "Gemini trả về thiếu hoặc sai câu. Bản dịch chưa hoàn tất.",
+  };
+  return code ? `${labels[code] ?? "Bản dịch chưa hoàn tất."} (${code})` : "Bản dịch chưa hoàn tất.";
 }
 
 function formatSeconds(microseconds: number) {
@@ -87,6 +111,14 @@ export function App() {
   const [transcriptEditing, setTranscriptEditing] = useState(false);
   const [transcriptSaving, setTranscriptSaving] = useState(false);
   const [transcriptError, setTranscriptError] = useState<string | null>(null);
+  const [translationRun, setTranslationRun] = useState<TranslationRun | null>(null);
+  const [translationJob, setTranslationJob] = useState<ASRJob | null>(null);
+  const [translationError, setTranslationError] = useState<string | null>(null);
+  const [translationStarting, setTranslationStarting] = useState(false);
+  const [translationRetrying, setTranslationRetrying] = useState(false);
+  const [clockNow, setClockNow] = useState(Date.now());
+  const [geminiConfigured, setGeminiConfigured] = useState(false);
+  const [showPass1, setShowPass1] = useState(false);
   const savedTranscript = useRef<TranscriptRevision | null>(null);
   const cancelToOriginal = useRef(false);
   const [videoPlayheadUs, setVideoPlayheadUs] = useState(0);
@@ -105,6 +137,7 @@ export function App() {
       await establishSession();
       const health = await fetchBackendHealth(signal);
       setConnection({ state: "online", message: "Backend đang phản hồi", health });
+      try { setGeminiConfigured((await fetchGeminiStatus()).configured); } catch { setGeminiConfigured(false); }
       try {
         setProjects(await fetchProjects(signal));
         setProjectError(null);
@@ -181,6 +214,51 @@ export function App() {
     }).catch((error) => { if (!stopped) setAsrError(error instanceof Error ? error.message : "Không tải được kết quả nhận diện."); });
     return () => { stopped = true; };
   }, [selectedProject, selectedMediaId]);
+
+  useEffect(() => {
+    let stopped = false;
+    setTranslationRun(null); setTranslationJob(null); setTranslationError(null);
+    if (!selectedProject || !selectedMediaId) return;
+    void fetchTranslationRuns(selectedProject).then((runs) => {
+      if (stopped) return;
+      const current = runs.find((run) => run.source_asset_id === selectedMediaId && run.transcript_revision_id === transcriptRevision?.id);
+      setTranslationRun(current ?? null);
+      if (current) void getImportJob(current.producer_job_id, current.project_id).then(setTranslationJob).catch(() => undefined);
+    }).catch((error) => { if (!stopped) setTranslationError(error instanceof Error ? error.message : "Không tải được bản dịch đã lưu."); });
+    return () => { stopped = true; };
+  }, [selectedProject, selectedMediaId, transcriptRevision?.id]);
+
+  useEffect(() => {
+    const activeRun = !!translationRun && ["QUEUED", "RUNNING", "PARTIAL", "WAITING_FOR_QUOTA"].includes(translationRun.status);
+    const waitingRetryCooldown = !!translationJob && translationJob.status === "FAILED" && translationJob.retry_block_reason === "retry_cooldown";
+    if (!translationRun || !selectedProject || (!activeRun && !waitingRetryCooldown)) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const job = await getImportJob(translationRun.producer_job_id, selectedProject);
+        if (stopped) return;
+        setTranslationJob(job);
+        const run = await fetchTranslationRun(selectedProject, translationRun.id);
+        if (stopped) return;
+        setTranslationRun(run);
+        const stillActiveRun = ["QUEUED", "RUNNING", "PARTIAL", "WAITING_FOR_QUOTA"].includes(run.status) && ["QUEUED", "RUNNING", "CANCEL_REQUESTED"].includes(job.status);
+        const stillCoolingDown = job.status === "FAILED" && job.retry_block_reason === "retry_cooldown";
+        if (stillActiveRun || stillCoolingDown) timer = window.setTimeout(poll, 900);
+        else if (job.status === "FAILED" || job.status === "INTERRUPTED") setTranslationError(job.error_code ? `Bản dịch chưa hoàn tất (${job.error_code}).` : "Bản dịch chưa hoàn tất.");
+      } catch (error) { if (!stopped) setTranslationError(error instanceof Error ? error.message : "Không theo dõi được tiến trình dịch."); }
+    };
+    timer = window.setTimeout(poll, 400);
+    return () => { stopped = true; if (timer) window.clearTimeout(timer); };
+  }, [translationRun, selectedProject, translationJob?.id, translationJob?.status, translationJob?.retry_block_reason]);
+
+  const translationRetryDeadline = translationJob?.progress?.retry_after_at ?? translationJob?.attempt?.retry_after_at ?? null;
+  useEffect(() => {
+    if (!translationRetryDeadline) return;
+    setClockNow(Date.now());
+    const timer = window.setInterval(() => setClockNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [translationRetryDeadline]);
 
   useEffect(() => {
     let stopped = false;
@@ -294,6 +372,21 @@ export function App() {
       setSelectedMediaId(asset.id);
     } catch (error) { setMediaError(error instanceof Error ? error.message : "Không thể chọn video xử lý."); }
     finally { setSavingProcessingSource(false); }
+  };
+
+  const startTranslation = async () => {
+    if (!selectedProject || !transcriptRevision?.id || transcriptRevision.status !== "ACCEPTED" || !transcriptRevision.is_current) return;
+    const consentText = "Lời thoại văn bản sẽ được gửi tới dịch vụ Gemini để dịch sang tiếng Việt. Video và file âm thanh vẫn được lưu trên máy tính.";
+    if (!window.confirm(consentText)) return;
+    setTranslationStarting(true); setTranslationError(null);
+    try {
+      const result = await createTranslationJob(selectedProject, transcriptRevision.id);
+      setTranslationJob(result.job);
+      setTranslationRun(await fetchTranslationRun(selectedProject, result.run_id));
+    } catch (error) {
+      setTranslationError(error instanceof Error ? error.message : "Không thể bắt đầu dịch.");
+      try { setGeminiConfigured((await fetchGeminiStatus()).configured); } catch { /* keep current configuration status */ }
+    } finally { setTranslationStarting(false); }
   };
 
   const startASR = async () => {
@@ -608,6 +701,31 @@ export function App() {
                     </> : null}
                     {transcriptEditing ? <div className="transcript-footer"><button type="button" disabled={transcriptSaving} onClick={cancelTranscriptEdit}>Hủy</button><button type="button" disabled={!transcriptDirty || transcriptSaving} onClick={() => void saveTranscript()}>{transcriptSaving ? "Đang lưu…" : "Lưu chỉnh sửa"}</button></div> : transcriptRevision?.status === "ACCEPTED" ? <div className="transcript-footer">{transcriptRevision.is_current ? <button type="button" disabled={transcriptSaving} onClick={editTranscript}>Sửa lại lời thoại</button> : null}</div> : transcriptRevision?.status === "DRAFT" ? <div className="transcript-footer"><button type="button" disabled={transcriptSaving} onClick={editTranscript}>Sửa lời thoại</button><button type="button" disabled={transcriptSaving || transcriptRevision.segments.length === 0 || transcriptRevision.segments.some((segment) => segment.coverage_status !== "REVIEWED")} onClick={() => void acceptTranscript()}>{transcriptSaving ? "Đang duyệt…" : "Duyệt lời thoại"}</button></div> : selectedRun?.source_asset_id === selectedMediaId ? <div className="transcript-footer"><button type="button" disabled={!selectedRun.segments.length || transcriptSaving} onClick={editTranscript}>Sửa lời thoại</button><button type="button" disabled={!selectedRun.segments.length || transcriptSaving} onClick={() => void acceptTranscript()}>{transcriptSaving ? "Đang duyệt…" : "Duyệt lời thoại"}</button></div> : <p>Chưa có transcript cho video này. Chạy nhận diện để tạo nội dung cần kiểm tra.</p>}
                     {transcriptError ? <p className="project-error" role="alert">{transcriptError}</p> : null}
+                  </section>
+                  <section className="translation-panel" aria-label="Dịch lời thoại">
+                    <header><div><h3>Dịch lời thoại</h3><small>Ngôn ngữ đích: Tiếng Việt</small></div>
+                      {translationRun ? <span className={`transcript-state transcript-${translationRun.status.toLowerCase()}`}>{translationStatusLabel(translationRun.status)}</span> : null}
+                    </header>
+                    <p>Lời thoại văn bản sẽ được gửi tới dịch vụ Gemini để dịch sang tiếng Việt. Video và file âm thanh vẫn được lưu trên máy tính.</p>
+                    {!transcriptRevision || transcriptRevision.status !== "ACCEPTED" || !transcriptRevision.is_current ? <p>Hãy duyệt lời thoại hiện hành trước khi dịch.</p> : null}
+                    {transcriptRevision?.status === "ACCEPTED" && transcriptRevision.segments.length === 0 ? <p>Không có lời thoại cần dịch.</p> : null}
+                    {!geminiConfigured ? <p role="note">Chưa cấu hình Gemini credentials ở backend. Hãy thêm `AUTODUB_GEMINI_API_KEY` hoặc `AUTODUB_GEMINI_CREDENTIALS_JSON` vào `.env` cục bộ rồi khởi động lại.</p> : null}
+                    <button type="button" disabled={!geminiConfigured || !transcriptRevision?.id || transcriptRevision.status !== "ACCEPTED" || !transcriptRevision.is_current || transcriptRevision.segments.length === 0 || translationStarting || (!!translationJob && ["QUEUED", "RUNNING", "CANCEL_REQUESTED"].includes(translationJob.status))} onClick={() => void startTranslation()}>
+                      {translationStarting ? "Đang chuẩn bị…" : "Dịch sang tiếng Việt"}
+                    </button>
+                    {translationJob && ["QUEUED", "RUNNING", "CANCEL_REQUESTED"].includes(translationJob.status) ? <div role="status"><p>{translationStatusLabel(translationRun?.status)}{translationJob.progress ? ` · ${translationJob.progress.completed_units ?? 0}/${translationJob.progress.total_units ?? 0} câu` : ""}</p><button type="button" onClick={() => void cancelLocalJob(translationJob.id, translationJob.project_id).then(setTranslationJob).catch((error) => setTranslationError(error instanceof Error ? error.message : "Không thể hủy Job."))}>Hủy dịch</button></div> : null}
+                    {translationJob && ["FAILED", "INTERRUPTED"].includes(translationJob.status) && translationJob.attempt?.retryable ? <button type="button" disabled={translationRetrying || !translationJob.retry_available} title={translationJob.retry_block_reason === "retry_cooldown" ? "Đang trong thời gian chờ." : translationJob.retry_block_reason === "retry_limit_reached" ? "Đã hết số lần thử của Job." : undefined} onClick={() => { setTranslationRetrying(true); setTranslationError(null); void retryLocalJob(translationJob).then((job) => { setTranslationJob(job); if (translationRun) setTranslationRun({ ...translationRun, status: "RUNNING" }); }).catch((error) => setTranslationError(error instanceof Error ? error.message : "Không thể thử lại.")).finally(() => setTranslationRetrying(false)); }}>{translationRetrying ? "Đang gửi yêu cầu…" : "Thử lại các câu chưa hoàn tất"}</button> : null}
+                    {translationJob?.retry_block_reason === "retry_cooldown" && translationRetryDeadline ? <p role="status">Có thể thử lại sau {Math.max(0, Math.ceil((Date.parse(translationRetryDeadline) - clockNow) / 1000))} giây.</p> : null}
+                    {translationJob?.retry_block_reason === "retry_limit_reached" ? <p>Job đã hết số lần thử. Hãy kiểm tra lỗi trước khi chủ động tạo Job dịch mới.</p> : null}
+                    {translationJob?.status === "RUNNING" && translationRun?.status === "RUNNING" && translationJob.progress?.phase === "retrying_provider" && translationJob.progress.retry_after_at ? <p role="status">Gemini đang bận. Ứng dụng sẽ tự thử lại sau {Math.max(0, Math.ceil((Date.parse(translationJob.progress.retry_after_at) - clockNow) / 1000))} giây.</p> : null}
+                    {translationRun?.error_code ? <p role="alert" className="project-error">{translationErrorLabel(translationRun.error_code)}</p> : null}
+                    {translationError ? <p role="alert" className="project-error">{translationError}</p> : null}
+                    {translationRun?.units?.length ? <>
+                      <label className="translation-pass-toggle"><input type="checkbox" checked={showPass1} onChange={(event) => setShowPass1(event.target.checked)} /> Xem bản dịch lượt đầu khi cần</label>
+                      <div className="translation-table-scroll"><table className="translation-table"><thead><tr><th>Thời gian</th><th>Lời thoại gốc</th><th>Bản dịch tiếng Việt</th>{showPass1 ? <th>Bản lượt đầu</th> : null}</tr></thead><tbody>{translationRun.units.map((unit) => <tr key={unit.unit_id} onClick={() => seekToTimestamp(translationRun.source_asset_id, unit.start_us)} tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") seekToTimestamp(translationRun.source_asset_id, unit.start_us); }}>
+                        <td>{formatSeconds(unit.start_us)}–{formatSeconds(unit.end_us)} s</td><td>{unit.source_text}</td><td>{unit.pass2_text ?? (unit.status === "FAILED" || unit.status === "REVIEW_REQUIRED" ? "Cần kiểm tra" : "Đang dịch…")}</td>{showPass1 ? <td>{unit.pass1_text ?? "—"}</td> : null}
+                      </tr>)}</tbody></table></div>
+                    </> : translationRun && ["FAILED", "REVIEW_REQUIRED", "WAITING_FOR_QUOTA"].includes(translationRun.status) ? <p>{translationRun.status === "READY" ? "" : "Bản dịch chưa hoàn tất. "}Kết quả đã lưu giữ lại các câu đã xác minh.</p> : null}
                   </section>
                 </section>
               </div>

@@ -25,6 +25,7 @@ from app.recovery import StartupRecovery
 from app.media import FFprobe, LinkManifestValidator, MediaError, MediaImportService, MediaImportWorker, SourceVideoValidator, parse_single_byte_range
 from app.asr import ASRConfig, ASRError, ASRService, ASRWorker, TranscriptArtifactValidator
 from app.transcripts import TranscriptError, TranscriptService
+from app.translation import TranslationError, TranslationService, TranslationWorker, TranslationArtifactValidator
 
 
 SESSION_COOKIE = "autodub_session"
@@ -80,6 +81,7 @@ class JobAttemptRead(BaseModel):
     ended_at: str | None
     error_code: str | None
     retryable: bool
+    retry_after_at: str | None = None
     progress: dict[str, object] | None
 
 
@@ -179,6 +181,13 @@ class TranscriptAcceptRequest(BaseModel):
     expected_active_revision_id: uuid.UUID | None = None
 
 
+class TranslationJobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    accepted_transcript_revision_id: uuid.UUID
+    target_language: Literal["vi"] = "vi"
+    privacy_consent_confirmed: bool
+
+
 def _is_loopback(address: str | None) -> bool:
     if not address:
         return False
@@ -213,6 +222,9 @@ def create_app(
     asr_service = ASRService(database, job_service, artifact_service, media_service)
     asr_worker = ASRWorker(asr_service)
     transcript_service = TranscriptService(database)
+    artifact_service.validators["translation_json"] = TranslationArtifactValidator(database)
+    translation_service = TranslationService(database, job_service)
+    translation_worker = TranslationWorker(translation_service, artifact_service)
     startup_recovery = StartupRecovery(database, job_service, artifact_service)
 
     @asynccontextmanager
@@ -222,9 +234,11 @@ def create_app(
         _app.state.recovery_report["media_assets_recovered"] = media_service.reconcile_pending_assets()
         media_worker.start()
         asr_worker.start()
+        translation_worker.start()
         try:
             yield
         finally:
+            translation_worker.stop()
             asr_worker.stop()
             media_worker.stop()
 
@@ -236,6 +250,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.transcript_service = transcript_service
+    app.state.translation_service = translation_service
     app.state.database = database
     app.state.artifact_service = artifact_service
     app.state.job_service = job_service
@@ -311,7 +326,12 @@ def create_app(
         if isinstance(exc, JobInputError):
             return api_error(422, str(exc), "The Job request is invalid.")
         if isinstance(exc, JobConflict):
-            return api_error(409, exc.code, "The Job cannot make that state transition.")
+            messages = {"retry_cooldown": "Hãy chờ hết thời gian tạm dừng trước khi thử lại.",
+                        "job_already_active": "Job dịch cho phiên bản lời thoại này đang chạy.",
+                        "job_not_retryable": "Job này không thể tự động thử lại.",
+                        "retry_limit_reached": "Job đã hết số lần thử được phép."}
+            message = messages.get(exc.code, "The Job cannot make that state transition.")
+            return api_error(409, exc.code, message)
         raise exc
 
     def transcript_exception(exc: TranscriptError | IdempotencyConflict) -> JSONResponse:
@@ -323,6 +343,32 @@ def create_app(
         else:
             status = 422
         return api_error(status, code, "Không thể cập nhật lời thoại. Bản nháp đã lưu trước đó vẫn được giữ.")
+
+    def translation_exception(exc: TranslationError | IdempotencyConflict) -> JSONResponse:
+        if isinstance(exc, IdempotencyConflict):
+            return api_error(409, "idempotency_key_reused", "Khóa yêu cầu đã được dùng cho nội dung khác.")
+        return api_error(exc.status, exc.code, {
+            "accepted_transcript_required": "Hãy duyệt lời thoại trước khi dịch.",
+            "accepted_transcript_stale": "Video hoặc lời thoại đã thay đổi. Hãy tải lại phiên bản hiện hành.",
+            "transcript_review_required": "Hãy hoàn tất việc kiểm tra lời thoại trước khi dịch.",
+            "translation_unit_coverage_invalid": "Không thể xác minh đầy đủ các câu lời thoại.",
+            "translation_no_units": "Không có câu lời thoại cần dịch.",
+            "privacy_consent_required": "Cần xác nhận việc gửi lời thoại tới Gemini.",
+            "gemini_api_key_missing": "Chưa cấu hình khóa Gemini trong môi trường backend.",
+            "gemini_api_key_invalid": "Gemini không chấp nhận khóa API đã cấu hình.",
+            "gemini_permission_denied": "Tài khoản hoặc dự án chưa có quyền sử dụng Gemini API.",
+            "gemini_quota_exceeded": "Đã đạt giới hạn sử dụng Gemini. Hãy thử lại khi hạn mức được khôi phục.",
+            "gemini_service_unavailable": "Dịch vụ Gemini đang tạm thời không khả dụng. Vui lòng thử lại sau.",
+            "gemini_network_error": "Không thể kết nối tới Gemini. Hãy kiểm tra kết nối Internet.",
+            "gemini_transient_provider_error": "Dịch vụ Gemini đang tạm thời gặp sự cố. Vui lòng thử lại sau.",
+            "gemini_model_unsupported": "Model Gemini đã cấu hình không khả dụng.",
+            "gemini_request_invalid": "Cấu hình hoặc schema yêu cầu Gemini không hợp lệ.",
+            "gemini_proxy_error": "Proxy mạng được cấu hình không thể kết nối tới Gemini.",
+            "gemini_tls_error": "Không thể xác minh chứng chỉ kết nối Gemini. Kiểm tra cấu hình chứng chỉ hệ thống.",
+            "job_already_active": "Job dịch cho phiên bản lời thoại này đang chạy.",
+            "gemini_network_error": "Không kết nối được Gemini. Hãy kiểm tra mạng rồi thử lại.",
+            "gemini_model_unsupported": "Model Gemini hiện không hỗ trợ yêu cầu này.",
+        }.get(exc.code, "Không thể tạo hoặc tải kết quả dịch."))
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, exc: RequestValidationError):
@@ -678,6 +724,62 @@ def create_app(
             return JSONResponse(status_code=201, content=result)
         except (TranscriptError, IdempotencyConflict) as exc:
             return transcript_exception(exc)
+
+    @app.get("/api/v1/providers/gemini/status")
+    def gemini_provider_status(request: Request):
+        current = require_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        return {"configured": translation_service.api_key_configured()}
+
+    @app.post("/api/v1/projects/{project_id}/translations/jobs", status_code=202)
+    def create_translation_job(project_id: str, body: TranslationJobRequest, request: Request):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project = uuid.UUID(project_id)
+            revision = uuid.UUID(str(body.accepted_transcript_revision_id))
+            if str(project) != project_id.lower():
+                raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_translation_id", "Project hoặc phiên bản lời thoại không hợp lệ.")
+        if database.get_project(str(project)) is None:
+            return api_error(404, "project_not_found", "Project không tồn tại.")
+        try:
+            result = translation_service.create_job(str(project), str(revision), body.privacy_consent_confirmed, request.headers.get("idempotency-key", ""))
+            return JSONResponse(status_code=202, content=result)
+        except (TranslationError, IdempotencyConflict) as exc:
+            return translation_exception(exc)
+
+    @app.get("/api/v1/projects/{project_id}/translations/runs")
+    def list_translation_runs(project_id: str, request: Request):
+        current = require_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project = uuid.UUID(project_id)
+            if str(project) != project_id.lower(): raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_project_id", "Project ID không hợp lệ.")
+        if database.get_project(str(project)) is None:
+            return api_error(404, "project_not_found", "Project không tồn tại.")
+        return {"items": translation_service.list_runs(str(project))}
+
+    @app.get("/api/v1/projects/{project_id}/translations/runs/{run_id}")
+    def get_translation_run(project_id: str, run_id: str, request: Request):
+        current = require_session(request)
+        if isinstance(current, JSONResponse):
+            return current
+        try:
+            project, run = uuid.UUID(project_id), uuid.UUID(run_id)
+            if str(project) != project_id.lower() or str(run) != run_id.lower(): raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_translation_id", "Project hoặc kết quả dịch không hợp lệ.")
+        result = translation_service.get_run(str(project), str(run))
+        if result is None:
+            return api_error(404, "translation_run_not_found", "Không tìm thấy kết quả dịch.")
+        return result
 
     @app.get("/api/v1/projects/{project_id}/transcripts/revisions/{revision_id}")
     def get_transcript_revision(project_id: str, revision_id: str, request: Request):

@@ -20,7 +20,7 @@ from typing import Any, BinaryIO, Iterator
 
 from app.artifacts import ArtifactConflict, ArtifactError, ArtifactPublicationService
 from app.database import Database, IdempotencyConflict, utc_now
-from app.jobs import JobService
+from app.jobs import JobService, invalidate_translation_input
 
 _STREAM_CHUNK_SIZE = 1024 * 1024
 
@@ -416,6 +416,7 @@ class MediaImportService:
                     "ON CONFLICT(project_id) DO UPDATE SET media_asset_id=excluded.media_asset_id,generation=excluded.generation,updated_at=excluded.updated_at",
                     (project_id, asset_id, generation, utc_now()),
                 )
+                invalidate_translation_input(connection, project_id, "processing_source_changed", f"{asset_id}:{generation}")
             connection.commit()
         return {"media_asset_id": asset_id, "generation": generation, "status": "READY", "asset": asset}
 

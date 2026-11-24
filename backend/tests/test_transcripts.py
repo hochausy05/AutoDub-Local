@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import json
@@ -101,10 +101,10 @@ class TranscriptTests(unittest.TestCase):
     def _draft(self):
         return self.service.create_draft(self.project["id"], source_run_id=self.run, parent_revision_id=None, idempotency_key=f"transcript-create-{uuid.uuid4().hex}")
 
-    def test_v9_migration_preserves_core_and_asr_and_is_repeatable(self):
+    def test_v10_migration_preserves_core_and_asr_and_is_repeatable(self):
         self.db.initialize()
         with closing(self.db.connect()) as c:
-            self.assertEqual(c.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 9)
+            self.assertEqual(c.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 12)
             self.assertEqual(c.execute("PRAGMA foreign_key_check").fetchall(), [])
             self.assertEqual(c.execute("SELECT COUNT(*) FROM segments WHERE run_id=?", (self.run,)).fetchone()[0], 3)
             self.assertEqual(c.execute("SELECT COUNT(*) FROM projects WHERE id=?", (self.project["id"],)).fetchone()[0], 1)

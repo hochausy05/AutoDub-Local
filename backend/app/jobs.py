@@ -10,6 +10,7 @@ import sqlite3
 import uuid
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Callable, Iterator
 
@@ -24,6 +25,18 @@ _STAGE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _STAGES = frozenset({"asr", "translation", "tts", "sync", "render"})
 MAX_SNAPSHOT_BYTES = 64 * 1024
 MAX_ATTEMPTS = 3
+
+
+def invalidate_translation_input(connection: sqlite3.Connection, project_id: str, reason: str, identity: str) -> None:
+    """Advance translation input generation when an upstream dependency changes."""
+    snapshot = json.dumps({"schema_version": 1, "invalidated_by": reason, "identity": identity}, sort_keys=True, separators=(",", ":"))
+    fingerprint = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
+    row = connection.execute("SELECT input_fingerprint FROM stage_pointers WHERE project_id=? AND stage='translation'", (project_id,)).fetchone()
+    stamp = utc_now()
+    if row is None:
+        connection.execute("INSERT INTO stage_pointers(project_id,stage,input_fingerprint,input_generation,pointer_generation,updated_at) VALUES(?,'translation',?,1,0,?)", (project_id, fingerprint, stamp))
+    elif row["input_fingerprint"] != fingerprint:
+        connection.execute("UPDATE stage_pointers SET input_fingerprint=?,input_generation=input_generation+1,updated_at=? WHERE project_id=? AND stage='translation'", (fingerprint, stamp, project_id))
 
 
 class ActivationStage(StrEnum):
@@ -116,7 +129,7 @@ class JobService:
         if row is None:
             raise JobNotFound
         attempts = connection.execute(
-            """SELECT id,attempt_no,schema_version,status,started_at,ended_at,error_code,retryable,progress_json,completion_evidence_json,activation_outcome
+            """SELECT id,attempt_no,schema_version,status,started_at,ended_at,error_code,retryable,retry_after_at,progress_json,completion_evidence_json,activation_outcome
                FROM job_attempts WHERE job_id=? ORDER BY attempt_no""",
             (job_id,),
         ).fetchall()
@@ -130,6 +143,7 @@ class JobService:
                 "ended_at": attempt["ended_at"],
                 "error_code": attempt["error_code"],
                 "retryable": bool(attempt["retryable"]),
+                "retry_after_at": attempt["retry_after_at"],
                 "progress": self._progress_value(attempt["progress_json"]),
                 "activation_outcome": attempt["activation_outcome"],
             }
@@ -143,6 +157,8 @@ class JobService:
                 retry_block_reason = "job_not_retryable"
             elif len(values) >= MAX_ATTEMPTS:
                 retry_block_reason = "retry_limit_reached"
+            elif latest["retry_after_at"] and latest["retry_after_at"] > utc_now():
+                retry_block_reason = "retry_cooldown"
             elif row["activation_stage"] is not None:
                 pointer = connection.execute(
                     "SELECT input_fingerprint,input_generation,pointer_generation FROM stage_pointers WHERE project_id=? AND stage=?",
@@ -214,6 +230,7 @@ class JobService:
     def create_job(
         self, project_id: str, kind: str, input_snapshot: dict[str, Any], idempotency_key: str,
         *, activation_stage: ActivationStage | str | None = None,
+        creation_hook: Callable[[sqlite3.Connection, str], None] | None = None,
     ) -> dict[str, Any]:
         project_id = self._uuid(project_id, "project_id")
         self.validate_idempotency_key(idempotency_key)
@@ -246,6 +263,14 @@ class JobService:
                 prior_job_id = json.loads(previous["response_json"])["job_id"]
                 return self._job_detail(connection, prior_job_id)
 
+            if kind == "gemini_translation":
+                active_translation = connection.execute(
+                    "SELECT id FROM jobs WHERE project_id=? AND kind=? AND input_fingerprint=? AND status IN ('QUEUED','RUNNING','CANCEL_REQUESTED') LIMIT 1",
+                    (project_id, kind, input_fingerprint),
+                ).fetchone()
+                if active_translation:
+                    raise JobConflict("job_already_active")
+
             expected_input_generation = None
             expected_pointer_generation = None
             if activation_stage is not None:
@@ -273,6 +298,8 @@ class JobService:
                    VALUES(?,?,?,?,?,?)""",
                 (scope, idempotency_key, request_digest, project_id, json.dumps({"job_id": job_id}), stamp),
             )
+            if creation_hook is not None:
+                creation_hook(connection, job_id)
             return self._job_detail(connection, job_id)
 
     def get_job(self, job_id: str, project_id: str | None = None) -> dict[str, Any]:
@@ -374,10 +401,12 @@ class JobService:
             if job["status"] != expected_status:
                 raise JobConflict("job_status_conflict")
             latest_attempt = connection.execute(
-                "SELECT retryable FROM job_attempts WHERE job_id=? ORDER BY attempt_no DESC LIMIT 1", (job_id,)
+                "SELECT retryable,retry_after_at FROM job_attempts WHERE job_id=? ORDER BY attempt_no DESC LIMIT 1", (job_id,)
             ).fetchone()
             if latest_attempt is None or not latest_attempt["retryable"]:
                 raise JobConflict("job_not_retryable")
+            if latest_attempt["retry_after_at"] and latest_attempt["retry_after_at"] > utc_now():
+                raise JobConflict("retry_cooldown")
             attempt_count = connection.execute("SELECT COUNT(*) FROM job_attempts WHERE job_id=?", (job_id,)).fetchone()[0]
             if attempt_count >= MAX_ATTEMPTS:
                 raise JobConflict("retry_limit_reached")
@@ -405,7 +434,7 @@ class JobService:
     def update_attempt_progress(self, job_id: str, attempt_id: str, progress: dict[str, Any]) -> dict[str, Any]:
         job_id = self._uuid(job_id, "job_id")
         attempt_id = self._uuid(attempt_id, "attempt_id")
-        if not isinstance(progress, dict) or set(progress) - {"phase", "completed_units", "total_units", "fraction"}:
+        if not isinstance(progress, dict) or set(progress) - {"phase", "completed_units", "total_units", "fraction", "retry_after_at"}:
             raise JobInputError("invalid_progress")
         phase = progress.get("phase")
         if phase is not None and (not isinstance(phase, str) or not _PHASE.fullmatch(phase)):
@@ -419,6 +448,14 @@ class JobService:
         fraction = progress.get("fraction")
         if fraction is not None and (isinstance(fraction, bool) or not isinstance(fraction, (float, int)) or not math.isfinite(fraction) or not 0 <= fraction <= 1):
             raise JobInputError("invalid_progress")
+        retry_after_at = progress.get("retry_after_at")
+        if retry_after_at is not None:
+            try:
+                parsed = datetime.fromisoformat(retry_after_at.replace("Z", "+00:00")) if isinstance(retry_after_at, str) else None
+                if parsed is None or parsed.tzinfo is None:
+                    raise ValueError
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise JobInputError("invalid_progress") from exc
         value = self._canonical(progress)
         if len(value.encode("utf-8")) > 4096:
             raise JobInputError("invalid_progress")
@@ -502,6 +539,8 @@ class JobService:
                         activation_outcome = "STALE"
                 if completion_hook is not None:
                     completion_hook(connection)
+                if job["activation_stage"] == "asr" and activation_outcome == "ACTIVE":
+                    invalidate_translation_input(connection, job["project_id"], "active_asr_changed", evidence.artifact_ids[0])
                 connection.execute(
                     "UPDATE job_attempts SET status='SUCCEEDED',ended_at=?,completion_evidence_json=?,activation_outcome=? WHERE id=?",
                     (stamp, evidence_json, activation_outcome, attempt_id),
@@ -514,11 +553,20 @@ class JobService:
                 raise JobConflict("invalid_job_transition")
             return self._job_detail(connection, job_id)
 
-    def fail_attempt(self, job_id: str, attempt_id: str, error_code: str, *, retryable: bool = False) -> dict[str, Any]:
+    def fail_attempt(self, job_id: str, attempt_id: str, error_code: str, *, retryable: bool = False,
+                     retry_after_at: str | None = None) -> dict[str, Any]:
         job_id = self._uuid(job_id, "job_id")
         attempt_id = self._uuid(attempt_id, "attempt_id")
         if type(retryable) is not bool:
             raise JobInputError("invalid_retryable")
+        if retry_after_at is not None:
+            try:
+                parsed = datetime.fromisoformat(retry_after_at.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    raise ValueError
+                retry_after_at = parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise JobInputError("invalid_retry_after") from exc
         safe_code = error_code if isinstance(error_code, str) and _CODE.fullmatch(error_code) else "worker_failed"
         with self._write() as connection:
             job = connection.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -538,9 +586,16 @@ class JobService:
                     (stamp, job_id),
                 )
             else:
+                progress_row = connection.execute("SELECT progress_json FROM job_attempts WHERE id=?", (attempt_id,)).fetchone()
+                progress = json.loads(progress_row["progress_json"]) if progress_row and progress_row["progress_json"] else {}
+                if retry_after_at is not None:
+                    progress["retry_after_at"] = retry_after_at
+                else:
+                    progress.pop("retry_after_at", None)
+                progress_json = self._canonical(progress) if progress else None
                 connection.execute(
-                    "UPDATE job_attempts SET status='FAILED',ended_at=?,error_code=?,retryable=? WHERE id=?",
-                    (stamp, safe_code, int(retryable), attempt_id),
+                    "UPDATE job_attempts SET status='FAILED',ended_at=?,error_code=?,retryable=?,retry_after_at=?,progress_json=? WHERE id=?",
+                    (stamp, safe_code, int(retryable), retry_after_at, progress_json, attempt_id),
                 )
                 connection.execute(
                     "UPDATE jobs SET status='FAILED',lock_version=lock_version+1,updated_at=? WHERE id=? AND status='RUNNING'",

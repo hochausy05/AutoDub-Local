@@ -86,7 +86,25 @@ class DurableJobTests(unittest.TestCase):
         )
         return self.artifacts.completion_evidence(job["id"], claimed["attempt"]["id"], [artifact["id"]])
 
-    def test_migrations_v4_through_v9_preserve_core_01a_b_c_data(self):
+    def test_retry_after_deadline_is_enforced_and_exposed(self):
+        job = self.create_job(key="job-retry-after-deadline-01")
+        claimed = self.claim(job)
+        retry_after_at = "2099-01-01T00:00:00Z"
+        failed = self.service.fail_attempt(job["id"], claimed["attempt"]["id"], "temporary_provider_error",
+                                           retryable=True, retry_after_at=retry_after_at)
+        self.assertFalse(failed["retry_available"])
+        self.assertEqual(failed["retry_block_reason"], "retry_cooldown")
+        self.assertEqual(failed["attempt"]["retry_after_at"], retry_after_at)
+        with self.assertRaisesRegex(JobConflict, "retry_cooldown"):
+            self.service.retry_job(job["id"], "FAILED", "job-retry-after-idem-0001")
+        with closing(self.app.state.database.connect()) as connection:
+            connection.execute("UPDATE job_attempts SET retry_after_at='2000-01-01T00:00:00Z' WHERE id=?", (claimed["attempt"]["id"],))
+        ready = self.service.get_job(job["id"])
+        self.assertTrue(ready["retry_available"])
+        retried = self.service.retry_job(job["id"], "FAILED", "job-retry-after-idem-0002")
+        self.assertEqual(retried["status"], "QUEUED")
+
+    def test_migrations_v4_through_v11_preserve_core_01a_b_c_data(self):
         legacy_root = Path(self.temp.name) / "legacy"
         legacy = Database(legacy_root)
         legacy.initialize(target_version=1)
@@ -110,13 +128,13 @@ class DurableJobTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 3)
         legacy.initialize()
         with closing(legacy.connect()) as connection:
-            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 9)
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 12)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM projects WHERE id=?", (project["id"],)).fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM jobs WHERE id=?", (job_id,)).fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM job_attempts WHERE id=?", (attempt_id,)).fetchone()[0], 1)
         legacy.initialize()
         with closing(legacy.connect()) as connection:
-            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 9)
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 12)
 
     def test_running_job_and_attempt_are_interrupted_on_backend_restart(self):
         job = self.create_job()

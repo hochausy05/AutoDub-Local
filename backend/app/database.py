@@ -14,7 +14,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 12
 BUSY_TIMEOUT_MS = 5000
 
 
@@ -504,6 +504,90 @@ class Database:
                     connection.execute("CREATE TRIGGER active_transcript_revision_accepted_insert BEFORE INSERT ON project_active_transcript_revisions WHEN (SELECT status FROM transcript_revisions WHERE id=NEW.revision_id)<>'ACCEPTED' BEGIN SELECT RAISE(ABORT, 'active transcript revision must be accepted'); END")
                     connection.execute("CREATE TRIGGER active_transcript_revision_accepted_update BEFORE UPDATE ON project_active_transcript_revisions WHEN (SELECT status FROM transcript_revisions WHERE id=NEW.revision_id)<>'ACCEPTED' BEGIN SELECT RAISE(ABORT, 'active transcript revision must be accepted'); END")
                     connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (9, utc_now()))
+                    current = 9
+                if current < 10 and target_version >= 10:
+                    statements = (
+                        """CREATE TABLE translation_runs (
+                            id TEXT PRIMARY KEY NOT NULL,
+                            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+                            producer_job_id TEXT NOT NULL UNIQUE,
+                            transcript_revision_id TEXT NOT NULL,
+                            source_asset_id TEXT NOT NULL,
+                            input_fingerprint TEXT NOT NULL CHECK(length(input_fingerprint)=64),
+                            provider TEXT NOT NULL CHECK(provider='gemini'),
+                            model_id TEXT NOT NULL,
+                            provider_sdk_version TEXT NOT NULL,
+                            prompt_version TEXT NOT NULL,
+                            status TEXT NOT NULL CHECK(status IN ('QUEUED','RUNNING','PARTIAL','REVIEW_REQUIRED','WAITING_FOR_QUOTA','FAILED','READY','STALE','CANCELLED')),
+                            artifact_id TEXT REFERENCES artifacts(id) ON DELETE RESTRICT,
+                            created_at TEXT NOT NULL,
+                            completed_at TEXT,
+                            error_code TEXT,
+                            UNIQUE(project_id,id),
+                            FOREIGN KEY(project_id,producer_job_id) REFERENCES jobs(project_id,id) ON DELETE RESTRICT,
+                            FOREIGN KEY(project_id,transcript_revision_id) REFERENCES transcript_revisions(project_id,id) ON DELETE RESTRICT,
+                            FOREIGN KEY(project_id,source_asset_id) REFERENCES media_assets(project_id,id) ON DELETE RESTRICT
+                        )""",
+                        "CREATE INDEX translation_runs_project_idx ON translation_runs(project_id,created_at DESC,id)",
+                        """CREATE TABLE translation_chunks (
+                            run_id TEXT NOT NULL REFERENCES translation_runs(id) ON DELETE RESTRICT,
+                            chunk_no INTEGER NOT NULL CHECK(chunk_no>=0),
+                            chunk_id TEXT NOT NULL,
+                            unit_ids_json TEXT NOT NULL CHECK(json_valid(unit_ids_json)),
+                            status TEXT NOT NULL CHECK(status IN ('PENDING','PASS1_READY','READY','FAILED','REVIEW_REQUIRED')),
+                            pass1_attempts INTEGER NOT NULL DEFAULT 0 CHECK(pass1_attempts>=0),
+                            pass2_attempts INTEGER NOT NULL DEFAULT 0 CHECK(pass2_attempts>=0),
+                            error_code TEXT,
+                            PRIMARY KEY(run_id,chunk_no),
+                            UNIQUE(run_id,chunk_id)
+                        )""",
+                        """CREATE TABLE translation_units (
+                            run_id TEXT NOT NULL REFERENCES translation_runs(id) ON DELETE RESTRICT,
+                            project_id TEXT NOT NULL,
+                            unit_id TEXT NOT NULL,
+                            logical_unit_key TEXT NOT NULL,
+                            position INTEGER NOT NULL CHECK(position>=0),
+                            chunk_no INTEGER NOT NULL CHECK(chunk_no>=0),
+                            revision_segment_ids_json TEXT NOT NULL CHECK(json_valid(revision_segment_ids_json)),
+                            source_segment_ids_json TEXT NOT NULL CHECK(json_valid(source_segment_ids_json)),
+                            source_text TEXT NOT NULL,
+                            start_us INTEGER NOT NULL CHECK(start_us>=0),
+                            end_us INTEGER NOT NULL CHECK(end_us>start_us),
+                            pass1_text TEXT,
+                            pass2_text TEXT,
+                            pass1_notes_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(pass1_notes_json)),
+                            review_flags_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(review_flags_json)),
+                            status TEXT NOT NULL CHECK(status IN ('PENDING','PASS1_READY','READY','REVIEW_REQUIRED','FAILED')),
+                            error_code TEXT,
+                            PRIMARY KEY(run_id,unit_id),
+                            UNIQUE(run_id,logical_unit_key),
+                            UNIQUE(run_id,position),
+                            FOREIGN KEY(project_id,run_id) REFERENCES translation_runs(project_id,id) ON DELETE RESTRICT
+                        )""",
+                        "CREATE INDEX translation_units_order_idx ON translation_units(run_id,position)",
+                        """CREATE TRIGGER translation_run_input_immutable BEFORE UPDATE OF id,project_id,producer_job_id,transcript_revision_id,source_asset_id,input_fingerprint,provider,model_id,provider_sdk_version,prompt_version,created_at ON translation_runs BEGIN SELECT RAISE(ABORT, 'translation run input is immutable'); END""",
+                        """CREATE TRIGGER translation_run_artifact_immutable BEFORE UPDATE OF artifact_id ON translation_runs WHEN OLD.artifact_id IS NOT NULL AND OLD.artifact_id IS NOT NEW.artifact_id BEGIN SELECT RAISE(ABORT, 'translation artifact identity is immutable'); END""",
+                        """CREATE TRIGGER translation_unit_mapping_immutable BEFORE UPDATE OF run_id,project_id,unit_id,logical_unit_key,position,chunk_no,revision_segment_ids_json,source_segment_ids_json,source_text,start_us,end_us ON translation_units BEGIN SELECT RAISE(ABORT, 'translation unit mapping is immutable'); END""",
+                        """CREATE TRIGGER translation_unit_result_immutable BEFORE UPDATE OF pass1_text,pass2_text,pass1_notes_json,review_flags_json ON translation_units WHEN (OLD.pass1_text IS NOT NULL AND (OLD.pass1_text IS NOT NEW.pass1_text OR OLD.pass1_notes_json IS NOT NEW.pass1_notes_json)) OR (OLD.pass2_text IS NOT NULL AND (OLD.pass2_text IS NOT NEW.pass2_text OR OLD.review_flags_json IS NOT NEW.review_flags_json)) BEGIN SELECT RAISE(ABORT, 'verified translation output is immutable'); END""",
+                    )
+                    for statement in statements:
+                        connection.execute(statement)
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (10, utc_now()))
+                    current = 10
+                if current < 11 and target_version >= 11:
+                    connection.execute("ALTER TABLE job_attempts ADD COLUMN retry_after_at TEXT")
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (11, utc_now()))
+                    current = 11
+                if current < 12 and target_version >= 12:
+                    connection.execute("""CREATE TABLE translation_credential_states (
+                        alias TEXT PRIMARY KEY NOT NULL,
+                        quota_group TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK(state IN ('AVAILABLE','AUTH_FAILED','DISABLED','RATE_LIMITED','QUOTA_EXHAUSTED','COOLDOWN','UNKNOWN')),
+                        cooldown_until TEXT,
+                        failure_code TEXT,
+                        updated_at TEXT NOT NULL
+                    )""")
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (12, utc_now()))
                 connection.commit()
             except BaseException:
                 connection.rollback()

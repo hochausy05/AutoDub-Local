@@ -1,5 +1,22 @@
 # ERROR_LOG — Reproducible Incidents in the New Project
 
+## TRANS-01A-ENGINE-OPTIMIZATION-001 — Small translation payload returned 503; separate output mapping rejected
+- **Date/time:** 2026-11-24 13:41 UTC+7 (local diagnostic event time)
+- **Task/environment:** Existing Windows local app diagnostics for `gemini-3.5-flash-lite`; inspected only allow-listed metadata, not transcript or response bodies.
+- **Observed:** One 10-Unit request (2,319 prompt characters; local estimate 580 tokens) returned HTTP 503 on both bounded provider attempts. The diagnostic did not observe physical HTTP count. A separate 10-Unit request returned HTTP success but failed strict `gemini_response_mapping_invalid` validation.
+- **Assessment:** The 503 occurred on a small request, so excessive payload size is not supported as its cause. The evidence does not identify Google's internal capacity cause. A successful HTTP response can still be unusable when output IDs/mapping fail validation; such a run must stay failed/reviewable and must not publish READY.
+- **Verification:** Metadata was present in the existing local diagnostic JSONL. No live requests were sent during this task because PO set the live-test budget to $0. Automated mapping/503 regressions pass.
+- **Remaining:** No model/API A/B evidence or real long transcript. Do not claim 503 resolved; G4 remains unaccepted.
+
+## TRANS-01A-RETRY-FIX-001 — Interactions SDK nhân đôi request 503 với retry của adapter
+- **Date/time:** 2026-11-24 13:34 UTC+7
+- **Task/environment:** TRANS-01A-RETRY-FIX; Windows; ứng dụng pin `google-genai==2.34.0`, model `gemini-3.5-flash-lite`. PO báo AI Studio có 6 request, cả 6 lỗi HTTP 503, 0 output token cho lần dịch Demo2 gồm 10 câu.
+- **Reproduction:** Với SDK 2.34.0, `HttpRetryOptions(attempts=1)` trên Interactions thực hiện thêm 1 retry. Transport mock qua SDK ghi nhận 2 HTTP request cho một `interactions.create`. Trong source, `GeminiProvider.translate` gọi SDK tối đa 3 lần cho cùng pass.
+- **Root cause:** Retry multiplication `3 adapter calls × 2 HTTP requests/SDK call = 6 HTTP requests` khi Pass 1 luôn trả 503. Worker chỉ gọi Pass 2 sau khi Pass 1 đã trả về và qua mapping validation; do đó không có Pass 2 trong trường hợp này. Số request thực tế PO báo khớp đường gọi tái hiện; do lần chạy cũ không có request ID/log chi tiết nên không thể liên kết từng request lịch sử với JobAttempt cụ thể. Không có bằng chứng cho giả thuyết “retry quá nhanh gây 503”; 503 là response của Gemini.
+- **Remediation:** Nâng pin lên `google-genai==3.6.1` — release chính thức sửa `Interactions retries = attempts - 1` — và đặt `attempts=1`, chọn API `v1beta` tường minh. Chỉ adapter quản lý retry: tối đa một lần cho 503/lỗi kết nối tạm thời; quota 429 dừng ngay. Job/Attempt không tự chạy lại FAILED; manual retry giữ các pass/chunk đã hoàn tất, áp dụng cooldown theo metadata Retry-After đáng tin cậy. Xem CHANGELOG TRANS-01A-RETRY-FIX.
+- **Regression/verification:** SDK 3.6.1 HTTP transport mock xác nhận 503 tối đa hai HTTP request cho Pass 1 và không gọi Pass 2; 503 một lần rồi thành công hoàn tất hai pass dùng 3 HTTP request; 429, lỗi 400/401/403/404, timeout/cancel, redaction, cooldown, Bulk-First và duplicate Job được kiểm tra. Backend **PASS** (120 tests), frontend build **PASS**, Windows launcher smoke **PASS** (2/2). Một mẫu tiếng Trung tổng hợp qua Gemini thật hoàn tất 2 pass với 2 generation SDK calls và mapping/schema hợp lệ; không dùng transcript Demo2.
+- **Remaining:** Demo2 translation qua UI, kết quả lưu qua restart sau Gemini thật và browser review **NOT RUN**. G4 vẫn chưa được PO nghiệm thu.
+
 ## ASR-01A-INFERENCE-FIX-001 — Faster-Whisper truyền tham số PyAV đã bị loại bỏ
 - **Date/time:** 2026-11-23 19:43 UTC+7
 - **Task/environment:** ASR-01A-INFERENCE-FIX; Windows, Python 3.14.2, Faster-Whisper 1.2.1, PyAV 19.0.2, CTranslate2 4.9.1; Demo2.mp4 là MediaAsset COPY READY.

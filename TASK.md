@@ -36,9 +36,12 @@
 - [x] FFmpeg source extraction, language/VAD/model/device controls and explicit CPU fallback policy covered by automated tests; real device inference measurements remain pending G3.
 - [x] **ASR-01B transcript revision automated slice:** immutable ASR source, editable text drafts, split/merge lineage contracts, transactional acceptance and history; backend tests and frontend build pass. UX correction keeps timing read-only and hides split/merge controls; browser interaction acceptance remains NOT RUN (see CHANGELOG).
 - [ ] **ASR-01B-UX-SIMPLIFY manual acceptance:** exercise edit/cancel/save/approve/re-edit/history/restart in Windows browser. Automated backend regression and frontend build pass; interaction test NOT RUN (see CHANGELOG).
-- [ ] **G3:** Real media/no-audio/VFR handling tested.
+- [x] **G3:** PO accepted (2026-11-23; explicitly specified as accepted by TRANS-01A task).
 
 ### TRANS-01 — Gemini
+- [x] **TRANS-01A local automated slice:** persistent two-pass orchestration, strict source-ID mapping, immutable provider outputs, bounded retry/cancel handling, stage CAS, session/CSRF API and Vietnamese review table; see latest CHANGELOG for retry fix and validation.
+- [x] **TRANS-01A-RETRY-FIX automated correction:** pinned SDK 3.6.1, transport regression confirms one physical HTTP request per SDK call and bounded adapter retry, 429 stop, cooldown, resume, redaction, and Bulk-First contracts; backend 120 tests, frontend build and Windows smoke PASS. Synthetic real Gemini two-pass smoke: 2 generation SDK calls, structured output/mapping PASS. Demo2 UI, browser, and restart after real provider run remain NOT RUN.
+- TRANS-01A-ENGINE-OPTIMIZATION (partial): removed fixed 10-Unit chunk cap; token-estimate planner, persisted credential aliases/auth-failure state, and one auth-only credential failover added; backend 126 tests and frontend build PASS. Live Gemini/API/model comparisons are NOT RUN under PO's $0 cap. Windows launcher smoke is BLOCKED by occupied ports 5173/8000. No fallback model or quota-remaining claim enabled; G4 remains unchecked.
 - [ ] Two-pass context-aware, lossless source-unit mappings and explicit missing-content review.
 - [ ] Edit multiple translations, save once, preserve drafts and revisions.
 - [ ] **G4:** Output coverage, retries/quota errors, edit protection checked.

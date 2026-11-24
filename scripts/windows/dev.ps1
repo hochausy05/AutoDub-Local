@@ -100,6 +100,33 @@ try {
     Set-ChildEnvironment "APP_PORT" ([string]$backendPort)
     Set-ChildEnvironment "APP_ALLOWED_ORIGIN" $allowedOrigin
     Set-ChildEnvironment "AUTODUB_BOOTSTRAP_SECRET" $secret
+    $geminiKey = [Environment]::GetEnvironmentVariable("AUTODUB_GEMINI_API_KEY", "Process")
+    $envFile = Join-Path $repoRoot ".env"
+    if ([string]::IsNullOrWhiteSpace($geminiKey) -and (Test-Path -LiteralPath $envFile -PathType Leaf)) {
+        foreach ($line in [System.IO.File]::ReadLines($envFile)) {
+            if ($line -match '^\s*AUTODUB_GEMINI_API_KEY\s*=\s*(.*?)\s*$') {
+                $geminiKey = $Matches[1]
+                if ($geminiKey.Length -ge 2 -and (($geminiKey.StartsWith('"') -and $geminiKey.EndsWith('"')) -or ($geminiKey.StartsWith("'") -and $geminiKey.EndsWith("'")))) {
+                    $geminiKey = $geminiKey.Substring(1, $geminiKey.Length - 2)
+                }
+                break
+            }
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($geminiKey)) { Set-ChildEnvironment "AUTODUB_GEMINI_API_KEY" $geminiKey }
+    $geminiCredentials = [Environment]::GetEnvironmentVariable("AUTODUB_GEMINI_CREDENTIALS_JSON", "Process")
+    if ([string]::IsNullOrWhiteSpace($geminiCredentials) -and (Test-Path -LiteralPath $envFile -PathType Leaf)) {
+        foreach ($line in [System.IO.File]::ReadLines($envFile)) {
+            if ($line -match '^\s*AUTODUB_GEMINI_CREDENTIALS_JSON\s*=\s*(.*?)\s*$') {
+                $geminiCredentials = $Matches[1]
+                if ($geminiCredentials.Length -ge 2 -and (($geminiCredentials.StartsWith('"') -and $geminiCredentials.EndsWith('"')) -or ($geminiCredentials.StartsWith("'") -and $geminiCredentials.EndsWith("'")))) {
+                    $geminiCredentials = $geminiCredentials.Substring(1, $geminiCredentials.Length - 2)
+                }
+                break
+            }
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($geminiCredentials)) { Set-ChildEnvironment "AUTODUB_GEMINI_CREDENTIALS_JSON" $geminiCredentials }
 
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
     $backendOut = Join-Path $runLogRoot "backend-$stamp.out.log"

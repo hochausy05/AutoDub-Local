@@ -53,3 +53,14 @@
 .transcript-footer { padding-top: .5rem; border-top: 1px solid var(--line); }
 .transcript-footer button:last-child:not(:first-child) { color: white; border-color: var(--ink); background: var(--ink); }
 .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+/* Translation review table */
+.translation-panel { margin-top: 1.25rem; padding: 1.1rem; border: 1px solid var(--border, #d8dce5); border-radius: 12px; background: var(--surface, #fff); }
+.translation-panel header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+.translation-panel header h3 { margin-bottom: .25rem; }
+.translation-panel > p { max-width: 70ch; }
+.translation-pass-toggle { display: flex; align-items: center; gap: .5rem; margin: 1rem 0 .65rem; }
+.translation-table-scroll { overflow-x: auto; }
+.translation-table { width: 100%; border-collapse: collapse; }
+.translation-table th, .translation-table td { padding: .65rem; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border, #d8dce5); }
+.translation-table tbody tr { cursor: pointer; }
+.translation-table tbody tr:hover, .translation-table tbody tr:focus { background: var(--surface-muted, #f4f6f9); outline: 2px solid transparent; }
