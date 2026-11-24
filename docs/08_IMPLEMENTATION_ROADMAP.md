@@ -36,7 +36,9 @@ FFmpeg extraction, Faster-Whisper model/language/VAD settings, measured CUDA/CPU
 
 ## Gate G4 — TRANS-01: Context translation
 
-Gemini Single-Pass by default with controlled chunks and complete source mapping; legacy Two-Pass Runs remain readable; editable structured Unit rows; no terminal punctuation on new Units and no silent omission. **Gate:** full mapping and manual revisions survive restart; provider failures actionable. Semantic quality comparison against Two-Pass remains NOT RUN until a nonzero live-test budget is authorized.
+Single-Pass Gemini translation with controlled chunks and complete source mapping; legacy Gemini Two-Pass and historical Cloudflare Runs remain readable. G4 was previously accepted by PO; G5 remains unaccepted.
+
+**PO status:** G4 accepted on 2026-11-24, explicitly confirmed in the TTS-01A task. This acceptance does not accept G5.
 
 ## Gate G5 — TTS-01: Edge narration
 

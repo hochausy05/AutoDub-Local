@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -233,9 +234,12 @@ class ArtifactPublicationService:
                 size += len(chunk)
         return digest.hexdigest(), size
 
-    def _validate_file(self, path: Path, validator: ArtifactValidator) -> tuple[str, str]:
+    def _validate_file(self, path: Path, validator: ArtifactValidator, cancelled=None) -> tuple[str, str]:
         try:
-            result = validator.validate(path)
+            if cancelled is not None and "cancelled" in inspect.signature(validator.validate).parameters:
+                result = validator.validate(path, cancelled=cancelled)
+            else:
+                result = validator.validate(path)
         except ArtifactError:
             raise
         except Exception as exc:
@@ -267,6 +271,8 @@ class ArtifactPublicationService:
         kind: str,
         input_fingerprint: str,
         fingerprint_version: int,
+        content_fingerprint: str | None = None,
+        validator_cancelled=None,
         source: Iterable[bytes] | BinaryIO | bytes,
     ) -> dict[str, Any]:
         project_id = self._uuid(project_id, "project_id")
@@ -276,6 +282,9 @@ class ArtifactPublicationService:
             raise ArtifactError("invalid_artifact_kind")
         if not isinstance(input_fingerprint, str) or not _FINGERPRINT.fullmatch(input_fingerprint):
             raise ArtifactError("invalid_input_fingerprint")
+        content_fingerprint = content_fingerprint or input_fingerprint
+        if not isinstance(content_fingerprint, str) or not _FINGERPRINT.fullmatch(content_fingerprint):
+            raise ArtifactError("invalid_content_fingerprint")
         if type(fingerprint_version) is not int or fingerprint_version < 1:
             raise ArtifactError("invalid_fingerprint_version")
         validator = self._validator(kind)
@@ -292,10 +301,10 @@ class ArtifactPublicationService:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 connection.execute(
-                    """INSERT INTO artifacts(id,project_id,producer_job_id,producer_attempt_id,kind,input_fingerprint,
+                    """INSERT INTO artifacts(id,project_id,producer_job_id,producer_attempt_id,kind,input_fingerprint,content_fingerprint,
                            fingerprint_version,staging_relative_path,managed_relative_path,status,schema_version,created_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,'STAGING',1,?)""",
-                    (artifact_id, project_id, job_id, attempt_id, kind, input_fingerprint, fingerprint_version,
+                       VALUES(?,?,?,?,?,?,?,?,?,?,'STAGING',1,?)""",
+                    (artifact_id, project_id, job_id, attempt_id, kind, input_fingerprint, content_fingerprint, fingerprint_version,
                      staging_relative, managed_relative, stamp),
                 )
                 connection.commit()
@@ -309,7 +318,7 @@ class ArtifactPublicationService:
             self._write_stream(staging_path, source)
             self._fault("after_stage_flush")
             sha256, file_size = self._hash_file(staging_path)
-            metadata_json, verification_version = self._validate_file(staging_path, validator)
+            metadata_json, verification_version = self._validate_file(staging_path, validator, validator_cancelled)
             with closing(self.database.connect()) as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 try:
@@ -396,7 +405,7 @@ class ArtifactPublicationService:
         expected_project = self._uuid(project_id, "project_id") if project_id is not None else None
         with closing(self.database.connect()) as connection:
             row = connection.execute(
-                """SELECT id,project_id,producer_job_id,producer_attempt_id,kind,input_fingerprint,fingerprint_version,
+                """SELECT id,project_id,producer_job_id,producer_attempt_id,kind,input_fingerprint,content_fingerprint,fingerprint_version,
                           staging_relative_path,managed_relative_path,sha256,file_size,verification_metadata_json,
                           verification_version,status,error_code,schema_version,created_at,verified_at,published_at
                    FROM artifacts WHERE id=?""",
@@ -411,6 +420,7 @@ class ArtifactPublicationService:
             "producer_attempt_id": row["producer_attempt_id"],
             "kind": row["kind"],
             "input_fingerprint": row["input_fingerprint"],
+            "content_fingerprint": row["content_fingerprint"],
             "fingerprint_version": row["fingerprint_version"],
             "staging_relative_path": row["staging_relative_path"],
             "managed_relative_path": row["managed_relative_path"],

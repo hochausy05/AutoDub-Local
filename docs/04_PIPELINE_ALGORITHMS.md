@@ -53,9 +53,11 @@ assert covered_source_ids(groups) == expected_ids
 
 Grouping is translation input management, not a guarantee of natural semantics. User review stays available.
 
-## 4. Gemini translation
+## 4. Provider-selectable translation (TRANS-02A implementation slice)
 
-**MVP production default (TRANS-01A-UX-REFINE): Single-Pass.** Each owned Translation Unit is translated once per successful chunk generation into concise, natural Vietnamese suitable for dubbing. The prompt requires faithful meaning, negation, names, terminology, numbers, humor and tone, and asks for no terminal punctuation. It does not impose duration-based truncation. This is an efficiency decision supported by local contract tests, not a claim of comparative semantic quality: live Gemini quality comparison is NOT RUN because the authorized live budget is $0.
+**Provider policy:** New Runs use Gemini `gemini-3.1-flash-lite` only. Gemini execution identity, Unit validation, checkpointing and immutable provenance remain in force. Historical Cloudflare Runs remain readable; their unfinished Jobs are retired.
+
+Single-Pass translates each owned Unit once per successful chunk into concise Vietnamese with native structured output, strict mapping and duration-aware compact IDs.
 
 **Run contract:** `pass_strategy` is immutable (`SINGLE_PASS` or legacy `TWO_PASS`); `normalization_policy_version` is recorded. A Single-Pass Unit stores only `final_text` and final notes; `pass1_text`/`pass2_text` remain NULL. Existing Two-Pass Runs keep their stored fields and remain readable. Never duplicate a Single-Pass value into legacy pass columns.
 
@@ -65,22 +67,24 @@ Grouping is translation input management, not a guarantee of natural semantics. 
 
 **Legacy compatibility:** `TWO_PASS` Runs are read-only historical results for this slice. Their stored Pass 1/Pass 2 fields and artifacts remain valid; no rerun is required. New production Jobs use Single-Pass.
 
-**UI:** one transcript workspace has read-only `Bản gốc` and current `Bản đã duyệt` tabs; only the latest accepted revision for the selected ASR Run is shown. Drafts are editable in that same workspace and remain clearly unapproved. Translation consent is inline, remembered for versioned Gemini transcript scope and revocable. Translation output shows source, final Vietnamese and timestamps; Pass 1 toggle appears only for Two-Pass Runs.
+**UI:** Transcript and translation workspaces retain original and approved tabs, Gemini consent and bulk editing. Historical Runs show their recorded provider.
 
 ## 5. Edge-TTS — per-Unit synthesis
 
 **Inputs:** accepted translation revision, chosen voice (default `vi-VN-NamMinhNeural` from legacy), rate%, pitch/volume if supported, output format, provider version. Edge-TTS requires Internet and is not under the same local CPU/GPU performance optimization as ASR/FFmpeg.
 
-The TRANS-01B editor distinguishes mutable drafts from accepted immutable revisions. A future TTS Run may consume only the active accepted revision for the current Translation Run; a draft or stale/non-active revision is not eligible. Text edits retain the logical Unit key, and the per-Unit artifact fingerprint is based on the key and effective text/configuration, not the revision ID, so unchanged Units remain reusable. TTS itself is not implemented in TRANS-01B.
+The TRANS-01B editor distinguishes mutable drafts from accepted immutable revisions. TTS-01A consumes only the active accepted revision for the current Translation Run; a draft or stale/non-active revision is rejected. Text edits retain the logical Unit key, and the per-Unit artifact fingerprint uses the key and exact accepted text/configuration, not the revision ID, so unchanged Units remain reusable.
 
-1. Compute artifact key from `unit_id + text hash + voice + rate/pitch/volume + provider/version + synthesis version`.
-2. Reuse valid matching cached artifact. If not, create TTS Job for that Unit; use bounded async semaphore (start 2-3, tune based on real error/network data, not automatically 5).
+1. Persist one immutable batch Job/Run snapshot and ordered Translation Units. Compute per-Unit fingerprint from stable logical Unit key, exact text hash, `vi-VN`, effective voice/rate/pitch/volume, output encoding, provider/library, adapter and synthesis-policy versions; revision ID is not part of this fingerprint.
+2. Reuse only a same-Project published Artifact whose content fingerprint and SHA-256 verification match. Otherwise queue the Unit in one batch Job with backend concurrency fixed at 3, shared with preview and voice-catalog requests.
 3. Sanitize only unsupported control characters. **Never shorten, truncate or rewrite the user's accepted text** behind their back.
-4. If Edge length/format limit is encountered, split by sentence/word boundaries into all subchunks with retained exact concatenated text and source mapping; synthesize all; concatenate with measured pauses. If impossible, return REVIEW_REQUIRED.
-5. Download to temp file, verify codec/duration, decode sample, inspect non-silence when non-empty text, sha256 and atomic publish; mark Unit READY independently.
+4. Use the pinned Edge-TTS library's UTF-8/XML-safe chunk splitter. Confirm token order and completeness before synthesis; do not issue a second request to shorten text. If the library cannot preserve content, return REVIEW_REQUIRED.
+5. Save to a project-local scratch path; FFprobe verifies MP3/24 kHz/mono, FFmpeg decodes the full stream to measured PCM samples, non-silence is checked, then SHA-256 and atomic Artifact publication complete before the individual Unit becomes READY.
 6. Retry transient network/429/5xx with jitter and caps; fail with a clear error when attempts exhausted. No silent WAV substitution for failed speech.
-7. Expose voice preview cache with exact config, asynchronous cancellation, bounded memory/disk.
-8. A Unit can be played while other Units generate. TTS Run READY only after all required Units READY and still matching latest revision.
+7. Expose a consented voice catalog and a separate preview Job/cache with exact text/config fingerprint. Batch and preview share the three-request provider semaphore. Cancellation is cooperative; queued batch Units are explicitly marked CANCELLED.
+8. Each verified Unit is playable while other Units generate through session-protected project-scoped audio routes supporting HTTP Range. TTS Run READY only after every required Unit is READY and the accepted translation/source dependencies remain current at activation.
+
+TTS-01A implementation uses a fixed project-wide voice/rate, neutral pitch and volume, a 24 kHz mono MP3 artifact, a one-attempt automatic retry for transient Unit failures, and shared Job retry/cancel endpoints. Full 50-Unit mixed-outcome acceptance and Windows browser interaction remain separate G5 acceptance work.
 
 **Rate fitting:** optional `target_rate = clamp(base_rate * (measured_duration / target_window), allowed_min, allowed_max)` is only a first estimate. Rate/duration can be nonlinear; verify after synthesis, maybe one bounded adjustment, never infinite retries. Explain remaining overflow to user.
 

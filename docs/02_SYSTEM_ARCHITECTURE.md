@@ -14,7 +14,7 @@ flowchart TD
   API <--> FS[(Project local files)]
   API --> Q[Durable Job scheduler]
   Q --> ASR[Faster-Whisper GPU/CPU worker]
-  Q --> TR[Gemini translation worker]
+  Q --> TR[Shared translation worker]
   Q --> TTS[Edge-TTS async worker]
   Q --> SYNC[AV fit and numeric conflict table]
   Q --> REN[FFmpeg render worker]
@@ -36,7 +36,7 @@ flowchart TD
 | Persistent metadata | SQLite WAL, schema migrations via Alembic or explicit SQL | Project, Run, Unit, artifact, Job, edit revisions | Single-user local persistence, transactional updates |
 | Media | FFmpeg/FFprobe CLI, `soundfile`, optional `PyAV` | Decode/extract, combine, measure, render | Avoid handling full video frames in Python |
 | ASR | Faster-Whisper / CTranslate2 | Speech segments with start/end | GPU float16 or CPU int8 fallback |
-| Translation | `google-genai` SDK | Gemini two-pass, structured JSON | Maintained SDK, explicit quota failures |
+| Translation | Gemini engine + `google-genai` adapter | Gemini `gemini-3.1-flash-lite` only | One prompt/chunk/mapping/persistence path; provider/model/adapter snapshot per Run |
 | Speech | `edge-tts` as default adapter | Vietnamese voice TTS, MP3/format metadata | Match legacy user preference; requires internet |
 | Voice preview | Bounded file cache | Short sample by exact voice/rate/pitch/config | Avoid repeated network generation |
 | Subtitle OCR (optional) | OpenCV + EasyOCR/other measured implementation | Suggest old subtitle location | Costly stage, opt-in, verify visually |
@@ -119,4 +119,4 @@ Edits invalidate only descendants whose *actual input fingerprint* changes. Exam
 
 ## 8. Trust boundaries
 
-Local UI on `127.0.0.1`, backend on `127.0.0.1`, Windows filesystem trusted only after user selection, external Gemini/Edge endpoints separate. Validate files based on probing, not extension alone. Rate-limit local endpoints and ensure no remote web page can invoke destructive local APIs through weak CORS/CSRF protections.
+Local UI on `127.0.0.1`, backend on `127.0.0.1`, Windows filesystem trusted only after user selection, and external Gemini/Edge endpoints remain separate consented boundaries. Translation consent is Gemini-specific; historical provider provenance remains readable. Validate files based on probing, not extension alone. Rate-limit local endpoints and ensure no remote web page can invoke destructive local APIs through weak CORS/CSRF protections.

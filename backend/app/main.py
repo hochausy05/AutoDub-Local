@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from app.database import Database, IdempotencyConflict
-from app.artifacts import ArtifactPublicationService
+from app.artifacts import ArtifactError, ArtifactPublicationService
 from app.jobs import JobConflict, JobInputError, JobNotFound, JobService
 from app.recovery import StartupRecovery
 from app.media import FFprobe, LinkManifestValidator, MediaError, MediaImportService, MediaImportWorker, SourceVideoValidator, parse_single_byte_range
@@ -27,6 +27,7 @@ from app.asr import ASRConfig, ASRError, ASRService, ASRWorker, TranscriptArtifa
 from app.transcripts import TranscriptError, TranscriptService
 from app.translation import TranslationError, TranslationService, TranslationWorker, TranslationArtifactValidator
 from app.translation_revisions import TranslationRevisionError, TranslationRevisionService
+from app.tts import TTSError, TTSService, TTSWorker
 
 
 SESSION_COOKIE = "autodub_session"
@@ -114,6 +115,26 @@ class RetryJobRequest(BaseModel):
     expected_status: Literal["FAILED", "INTERRUPTED"]
 
 
+class TTSJobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    translation_revision_id: uuid.UUID
+    voice: str = Field(min_length=1, max_length=128)
+    rate_percent: int = Field(default=0, ge=-50, le=50)
+    pitch_hz: int = Field(default=0, ge=-50, le=50)
+    volume_percent: int = Field(default=0, ge=-50, le=50)
+    consent_confirmed: bool = False
+
+
+class TTSPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(min_length=1, max_length=4000)
+    voice: str = Field(min_length=1, max_length=128)
+    rate_percent: int = Field(default=0, ge=-50, le=50)
+    pitch_hz: int = Field(default=0, ge=-50, le=50)
+    volume_percent: int = Field(default=0, ge=-50, le=50)
+    consent_confirmed: bool = False
+
+
 class ImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     selection_id: str = Field(min_length=32, max_length=128)
@@ -187,6 +208,8 @@ class TranslationJobRequest(BaseModel):
     accepted_transcript_revision_id: uuid.UUID
     target_language: Literal["vi"] = "vi"
     privacy_consent_confirmed: bool
+    provider: Literal["cloudflare", "gemini"] | None = None
+    privacy_consent_provider: Literal["cloudflare", "gemini"] | None = None
 
 
 class TranslationDraftCreateRequest(BaseModel):
@@ -255,6 +278,8 @@ def create_app(
     translation_service = TranslationService(database, job_service)
     translation_revision_service = TranslationRevisionService(database)
     translation_worker = TranslationWorker(translation_service, artifact_service)
+    tts_service = TTSService(database, job_service, artifact_service, translation_revision_service)
+    tts_worker = TTSWorker(tts_service)
     startup_recovery = StartupRecovery(database, job_service, artifact_service)
 
     @asynccontextmanager
@@ -265,9 +290,11 @@ def create_app(
         media_worker.start()
         asr_worker.start()
         translation_worker.start()
+        tts_worker.start()
         try:
             yield
         finally:
+            tts_worker.stop()
             translation_worker.stop()
             asr_worker.stop()
             media_worker.stop()
@@ -282,6 +309,8 @@ def create_app(
     app.state.transcript_service = transcript_service
     app.state.translation_service = translation_service
     app.state.translation_revision_service = translation_revision_service
+    app.state.tts_service = tts_service
+    app.state.tts_worker = tts_worker
     app.state.database = database
     app.state.artifact_service = artifact_service
     app.state.job_service = job_service
@@ -365,6 +394,26 @@ def create_app(
             return api_error(409, exc.code, message)
         raise exc
 
+    def tts_exception(exc: Exception) -> JSONResponse:
+        if isinstance(exc, (JobNotFound, TTSError)):
+            code = exc.code if isinstance(exc, TTSError) else "resource_not_found"
+            status = 404 if code in {"resource_not_found", "tts_audio_not_ready", "translation_run_not_found"} else 422
+            if code in {"tts_voice_catalog_unavailable", "tts_network_failure", "tts_provider_temporary_failure", "tts_provider_timeout"}:
+                status = 503
+            if code in {"translation_revision_stale", "job_already_active", "tts_job_already_active", "idempotency_key_reused"}:
+                status = 409
+            if code == "edge_tts_consent_required": status = 403
+            messages = {"edge_tts_consent_required":"Cần đồng ý riêng trước khi gửi lời thoại đến Edge-TTS.",
+                "accepted_translation_revision_required":"Chỉ có thể tạo giọng đọc từ bản dịch đã duyệt.",
+                "translation_revision_stale":"Bản dịch đã duyệt không còn hiện hành. Hãy tải lại và duyệt lại nếu cần.",
+                "tts_voice_unavailable":"Giọng đọc này không có trong danh sách Edge-TTS hiện tại.",
+                "tts_voice_catalog_unavailable":"Không tải được danh sách giọng đọc Edge-TTS.",
+                "tts_audio_not_ready":"Audio Unit chưa sẵn sàng để phát."}
+            return api_error(status, code, messages.get(code,"Yêu cầu tạo giọng đọc không hợp lệ hoặc chưa thể thực hiện."))
+        if isinstance(exc, (JobConflict, JobInputError, IdempotencyConflict)):
+            return job_exception(exc)
+        raise exc
+
     def transcript_exception(exc: TranscriptError | IdempotencyConflict) -> JSONResponse:
         code = exc.code if isinstance(exc, TranscriptError) else "idempotency_key_reused"
         if code in {"transcript_revision_not_found", "transcription_run_not_found", "transcript_segment_not_found"}:
@@ -384,7 +433,11 @@ def create_app(
             "transcript_review_required": "Hãy hoàn tất việc kiểm tra lời thoại trước khi dịch.",
             "translation_unit_coverage_invalid": "Không thể xác minh đầy đủ các câu lời thoại.",
             "translation_no_units": "Không có câu lời thoại cần dịch.",
-            "privacy_consent_required": "Cần xác nhận việc gửi lời thoại tới Gemini.",
+            "privacy_consent_required": "Cần xác nhận quyền riêng tư cho nhà cung cấp đã chọn.",
+            "gemini_privacy_consent_required": "Cần xác nhận việc gửi lời thoại tới Google Gemini.",
+            "gemini_credentials_missing": "Chưa cấu hình Gemini credentials ở backend.",
+            "translation_provider_retired": "Nhà cung cấp dịch này không còn được hỗ trợ.",
+            "translation_provider_invalid": "Nhà cung cấp dịch không hợp lệ.",
             "gemini_api_key_missing": "Chưa cấu hình khóa Gemini trong môi trường backend.",
             "gemini_api_key_invalid": "Gemini không chấp nhận khóa API đã cấu hình.",
             "gemini_permission_denied": "Tài khoản hoặc dự án chưa có quyền sử dụng Gemini API.",
@@ -779,12 +832,20 @@ def create_app(
         except (TranscriptError, IdempotencyConflict) as exc:
             return transcript_exception(exc)
 
-    @app.get("/api/v1/providers/gemini/status")
-    def gemini_provider_status(request: Request):
+    @app.get("/api/v1/providers/status")
+    def translation_provider_status(request: Request):
         current = require_session(request)
         if isinstance(current, JSONResponse):
             return current
-        return {"configured": translation_service.api_key_configured()}
+        return {"default_provider": translation_service.default_provider(), "providers": {
+            "gemini": {"configured": translation_service.provider_configured("gemini"), "model_id": "gemini-3.1-flash-lite"},
+        }}
+
+    @app.get("/api/v1/providers/gemini/status")
+    def legacy_gemini_provider_status(request: Request):
+        current = require_session(request)
+        if isinstance(current, JSONResponse): return current
+        return {"configured": translation_service.provider_configured("gemini")}
 
     @app.post("/api/v1/projects/{project_id}/translations/jobs", status_code=202)
     def create_translation_job(project_id: str, body: TranslationJobRequest, request: Request):
@@ -801,7 +862,7 @@ def create_app(
         if database.get_project(str(project)) is None:
             return api_error(404, "project_not_found", "Project không tồn tại.")
         try:
-            result = translation_service.create_job(str(project), str(revision), body.privacy_consent_confirmed, request.headers.get("idempotency-key", ""))
+            result = translation_service.create_job(str(project), str(revision), body.privacy_consent_confirmed, request.headers.get("idempotency-key", ""), body.provider, body.privacy_consent_provider)
             return JSONResponse(status_code=202, content=result)
         except (TranslationError, IdempotencyConflict) as exc:
             return translation_exception(exc)
@@ -911,6 +972,130 @@ def create_app(
             return api_error(422, "invalid_translation_id", "Project hoặc kết quả dịch không hợp lệ.")
         except (TranslationRevisionError, IdempotencyConflict) as exc:
             return translation_revision_exception(exc)
+
+    @app.get("/api/v1/providers/edge-tts/voices")
+    def edge_tts_voices(request: Request, refresh: bool = False):
+        current = require_session(request)
+        if isinstance(current, JSONResponse): return current
+        try: return tts_service.voice_catalog(refresh=refresh)
+        except TTSError as exc: return tts_exception(exc)
+
+    @app.post("/api/v1/projects/{project_id}/tts/jobs", status_code=202)
+    def create_tts_job(project_id: str, body: TTSJobRequest, request: Request):
+        current = require_mutation_session(request)
+        if isinstance(current, JSONResponse): return current
+        try:
+            project=uuid.UUID(project_id)
+            if str(project)!=project_id.lower(): raise ValueError
+            config={"voice":body.voice,"rate_percent":body.rate_percent,"pitch_hz":body.pitch_hz,"volume_percent":body.volume_percent}
+            result=tts_service.create_batch(str(project),str(body.translation_revision_id),config,body.consent_confirmed,
+                request.headers.get("idempotency-key",""))
+            return JSONResponse(status_code=202,content=result)
+        except ValueError:
+            return api_error(422,"invalid_project_id","Project ID phải là UUID chuẩn.")
+        except (TTSError,JobConflict,JobInputError,JobNotFound,IdempotencyConflict) as exc:
+            return tts_exception(exc)
+
+    @app.get("/api/v1/projects/{project_id}/tts/runs/current")
+    def get_current_tts_run(project_id: str, request: Request):
+        current=require_session(request)
+        if isinstance(current,JSONResponse):return current
+        try:
+            project=uuid.UUID(project_id)
+            if str(project)!=project_id.lower():raise ValueError
+            if database.get_project(str(project)) is None:return api_error(404,"project_not_found","Project không tồn tại.")
+            return tts_service.latest_run(str(project))
+        except ValueError:return api_error(422,"invalid_project_id","Project ID phải là UUID chuẩn.")
+        except TTSError as exc:return tts_exception(exc)
+
+    @app.get("/api/v1/projects/{project_id}/tts/runs/{run_id}")
+    def get_tts_run(project_id: str, run_id: str, request: Request):
+        current=require_session(request)
+        if isinstance(current,JSONResponse):return current
+        try:
+            project,run=uuid.UUID(project_id),uuid.UUID(run_id)
+            if str(project)!=project_id.lower() or str(run)!=run_id.lower():raise ValueError
+            return tts_service.get_run(str(project),str(run))
+        except ValueError:return api_error(422,"invalid_tts_id","Project và TTS Run ID phải là UUID chuẩn.")
+        except (TTSError,JobNotFound) as exc:return tts_exception(exc)
+
+    @app.post("/api/v1/projects/{project_id}/tts/previews",status_code=202)
+    def create_tts_preview(project_id: str, body: TTSPreviewRequest, request: Request):
+        current=require_mutation_session(request)
+        if isinstance(current,JSONResponse):return current
+        try:
+            project=uuid.UUID(project_id)
+            if str(project)!=project_id.lower():raise ValueError
+            config={"voice":body.voice,"rate_percent":body.rate_percent,"pitch_hz":body.pitch_hz,"volume_percent":body.volume_percent}
+            result=tts_service.create_preview(str(project),body.text,config,body.consent_confirmed,request.headers.get("idempotency-key",""))
+            return JSONResponse(status_code=200 if result.get("cached") else 202,content=result)
+        except ValueError:return api_error(422,"invalid_project_id","Project ID phải là UUID chuẩn.")
+        except (TTSError,JobConflict,JobInputError,JobNotFound,IdempotencyConflict) as exc:return tts_exception(exc)
+
+    @app.get("/api/v1/projects/{project_id}/tts/previews/{job_id}")
+    def get_tts_preview(project_id: str, job_id: str, request: Request):
+        current=require_session(request)
+        if isinstance(current,JSONResponse):return current
+        try:
+            project=uuid.UUID(project_id);job=uuid.UUID(job_id)
+            if str(project)!=project_id.lower() or str(job)!=job_id.lower():raise ValueError
+            return tts_service.preview_result(str(project),str(job))
+        except ValueError:return api_error(422,"invalid_tts_id","Project và Job ID phải là UUID chuẩn.")
+        except (TTSError,JobNotFound) as exc:return tts_exception(exc)
+
+    @app.api_route("/api/v1/projects/{project_id}/tts/runs/{run_id}/units/{unit_id}/audio",methods=["GET","HEAD"])
+    def stream_tts_unit(project_id: str,run_id: str,unit_id: str,request: Request):
+        current=require_session(request)
+        if isinstance(current,JSONResponse):return current
+        try:
+            project,run,unit=uuid.UUID(project_id),uuid.UUID(run_id),uuid.UUID(unit_id)
+            if str(project)!=project_id.lower() or str(run)!=run_id.lower() or str(unit)!=unit_id.lower():raise ValueError
+            artifact=tts_service.audio_artifact(str(project),str(run),str(unit))
+            return tts_audio_response(str(project),artifact["id"],request)
+        except ValueError:return api_error(422,"invalid_tts_id","ID audio Unit không hợp lệ.")
+        except (TTSError,JobNotFound) as exc:return tts_exception(exc)
+
+    @app.api_route("/api/v1/projects/{project_id}/tts/artifacts/{artifact_id}/audio",methods=["GET","HEAD"])
+    def stream_tts_artifact(project_id: str,artifact_id: str,request: Request):
+        current=require_session(request)
+        if isinstance(current,JSONResponse):return current
+        try:
+            project,artifact=uuid.UUID(project_id),uuid.UUID(artifact_id)
+            if str(project)!=project_id.lower() or str(artifact)!=artifact_id.lower():raise ValueError
+            return tts_audio_response(str(project),str(artifact),request)
+        except ValueError:return api_error(422,"invalid_tts_id","Project hoặc Audio Artifact ID không hợp lệ.")
+        except (TTSError,JobNotFound) as exc:return tts_exception(exc)
+
+    def tts_audio_response(project_id: str,artifact_id: str,request: Request):
+        try:handle,size,sha=tts_service.open_audio(project_id,artifact_id)
+        except (TTSError,ArtifactError) as exc:
+            code=exc.code if isinstance(exc,(TTSError,ArtifactError)) else "tts_audio_not_ready"
+            status=404 if code in {"artifact_not_found","tts_audio_not_ready"} else 409
+            return api_error(status,code,"Audio chưa sẵn sàng hoặc không vượt qua kiểm tra toàn vẹn.")
+        etag=f'"{sha}"';start,end=0,size-1;status=200
+        headers={"Accept-Ranges":"bytes","ETag":etag,"Cache-Control":"private, no-store","X-Content-Type-Options":"nosniff","Content-Type":"audio/mpeg"}
+        header=request.headers.get("range")
+        if header and request.headers.get("if-range",etag)==etag:
+            try:start,end=parse_single_byte_range(header,size)
+            except MediaError as exc:
+                handle.close()
+                if exc.code=="range_not_satisfiable":
+                    headers["Content-Range"]=f"bytes */{size}"
+                    return Response(status_code=416,headers=headers)
+                return api_error(400,"invalid_range","Chỉ hỗ trợ một byte range hợp lệ.")
+            status=206;headers["Content-Range"]=f"bytes {start}-{end}/{size}"
+        length=max(0,end-start+1);headers["Content-Length"]=str(length)
+        if request.method=="HEAD":handle.close();return Response(status_code=status,headers=headers)
+        def stream_audio():
+            remaining=length
+            try:
+                handle.seek(start)
+                while remaining:
+                    chunk=handle.read(min(256*1024,remaining))
+                    if not chunk:break
+                    remaining-=len(chunk);yield chunk
+            finally:handle.close()
+        return StreamingResponse(stream_audio(),status_code=status,headers=headers)
 
     @app.get("/api/v1/projects/{project_id}/transcripts/revisions/{revision_id}")
     def get_transcript_revision(project_id: str, revision_id: str, request: Request):
@@ -1068,8 +1253,10 @@ def create_app(
             return current
         key = request.headers.get("idempotency-key", "")
         try:
-            job_service.get_job(job_id, project_id)
+            job = job_service.get_job(job_id, project_id)
             result = job_service.request_cancel(job_id, key)
+            if job.get("kind") == "edge_tts_batch":
+                tts_service.reconcile_cancelled_job(job_id)
         except (JobNotFound, JobInputError, JobConflict, IdempotencyConflict) as exc:
             return job_exception(exc)
         response = JSONResponse(status_code=202 if result["status"] == "CANCEL_REQUESTED" else 200, content=result)

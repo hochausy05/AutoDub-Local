@@ -44,6 +44,10 @@ class StartupRecovery:
         with closing(self.database.connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                connection.execute("UPDATE job_attempts SET status='FAILED',ended_at=?,error_code='translation_provider_retired',retryable=0 WHERE status='RUNNING' AND job_id IN (SELECT id FROM jobs WHERE kind='cloudflare_translation' AND status IN ('QUEUED','RUNNING','CANCEL_REQUESTED'))", (stamp,))
+                connection.execute("UPDATE translation_runs SET status='FAILED',error_code='translation_provider_retired',completed_at=? WHERE producer_job_id IN (SELECT id FROM jobs WHERE kind='cloudflare_translation' AND status IN ('QUEUED','RUNNING','CANCEL_REQUESTED')) AND status NOT IN ('READY','STALE')", (stamp,))
+                connection.execute("UPDATE jobs SET status='CANCELLED',cancel_requested=1,lock_version=lock_version+1,updated_at=? WHERE kind='cloudflare_translation' AND status IN ('QUEUED','CANCEL_REQUESTED')", (stamp,))
+                connection.execute("UPDATE jobs SET status='FAILED',cancel_requested=0,lock_version=lock_version+1,updated_at=? WHERE kind='cloudflare_translation' AND status='RUNNING'", (stamp,))
                 rows = connection.execute(
                     """SELECT j.id,j.status,
                               EXISTS(SELECT 1 FROM job_attempts a WHERE a.job_id=j.id AND a.status='RUNNING') AS has_running

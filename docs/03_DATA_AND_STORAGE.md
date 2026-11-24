@@ -14,11 +14,14 @@ Maintain user edits and processing artifacts across application restarts, crashe
 | `media_assets` | `id`, `project_id`, `role SOURCE/OUTPUT/PREVIEW`, `import_mode COPY/LINK`, `relative_path` or approved external path, `size`, `sha256`, duration_us, streams JSON, verified_at |
 | `transcription_runs` | `id`, `project_id`, `source_asset_id`, model/device/language/VAD config JSON, immutable provenance, status |
 | `segments` | `id`, `run_id`, position, start_us, end_us, source_text, confidence/flags; unique(run_id,position), start < end |
-| `translation_runs` | `id`, `transcription_run_id`, provider/model/config, structured result metadata |
+| `translation_runs` | Immutable provider/model/route/adapter/provider-strategy/prompt/wire/pass-strategy snapshot; new Runs use `gemini`; historical `cloudflare` provenance remains readable; provider SDK version is nullable so REST adapters do not invent an SDK provenance. Existing rows migrate with `legacy-shared-v1` and remain readable. |
 | `translation_units` | `id`, `run_id`, ordered index, start_us/end_us, `source_segment_ids`, proposed_text, final_text, revision, status |
 | `translation_edits` | `id`, `unit_id`, old/new text, revision, author=local, timestamp, optional reason |
-| `tts_runs` | `id`, `translation_run_id`, provider, voice/rate settings snapshot, status |
-| `tts_artifacts` | `id`, `run_id`, `unit_id`, fingerprint, provider/voice/rate, relative audio path, format, duration_us, sample_count, sha256, verified_at, status |
+| `tts_runs` | Implemented by migration v18: immutable accepted-revision/source/config snapshot, producer Job, dependency generations, provider/adapter/synthesis versions and aggregate status. |
+| `tts_run_units` | Implemented by migration v18: ordered Unit and source/revision mapping, exact accepted text, timing, synthesis fingerprint, per-Unit state, retryability and verified Artifact reference. A source Segment may appear in more than one Unit when accepted RevisionSegments split a CoverageGroup; each RevisionSegment ID appears once. |
+| `tts_preview_cache` | Bounded lookup for verified preview artifacts; previews are separate from translation Unit results. |
+| `artifacts` | Shared immutable publication table. TTS uses `tts_audio`, `tts_preview`, and `tts_run_manifest`; migration v19 adds a content fingerprint distinct from the producing Job input fingerprint. |
+| `translation_provider_calls` | Per-physical-request provenance includes route, provider strategy/adapter version, per-request latency, total provider-operation latency, Attempt elapsed at capture, request-body bytes, output budget, timeout exception class/phase, actual usage when returned, status and sanitized error code. Credentials and transcript request/response bodies are excluded. |
 | `sync_plans` | `id`, `tts_run_id`, policy/config, resolved timeline JSON, conflicts JSON, status, sha256 |
 | `render_runs` | `id`, `sync_plan_id`, profile, filtergraph path, output_asset_id, ffprobe report, status |
 | `jobs` / `job_attempts` | kind, project, input fingerprint, status, attempts, local_process_owner (V1 may add heartbeat/lease), stage, started/ended, error_code |
@@ -28,12 +31,16 @@ Maintain user edits and processing artifacts across application restarts, crashe
 
 Relationships: one Project -> multiple source/video Runs -> many Segments/Translation Units/TTS artifacts -> immutable sync plan -> render. Existing Run rows never silently overwrite; active pointers move transactionally after validation.
 
+Migrations v20–v22 widen the translation provider discriminator for Cloudflare, make Google SDK provenance nullable for non-SDK REST calls, and add immutable provider adapter versions. Migration v23 adds immutable provider strategy identity and redacted request/timeout diagnostics; prior rows receive `legacy-shared-v1` and nullable diagnostic fields. It is additive and preserves existing Runs and artifacts.
+
 ## 3. Example invariants
 
 - `end_us > start_us >= 0`, `position >= 0`, foreign keys valid. Any overlap is represented and reviewed, not silently collapsed.
 - `source_segment_ids` for a Translation Unit is non-empty, ordered, refers to same ASR Run, and the set of active source IDs is completely covered exactly as chosen mapping strategy requires.
 - `final_text` edit increments revision by compare-and-swap: `UPDATE ... WHERE id=? AND revision=?`, reject 0 rows as conflict.
 - `tts_artifact` READY only if target file exists, decodes, nonzero speech where text nonempty, size/hash/duration match DB.
+- TTS Unit READY only after FFprobe confirms MP3/24 kHz/mono, FFmpeg decodes the full stream, measured PCM sample count/duration are recorded, audio is non-silent, and the immutable Artifact is atomically published with SHA-256. A run manifest activates through the existing TTS stage compare-and-swap.
+- TTS synthesis fingerprints use stable logical Unit key, exact accepted-text hash, language, voice/rate/pitch/volume, encoding, provider/library and synthesis-policy versions. The accepted revision ID is kept in the immutable Run snapshot but is excluded from per-Unit synthesis fingerprints so unchanged Units remain reusable.
 - `render_run` READY only if MP4 exists, playable streams present, reported duration within accepted tolerance, output checksum computed.
 
 ## 4. Local path scheme

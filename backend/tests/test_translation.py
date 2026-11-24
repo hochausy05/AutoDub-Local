@@ -31,13 +31,31 @@ from app.translation_revisions import TranslationRevisionError, TranslationRevis
 
 
 class TranslationMigrationTests(unittest.TestCase):
+    def test_v23_adds_provider_strategy_and_redacted_call_diagnostics_repeatably(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Database(Path(temporary) / "data")
+            database.initialize(target_version=22)
+            project, _ = database.create_project("migration fixture", "translation-v23-project-001")
+            database.initialize(target_version=23)
+            database.initialize(target_version=23)
+            with closing(database.connect()) as connection:
+                run_columns = {row["name"] for row in connection.execute("PRAGMA table_info(translation_runs)")}
+                call_columns = {row["name"] for row in connection.execute("PRAGMA table_info(translation_provider_calls)")}
+                applied = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+                preserved = connection.execute("SELECT id FROM projects WHERE id=?", (project["id"],)).fetchone()
+            self.assertIn("provider_strategy_version", run_columns)
+            self.assertTrue({"provider_strategy_version", "exception_class", "timeout_phase", "request_body_bytes",
+                             "output_token_budget", "attempt_elapsed_ms", "provider_operation_elapsed_ms"}.issubset(call_columns))
+            self.assertEqual(applied, 23)
+            self.assertIsNotNone(preserved)
+
     def test_v17_adds_translation_revision_contract_repeatably_without_losing_project(self):
         with tempfile.TemporaryDirectory() as temporary:
             database = Database(Path(temporary) / "data")
             database.initialize(target_version=15)
             project, _ = database.create_project("migration fixture", "translation-v16-project-001")
-            database.initialize()
-            database.initialize()
+            database.initialize(target_version=17)
+            database.initialize(target_version=17)
             with closing(database.connect()) as connection:
                 run_columns = {row["name"] for row in connection.execute("PRAGMA table_info(translation_runs)")}
                 unit_columns = {row["name"] for row in connection.execute("PRAGMA table_info(translation_units)")}
@@ -240,6 +258,9 @@ class GeminiWireContractTests(unittest.TestCase):
 
 class TranslationTests(unittest.TestCase):
     def setUp(self):
+        self._provider_env = patch.dict(os.environ, {"AUTODUB_TRANSLATION_PROVIDER": "gemini"}, clear=False)
+        self._provider_env.start()
+        self.addCleanup(self._provider_env.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.db = Database(self.root / "data")
@@ -287,6 +308,11 @@ class TranslationTests(unittest.TestCase):
             self.assertTrue(worker.run_once())
         self.assertEqual(self.service.get_run(self.project["id"], created["run_id"])["status"], "READY")
         return created["run_id"], provider
+
+    def test_retired_provider_rejected_before_network(self):
+        with self.assertRaises(TranslationError) as error:
+            self.service.create_job(self.project["id"], self.accepted["id"], True, "retired-provider-fixture-001", "cloudflare", "cloudflare")
+        self.assertEqual(error.exception.code, "translation_provider_retired")
 
     def test_translation_bulk_draft_approval_restart_and_unit_identity(self):
         run_id, provider = self._ready_single_pass_translation()
@@ -538,9 +564,9 @@ class TranslationTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM jobs WHERE kind='gemini_translation'").fetchone()[0], 1)
 
     def test_missing_key_rejected_before_job_creation(self):
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, {"AUTODUB_TRANSLATION_PROVIDER": "gemini"}, clear=True):
             with self.assertRaisesRegex(TranslationError, "gemini_api_key_missing"):
-                self.service.create_job(self.project["id"], self.accepted["id"], True, "translation-missing-key-01")
+                self.service.create_job(self.project["id"], self.accepted["id"], True, "translation-missing-key-01", "gemini")
         with closing(self.db.connect()) as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM jobs WHERE kind='gemini_translation'").fetchone()[0], 0)
 
@@ -891,8 +917,16 @@ class TranslationAPISecurityTests(unittest.TestCase):
             with client:
                 headers = {"host": "127.0.0.1:8000", "origin": "http://127.0.0.1:5173", "sec-fetch-site": "same-origin"}
                 self.assertEqual(client.get("/api/v1/providers/gemini/status", headers=headers).status_code, 401)
+                self.assertEqual(client.get("/api/v1/providers/status", headers=headers).status_code, 401)
                 bootstrap = client.post("/api/v1/session/bootstrap", headers={**headers, "x-local-bootstrap": "translation-api-secret"}, json={})
                 csrf = bootstrap.json()["csrf_token"]
+                with patch.dict(os.environ, {"AUTODUB_TRANSLATION_PROVIDER": "cloudflare", "AUTODUB_CLOUDFLARE_ACCOUNT_ID": "account-must-not-leak", "AUTODUB_CLOUDFLARE_API_TOKEN": "token-must-not-leak"}):
+                    status = client.get("/api/v1/providers/status", headers=headers)
+                self.assertEqual(status.status_code, 200)
+                self.assertEqual(status.json()["default_provider"], "gemini")
+                self.assertNotIn("cloudflare", status.json()["providers"])
+                self.assertNotIn("account-must-not-leak", status.text)
+                self.assertNotIn("token-must-not-leak", status.text)
                 project = client.post("/api/v1/projects", headers={**headers, "x-csrf-token": csrf, "idempotency-key": "translation-api-project-key-01"}, json={"name": "Security"}).json()
                 response = client.post(f"/api/v1/projects/{project['id']}/translations/jobs", headers={**headers, "idempotency-key": "translation-api-job-key-001"}, json={"accepted_transcript_revision_id": str(uuid.uuid4()), "privacy_consent_confirmed": True})
                 self.assertEqual(response.status_code, 403)

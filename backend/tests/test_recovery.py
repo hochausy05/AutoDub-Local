@@ -95,6 +95,41 @@ class StartupRecoveryTests(unittest.TestCase):
             job["id"], attempt["attempt"]["id"], [artifact["id"]]
         )
 
+    def test_retired_queued_job_is_failed_without_fabricating_attempt(self):
+        jobs = self.app.state.job_service
+        old = jobs.create_job(self.project_id, "cloudflare_translation", {"schema_version": 1}, "retired-queued-key-00001")
+        self.app.state.startup_recovery.reconcile()
+        retired = jobs.get_job(old["id"])
+        self.assertEqual(retired["status"], "CANCELLED")
+        self.assertEqual(retired["error_code"], "translation_provider_retired")
+        self.assertEqual(retired["attempts"], [])
+        self.assertFalse(retired["retry_available"])
+        self.assertEqual(retired["retry_block_reason"], "translation_provider_retired")
+
+    def test_retired_cancel_requested_job_reconciles(self):
+        jobs = self.app.state.job_service
+        old = jobs.create_job(self.project_id, "cloudflare_translation", {"schema_version": 1}, "retired-cancel-key-00001")
+        jobs.claim_next_job(kind="cloudflare_translation")
+        jobs.request_cancel(old["id"], "retired-cancel-request-001")
+        self.app.state.startup_recovery.reconcile()
+        retired = jobs.get_job(old["id"])
+        self.assertEqual(retired["status"], "CANCELLED")
+        self.assertEqual(retired["error_code"], "translation_provider_retired")
+
+    def test_retired_translation_recovery_releases_queue_and_blocks_retry(self):
+        jobs = self.app.state.job_service
+        old = jobs.create_job(self.project_id, "cloudflare_translation", {"schema_version": 1}, "retired-recovery-key-0001")
+        claimed = jobs.claim_next_job(kind="cloudflare_translation")
+        self.assertEqual(claimed["id"], old["id"])
+        self.app.state.startup_recovery.reconcile()
+        retired = jobs.get_job(old["id"])
+        self.assertEqual(retired["status"], "FAILED")
+        self.assertEqual(retired["attempt"]["error_code"], "translation_provider_retired")
+        with self.assertRaisesRegex(JobConflict, "translation_provider_retired"):
+            jobs.retry_job(old["id"], "FAILED", "retired-retry-key-000001")
+        new = jobs.create_job(self.project_id, "gemini_translation", {"schema_version": 1}, "gemini-after-retired-001")
+        self.assertEqual(new["status"], "QUEUED")
+
     def test_restart_interrupts_running_and_cancel_requested_jobs_idempotently(self):
         running_job = self.create_job()
         self.claim(running_job)

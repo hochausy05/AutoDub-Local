@@ -153,7 +153,9 @@ class JobService:
         retry_block_reason = None
         retry_available = False
         if row["status"] in {"FAILED", "INTERRUPTED"}:
-            if latest is None or not latest["retryable"]:
+            if row["kind"] == "cloudflare_translation":
+                retry_block_reason = "translation_provider_retired"
+            elif latest is None or not latest["retryable"]:
                 retry_block_reason = "job_not_retryable"
             elif len(values) >= MAX_ATTEMPTS:
                 retry_block_reason = "retry_limit_reached"
@@ -172,6 +174,8 @@ class JobService:
                     retry_available = True
             else:
                 retry_available = True
+        if row["kind"] == "cloudflare_translation" and row["status"] == "CANCELLED":
+            retry_block_reason = "translation_provider_retired"
         return {
             "id": row["id"],
             "project_id": row["project_id"],
@@ -186,7 +190,7 @@ class JobService:
             "attempt": latest,
             "attempts": values,
             "progress": latest["progress"] if latest else None,
-            "error_code": latest["error_code"] if latest else None,
+            "error_code": latest["error_code"] if latest else "translation_provider_retired" if row["kind"] == "cloudflare_translation" and row["status"] == "CANCELLED" else None,
             "retry_available": retry_available,
             "retry_block_reason": retry_block_reason,
             "activation_stage": row["activation_stage"],
@@ -263,10 +267,10 @@ class JobService:
                 prior_job_id = json.loads(previous["response_json"])["job_id"]
                 return self._job_detail(connection, prior_job_id)
 
-            if kind == "gemini_translation":
+            if kind in {"gemini_translation", "cloudflare_translation"}:
                 active_translation = connection.execute(
-                    "SELECT id FROM jobs WHERE project_id=? AND kind=? AND input_fingerprint=? AND status IN ('QUEUED','RUNNING','CANCEL_REQUESTED') LIMIT 1",
-                    (project_id, kind, input_fingerprint),
+                    "SELECT id FROM jobs WHERE project_id=? AND kind IN ('gemini_translation','cloudflare_translation') AND status IN ('QUEUED','RUNNING','CANCEL_REQUESTED') LIMIT 1",
+                    (project_id,),
                 ).fetchone()
                 if active_translation:
                     raise JobConflict("job_already_active")
@@ -385,11 +389,13 @@ class JobService:
         digest = self._digest({"job_id": job_id, "action": "retry", "expected_status": expected_status})
         with self._write() as connection:
             job = connection.execute(
-                "SELECT project_id,status,activation_stage,expected_input_generation,expected_pointer_generation,input_fingerprint FROM jobs WHERE id=?",
+                "SELECT project_id,kind,status,activation_stage,expected_input_generation,expected_pointer_generation,input_fingerprint FROM jobs WHERE id=?",
                 (job_id,),
             ).fetchone()
             if job is None:
                 raise JobNotFound
+            if job["kind"] == "cloudflare_translation":
+                raise JobConflict("translation_provider_retired")
             previous = connection.execute(
                 "SELECT request_digest FROM idempotency_records WHERE scope=? AND idempotency_key=?",
                 (scope, idempotency_key),

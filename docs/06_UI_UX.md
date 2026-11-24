@@ -37,7 +37,7 @@ Buttons: `Chạy`, `Hủy`, `Chạy lại`, `Lưu nháp`, `Duyệt kết quả`,
 ## 5. Translation review (current MVP)
 
 - Show source text, final Vietnamese and timestamps in one Unit table; clicking a timestamp seeks the selected video. A Pass 1 view is available only for legacy Two-Pass Runs.
-- Show inline notice: “Lời thoại văn bản được gửi đến Gemini để dịch. Video và âm thanh vẫn được lưu trên máy tính.” The user can consent once for the versioned provider/data scope and revoke it. The API still requires a true consent field for each create request; UI consent does not bypass backend validation.
+- Show Gemini availability and revocable Gemini consent for new translation Runs. Historical Runs retain their recorded provider and model.
 
 ## 5.1. Translation editor (TRANS-01B implementation slice)
 
@@ -48,11 +48,9 @@ Buttons: `Chạy`, `Hủy`, `Chạy lại`, `Lưu nháp`, `Duyệt kết quả`,
 
 ## 6. TTS editor and player
 
-- Voice selector previews actual chosen voice; default reference voice `vi-VN-NamMinhNeural`; names queried from provider, not invented gender/region descriptions.
-- Global rate/pitch/volume and per-Unit override; `Nghe thử` for sample; `Tạo các đoạn chưa có` and `Tạo lại đoạn đã chọn` actions.
-- Unit list shows `Chưa tạo`, `Đang tạo`, `Sẵn sàng`, `Lỗi`, `Hết hiệu lực`, with playable artifact as soon as verified.
-- Full waveform/seek/time/remaining can be staged after core player; display actual audio duration and target window, highlight overflow.
-- Player Play/Pause/Resume, one active audio, source video seek; no surprise background speech.
+TTS-01A adds a minimal testable panel under the approved-translation tab. It loads the real `vi-VN` voice catalog, selects the documented default only when returned by the provider, and has a simple global rate choice. Pitch and volume remain neutral. The exact inline consent explains that approved Vietnamese text is sent to Edge-TTS while source video/audio stay local; it is independent from Gemini consent and can be revoked.
+
+`Nghe thử` creates a real, separately cached preview only after the explicit click. One `Tạo giọng đọc` action starts the whole eligible batch; the panel shows evidence-based per-Unit status, reused/ready/running/queued/error counts, accepted text, source timing, measured audio duration and a play action for each verified Unit. It keeps one audio player and does not autoplay. Batch cancellation and retry of failed Units use the existing Job lifecycle. Larger player controls, per-Unit rate override, waveform, and the full source-seek/overflow workflow remain future UI work; G5 is not accepted by adding this panel.
 
 ## 7. AV sync workspace — MVP simple table
 

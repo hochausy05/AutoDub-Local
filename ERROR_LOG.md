@@ -1,5 +1,24 @@
 # ERROR_LOG — Reproducible Incidents in the New Project
 
+## TRANS-02C - Recovery rejected invalid queued transition
+- During focused synthetic recovery testing, SQLite rejected a direct QUEUED to FAILED update with `invalid job state transition`; the transaction rolled back.
+- Corrected recovery to transition queued/cancellation-requested retired Jobs to CANCELLED and running Jobs to FAILED, preserving the existing state machine. Recovery regression PASS (14 tests), including queued, running and cancellation-requested cases. No user database was modified by this test.
+
+## TRANS-02B — Synthetic Cloudflare qualification failed strict output acceptance
+- **Date/time:** 2026-11-24 23:39 UTC+7
+- **Scope/data:** Direct Workers AI requests used only a synthetic 48-Unit Chinese fixture; no Project transcript, Gemini, TTS or production Job was sent/run.
+- **Observed:** On the UTF-8-correct Compact Text request (`max_completion_tokens=1024`), HTTP 200 completed in 18.646 s with `finish_reason=stop`, 836 input and 713 output tokens, but output covered only 40/48 IDs and emitted durations in the translation field. The prompt-only JSON candidate on the same fixture/settings returned HTTP 200 in 28.691 s, `finish_reason=stop`, 1,181 input and 986 output tokens; its content failed JSON parsing. A prior harness invocation transported Chinese characters as `?` due PowerShell pipeline encoding; its output is excluded from quality evidence. One separate direct-request invocation did not return its output to the tool, so its HTTP status and usage are unknown.
+- **Confirmed code defect:** The adapter expected `result.response`, while the live Workers AI REST response used `result.choices[0].message.content`. The parser now uses only that observed final assistant content and never reasoning fields; adapter version advances to v2. The timeout ledger now stores the timeout exception class/phase and per-request rather than cumulative latency.
+- **Remediation/limits:** Added schema v23 provider-strategy identity and redacted call diagnostics; Gemini, shared validation/persistence, chunking, prompt, current Cloudflare JSON wire, 6,000-token output ceiling and retry count remain unchanged. No Compact Text, native JSON Mode, or Thinking configuration is enabled. The observed disabled-thinking candidate received HTTP 200, but effect is unverified. These failures do not establish the prior production timeout cause or prove 48 Units are oversized.
+- **Usage/charge:** Three request responses were captured: aggregate usage 2,706 input and 2,241 output tokens. At the published GLM-4.7-Flash Neuron rates this is approximately 96.46 Neurons, excluding the unrecorded invocation. The task's Cloudflare dashboard showed 0/10,000 before qualification; the known usage is within that daily free allocation. Exact usage for the unrecorded invocation is unavailable. No paid plan or account setting was changed.
+- **Verification:** Focused backend translation tests **PASS** (51 tests); full backend regression **PASS** (164 tests). No Cloudflare production Job was run and no candidate is qualified for READY production use.
+
+## TTS-01A — Edge-TTS chunk iterator exhausted before synthesis
+- **Date/time:** 2026-11-24 20:33 UTC+7
+- **Observed:** A live smoke with synthetic Vietnamese text returned from `Communicate.save()` without raising, but the generated MP3 was 0 bytes; the artifact validator correctly rejected it as `tts_audio_empty`, so it was not published or marked READY. The adapter's integrity check had consumed the one-shot `Communicate.texts` generator before calling `save()`.
+- **Correction:** Buffer the library's lossless text chunks, validate token order after XML entity decoding, then restore the chunks for the library save call. Added a regression test proving the generator remains available to `save()`.
+- **Verification:** TTS synthetic integration tests passed. Within the authorized five-synthesis live-smoke limit, a later one-sentence synthetic request produced a non-empty MP3; FFprobe/FFmpeg verification measured 54,720 samples at 24 kHz mono and rejected no silence. One separate provider request returned `NoAudioReceived` and remained an explicit failure. No user translation/video/audio was sent; no empty artifact was published.
+
 ## TRANS-01B — Draft editor retained leading whitespace
 - **Date/time:** 2026-11-24 19:40 UTC+7
 - **Observed:** The focused translation-revision test submitted an edited Unit with surrounding spaces; the saved response retained leading spaces while trailing spaces were removed by the existing punctuation normalizer.

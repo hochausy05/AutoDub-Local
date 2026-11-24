@@ -14,7 +14,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 23
 BUSY_TIMEOUT_MS = 5000
 
 
@@ -717,6 +717,127 @@ class Database:
                     connection.execute("CREATE TRIGGER active_translation_revision_accepted_insert BEFORE INSERT ON project_active_translation_revisions WHEN (SELECT status FROM translation_revisions WHERE id=NEW.revision_id)<>'ACCEPTED' BEGIN SELECT RAISE(ABORT, 'active translation revision must be accepted'); END")
                     connection.execute("CREATE TRIGGER active_translation_revision_accepted_update BEFORE UPDATE ON project_active_translation_revisions WHEN (SELECT status FROM translation_revisions WHERE id=NEW.revision_id)<>'ACCEPTED' BEGIN SELECT RAISE(ABORT, 'active translation revision must be accepted'); END")
                     connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (17, utc_now()))
+                    current = 17
+                if current < 18 and target_version >= 18:
+                    connection.execute("""CREATE TABLE tts_runs (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        project_id TEXT NOT NULL,
+                        source_asset_id TEXT NOT NULL,
+                        translation_run_id TEXT NOT NULL,
+                        translation_revision_id TEXT NOT NULL,
+                        producer_job_id TEXT NOT NULL UNIQUE,
+                        input_fingerprint TEXT NOT NULL CHECK(length(input_fingerprint)=64),
+                        revision_fingerprint TEXT NOT NULL CHECK(length(revision_fingerprint)=64),
+                        config_json TEXT NOT NULL CHECK(json_valid(config_json)),
+                        provider_version TEXT NOT NULL,
+                        adapter_version TEXT NOT NULL,
+                        synthesis_version TEXT NOT NULL,
+                        expected_input_generation INTEGER NOT NULL CHECK(expected_input_generation>=1),
+                        expected_pointer_generation INTEGER NOT NULL CHECK(expected_pointer_generation>=0),
+                        status TEXT NOT NULL CHECK(status IN ('QUEUED','RUNNING','PARTIAL','READY','FAILED','CANCELLED','INTERRUPTED','STALE')),
+                        manifest_artifact_id TEXT,
+                        created_at TEXT NOT NULL,
+                        completed_at TEXT,
+                        UNIQUE(project_id,id),
+                        FOREIGN KEY(project_id,source_asset_id) REFERENCES media_assets(project_id,id) ON DELETE RESTRICT,
+                        FOREIGN KEY(project_id,translation_revision_id) REFERENCES translation_revisions(project_id,id) ON DELETE RESTRICT,
+                        FOREIGN KEY(project_id,translation_run_id) REFERENCES translation_runs(project_id,id) ON DELETE RESTRICT,
+                        FOREIGN KEY(project_id,producer_job_id) REFERENCES jobs(project_id,id) ON DELETE RESTRICT,
+                        FOREIGN KEY(project_id,manifest_artifact_id) REFERENCES artifacts(project_id,id) ON DELETE RESTRICT
+                    )""")
+                    connection.execute("CREATE INDEX tts_runs_project_created_idx ON tts_runs(project_id,created_at DESC,id)")
+                    connection.execute("""CREATE TABLE tts_run_units (
+                        project_id TEXT NOT NULL,
+                        tts_run_id TEXT NOT NULL,
+                        unit_id TEXT NOT NULL,
+                        logical_unit_key TEXT NOT NULL,
+                        position INTEGER NOT NULL CHECK(position>=0),
+                        source_segment_ids_json TEXT NOT NULL CHECK(json_valid(source_segment_ids_json)),
+                        revision_segment_ids_json TEXT NOT NULL CHECK(json_valid(revision_segment_ids_json)),
+                        source_text TEXT NOT NULL,
+                        accepted_text TEXT NOT NULL CHECK(length(trim(accepted_text))>0),
+                        text_sha256 TEXT NOT NULL CHECK(length(text_sha256)=64),
+                        start_us INTEGER NOT NULL CHECK(start_us>=0),
+                        end_us INTEGER NOT NULL CHECK(end_us>start_us),
+                        source_window_duration_us INTEGER NOT NULL CHECK(source_window_duration_us=end_us-start_us),
+                        synthesis_fingerprint TEXT NOT NULL CHECK(length(synthesis_fingerprint)=64),
+                        status TEXT NOT NULL CHECK(status IN ('QUEUED','RUNNING','READY','FAILED','REVIEW_REQUIRED','CANCELLED','STALE')),
+                        artifact_id TEXT,
+                        cache_hit INTEGER NOT NULL DEFAULT 0 CHECK(cache_hit IN (0,1)),
+                        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count>=0),
+                        retryable INTEGER NOT NULL DEFAULT 0 CHECK(retryable IN (0,1)),
+                        error_code TEXT,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(tts_run_id,unit_id),
+                        UNIQUE(tts_run_id,logical_unit_key),
+                        UNIQUE(tts_run_id,position),
+                        FOREIGN KEY(project_id,tts_run_id) REFERENCES tts_runs(project_id,id) ON DELETE RESTRICT,
+                        FOREIGN KEY(project_id,artifact_id) REFERENCES artifacts(project_id,id) ON DELETE RESTRICT
+                    )""")
+                    connection.execute("CREATE INDEX tts_run_units_status_idx ON tts_run_units(tts_run_id,status,position)")
+                    connection.execute("CREATE INDEX tts_run_units_fingerprint_idx ON tts_run_units(project_id,synthesis_fingerprint,status)")
+                    connection.execute("""CREATE TABLE tts_preview_cache (
+                        fingerprint TEXT PRIMARY KEY NOT NULL CHECK(length(fingerprint)=64),
+                        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+                        artifact_id TEXT NOT NULL UNIQUE,
+                        text_sha256 TEXT NOT NULL CHECK(length(text_sha256)=64),
+                        created_at TEXT NOT NULL,
+                        last_used_at TEXT NOT NULL,
+                        FOREIGN KEY(project_id,artifact_id) REFERENCES artifacts(project_id,id) ON DELETE RESTRICT
+                    )""")
+                    connection.execute("""CREATE TRIGGER tts_run_input_immutable BEFORE UPDATE OF id,project_id,source_asset_id,translation_run_id,translation_revision_id,producer_job_id,input_fingerprint,revision_fingerprint,config_json,provider_version,adapter_version,synthesis_version,expected_input_generation,expected_pointer_generation,created_at ON tts_runs
+                        BEGIN SELECT RAISE(ABORT, 'TTS run input snapshot is immutable'); END""")
+                    connection.execute("""CREATE TRIGGER tts_run_unit_input_immutable BEFORE UPDATE OF project_id,tts_run_id,unit_id,logical_unit_key,position,source_segment_ids_json,revision_segment_ids_json,source_text,accepted_text,text_sha256,start_us,end_us,source_window_duration_us,synthesis_fingerprint ON tts_run_units
+                        BEGIN SELECT RAISE(ABORT, 'TTS unit input snapshot is immutable'); END""")
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (18, utc_now()))
+                    current = 18
+                if current < 19 and target_version >= 19:
+                    connection.execute("ALTER TABLE artifacts ADD COLUMN content_fingerprint TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'")
+                    connection.execute("UPDATE artifacts SET content_fingerprint=input_fingerprint")
+                    connection.execute("CREATE TRIGGER artifact_content_fingerprint_immutable BEFORE UPDATE OF content_fingerprint ON artifacts BEGIN SELECT RAISE(ABORT, 'artifact content fingerprint is immutable'); END")
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (19, utc_now()))
+                    current = 19
+                if current < 20 and target_version >= 20:
+                    # SQLite cannot drop a CHECK/NOT NULL constraint in-place. Relax only
+                    # the provider discriminator and SDK provenance columns, preserving
+                    # every existing row and all child-table relationships.
+                    old_schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
+                    connection.execute("PRAGMA writable_schema=ON")
+                    try:
+                        changed = connection.execute("UPDATE sqlite_schema SET sql=replace(sql,\"CHECK(provider='gemini')\",\"CHECK(provider IN ('gemini','cloudflare'))\") WHERE type='table' AND name='translation_runs'").rowcount
+                        if changed != 1:
+                            raise RuntimeError("Could not safely widen translation provider constraint.")
+                        changed = connection.execute("UPDATE sqlite_schema SET sql=replace(sql,\"provider_sdk_version TEXT NOT NULL\",\"provider_sdk_version TEXT\") WHERE type='table' AND name='translation_runs'").rowcount
+                        if changed != 1:
+                            raise RuntimeError("Could not safely make provider SDK provenance optional.")
+                        changed = connection.execute("UPDATE sqlite_schema SET sql=replace(sql,\"sdk_version TEXT NOT NULL\",\"sdk_version TEXT\") WHERE type='table' AND name='translation_provider_calls'").rowcount
+                        if changed != 1:
+                            raise RuntimeError("Could not safely make provider-call SDK provenance optional.")
+                        connection.execute(f"PRAGMA schema_version={old_schema_version + 1}")
+                    finally:
+                        connection.execute("PRAGMA writable_schema=OFF")
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (20, utc_now()))
+                    current = 20
+                if current < 21 and target_version >= 21:
+                    connection.execute("ALTER TABLE translation_runs ADD COLUMN adapter_version TEXT NOT NULL DEFAULT 'google-genai/3.6.1'")
+                    connection.execute("ALTER TABLE translation_provider_calls ADD COLUMN adapter_version TEXT NOT NULL DEFAULT 'google-genai/3.6.1'")
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (21, utc_now()))
+                    current = 21
+                if current < 22 and target_version >= 22:
+                    connection.execute("CREATE TRIGGER translation_run_adapter_immutable BEFORE UPDATE OF adapter_version ON translation_runs BEGIN SELECT RAISE(ABORT, 'translation adapter version is immutable'); END")
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (22, utc_now()))
+                    current = 22
+                if current < 23 and target_version >= 23:
+                    connection.execute("ALTER TABLE translation_runs ADD COLUMN provider_strategy_version TEXT NOT NULL DEFAULT 'legacy-shared-v1'")
+                    connection.execute("ALTER TABLE translation_provider_calls ADD COLUMN provider_strategy_version TEXT NOT NULL DEFAULT 'legacy-shared-v1'")
+                    connection.execute("ALTER TABLE translation_provider_calls ADD COLUMN exception_class TEXT")
+                    connection.execute("ALTER TABLE translation_provider_calls ADD COLUMN timeout_phase TEXT")
+                    connection.execute("ALTER TABLE translation_provider_calls ADD COLUMN request_body_bytes INTEGER CHECK(request_body_bytes IS NULL OR request_body_bytes >= 0)")
+                    connection.execute("ALTER TABLE translation_provider_calls ADD COLUMN output_token_budget INTEGER CHECK(output_token_budget IS NULL OR output_token_budget >= 0)")
+                    connection.execute("ALTER TABLE translation_provider_calls ADD COLUMN attempt_elapsed_ms INTEGER CHECK(attempt_elapsed_ms IS NULL OR attempt_elapsed_ms >= 0)")
+                    connection.execute("ALTER TABLE translation_provider_calls ADD COLUMN provider_operation_elapsed_ms INTEGER CHECK(provider_operation_elapsed_ms IS NULL OR provider_operation_elapsed_ms >= 0)")
+                    connection.execute("CREATE TRIGGER translation_provider_strategy_immutable BEFORE UPDATE OF provider_strategy_version ON translation_runs BEGIN SELECT RAISE(ABORT, 'translation provider strategy is immutable'); END")
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (23, utc_now()))
                 connection.commit()
             except BaseException:
                 connection.rollback()

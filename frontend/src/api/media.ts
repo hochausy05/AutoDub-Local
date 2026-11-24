@@ -30,7 +30,7 @@ export type ASRRun = ASRRunSummary & { model_revision: string; input_fingerprint
 export type TranscriptSegment = { row_id: string; stable_segment_key: string; position: number; text: string; start_us: number; end_us: number; parent_keys: string[]; coverage_group_id: string | null; coverage_status: "PENDING" | "REVIEWED" | null; source_segment_ids: string[]; source_texts: string[]; timing_warning: boolean };
 export type TranscriptRevision = { id: string; project_id: string; run_id: string; source_asset_id: string; parent_revision_id: string | null; revision_no: number; status: "DRAFT" | "ACCEPTED"; lock_version: number; created_at: string; accepted_at: string | null; is_active: boolean; is_current: boolean; active_generation: number; run_status: string; duration_us: number; segments: TranscriptSegment[] };
 export type TranslationUnit = { unit_id: string; logical_unit_key: string; position: number; revision_segment_ids: string[]; source_segment_ids: string[]; source_text: string; start_us: number; end_us: number; pass1_text: string | null; pass2_text: string | null; final_text: string | null; final_notes: string[]; status: string; error_code: string | null; review_flags: string[] };
-export type TranslationRun = { id: string; project_id: string; producer_job_id: string; transcript_revision_id: string; source_asset_id: string; status: string; pass_strategy: "SINGLE_PASS" | "TWO_PASS"; error_code: string | null; is_active: boolean; units: TranslationUnit[] };
+export type TranslationRun = { id: string; project_id: string; producer_job_id: string; transcript_revision_id: string; source_asset_id: string; provider: "cloudflare" | "gemini"; model_id: string; status: string; pass_strategy: "SINGLE_PASS" | "TWO_PASS"; error_code: string | null; is_active: boolean; units: TranslationUnit[] };
 export type TranslationRevisionUnit = Pick<TranslationUnit, "unit_id" | "logical_unit_key" | "position" | "revision_segment_ids" | "source_segment_ids" | "source_text" | "start_us" | "end_us"> & { final_text: string; unit_fingerprint: string; text_origin: "PROVIDER_OUTPUT" | "USER_EDIT" };
 export type TranslationRevision = { id: string; project_id: string; run_id: string; parent_revision_id: string | null; source_revision_id: string | null; source_kind: "PROVIDER_OUTPUT" | "ACCEPTED_REVISION"; revision_no: number; status: "DRAFT" | "ACCEPTED"; lock_version: number; fingerprint: string; fingerprint_version: number; provenance: Record<string, unknown>; created_at: string; accepted_at: string | null; is_active: boolean; units: TranslationRevisionUnit[] };
 export type TranslationEditorState = { project_id: string; run_id: string; source_asset_id: string; transcript_revision_id: string; run_is_current: boolean; active_revision_id: string | null; active_generation: number; original_units: TranslationRevisionUnit[]; draft: TranslationRevision | null; accepted: TranslationRevision | null; latest_accepted: TranslationRevision | null };
@@ -282,17 +282,19 @@ export async function acceptTranscriptRevision(projectId: string, revision: Tran
   return transcriptMutation(`/api/v1/projects/${projectId}/transcripts/revisions/${revision.id}/accept`, { expected_lock_version: revision.lock_version, expected_active_revision_id: expectedActiveRevisionId });
 }
 
-export async function fetchGeminiStatus() {
-  const response = await fetch("/api/v1/providers/gemini/status", { credentials: "same-origin", cache: "no-store" });
+export type TranslationProviderStatus = { default_provider: "gemini"; providers: Record<"gemini", { configured: boolean; model_id: string }> };
+
+export async function fetchTranslationProviders() {
+  const response = await fetch("/api/v1/providers/status", { credentials: "same-origin", cache: "no-store" });
   await checked(response);
-  return await response.json() as { configured: boolean };
+  return await response.json() as TranslationProviderStatus;
 }
 
-export async function createTranslationJob(projectId: string, revisionId: string, consentConfirmed: boolean) {
+export async function createTranslationJob(projectId: string, revisionId: string, provider: "gemini", consentConfirmed: boolean) {
   if (!consentConfirmed) throw new Error("Cần xác nhận quyền riêng tư trước khi gửi lời thoại.");
   const csrf = currentCsrfToken();
   if (!csrf) throw new Error("Phiên cục bộ chưa sẵn sàng.");
-  const response = await fetch(`/api/v1/projects/${projectId}/translations/jobs`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf, "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ accepted_transcript_revision_id: revisionId, target_language: "vi", privacy_consent_confirmed: consentConfirmed }) });
+  const response = await fetch(`/api/v1/projects/${projectId}/translations/jobs`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf, "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ accepted_transcript_revision_id: revisionId, target_language: "vi", provider, privacy_consent_confirmed: consentConfirmed, privacy_consent_provider: consentConfirmed ? provider : null }) });
   await checked(response);
   return await response.json() as { run_id: string; job: ASRJob };
 }
