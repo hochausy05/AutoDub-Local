@@ -25,7 +25,7 @@ from app.recovery import StartupRecovery
 from app.media import FFprobe, LinkManifestValidator, MediaError, MediaImportService, MediaImportWorker, SourceVideoValidator, parse_single_byte_range
 from app.asr import ASRConfig, ASRError, ASRService, ASRWorker, TranscriptArtifactValidator
 from app.transcripts import TranscriptError, TranscriptService
-from app.translation import TranslationError, TranslationService, TranslationWorker, TranslationArtifactValidator
+from app.translation import TranslationError, TranslationService, TranslationArtifactValidator
 from app.translation_revisions import TranslationRevisionError, TranslationRevisionService
 from app.tts import TTSError, TTSService, TTSWorker
 
@@ -203,15 +203,6 @@ class TranscriptAcceptRequest(BaseModel):
     expected_active_revision_id: uuid.UUID | None = None
 
 
-class TranslationJobRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    accepted_transcript_revision_id: uuid.UUID
-    target_language: Literal["vi"] = "vi"
-    privacy_consent_confirmed: bool
-    provider: Literal["cloudflare", "gemini"] | None = None
-    privacy_consent_provider: Literal["cloudflare", "gemini"] | None = None
-
-
 class TranslationDraftCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     base_accepted_revision_id: uuid.UUID | None = None
@@ -277,7 +268,6 @@ def create_app(
     artifact_service.validators["translation_json"] = TranslationArtifactValidator(database)
     translation_service = TranslationService(database, job_service)
     translation_revision_service = TranslationRevisionService(database)
-    translation_worker = TranslationWorker(translation_service, artifact_service)
     tts_service = TTSService(database, job_service, artifact_service, translation_revision_service)
     tts_worker = TTSWorker(tts_service)
     startup_recovery = StartupRecovery(database, job_service, artifact_service)
@@ -289,13 +279,11 @@ def create_app(
         _app.state.recovery_report["media_assets_recovered"] = media_service.reconcile_pending_assets()
         media_worker.start()
         asr_worker.start()
-        translation_worker.start()
         tts_worker.start()
         try:
             yield
         finally:
             tts_worker.stop()
-            translation_worker.stop()
             asr_worker.stop()
             media_worker.stop()
 
@@ -434,24 +422,9 @@ def create_app(
             "translation_unit_coverage_invalid": "Không thể xác minh đầy đủ các câu lời thoại.",
             "translation_no_units": "Không có câu lời thoại cần dịch.",
             "privacy_consent_required": "Cần xác nhận quyền riêng tư cho nhà cung cấp đã chọn.",
-            "gemini_privacy_consent_required": "Cần xác nhận việc gửi lời thoại tới Google Gemini.",
-            "gemini_credentials_missing": "Chưa cấu hình Gemini credentials ở backend.",
             "translation_provider_retired": "Nhà cung cấp dịch này không còn được hỗ trợ.",
             "translation_provider_invalid": "Nhà cung cấp dịch không hợp lệ.",
-            "gemini_api_key_missing": "Chưa cấu hình khóa Gemini trong môi trường backend.",
-            "gemini_api_key_invalid": "Gemini không chấp nhận khóa API đã cấu hình.",
-            "gemini_permission_denied": "Tài khoản hoặc dự án chưa có quyền sử dụng Gemini API.",
-            "gemini_quota_exceeded": "Đã đạt giới hạn sử dụng Gemini. Hãy thử lại khi hạn mức được khôi phục.",
-            "gemini_service_unavailable": "Dịch vụ Gemini đang tạm thời không khả dụng. Vui lòng thử lại sau.",
-            "gemini_network_error": "Không thể kết nối tới Gemini. Hãy kiểm tra kết nối Internet.",
-            "gemini_transient_provider_error": "Dịch vụ Gemini đang tạm thời gặp sự cố. Vui lòng thử lại sau.",
-            "gemini_model_unsupported": "Model Gemini đã cấu hình không khả dụng.",
-            "gemini_request_invalid": "Cấu hình hoặc schema yêu cầu Gemini không hợp lệ.",
-            "gemini_proxy_error": "Proxy mạng được cấu hình không thể kết nối tới Gemini.",
-            "gemini_tls_error": "Không thể xác minh chứng chỉ kết nối Gemini. Kiểm tra cấu hình chứng chỉ hệ thống.",
             "job_already_active": "Job dịch cho phiên bản lời thoại này đang chạy.",
-            "gemini_network_error": "Không kết nối được Gemini. Hãy kiểm tra mạng rồi thử lại.",
-            "gemini_model_unsupported": "Model Gemini hiện không hỗ trợ yêu cầu này.",
         }.get(exc.code, "Không thể tạo hoặc tải kết quả dịch."))
 
     def translation_revision_exception(exc: TranslationRevisionError | IdempotencyConflict) -> JSONResponse:
@@ -832,40 +805,12 @@ def create_app(
         except (TranscriptError, IdempotencyConflict) as exc:
             return transcript_exception(exc)
 
-    @app.get("/api/v1/providers/status")
-    def translation_provider_status(request: Request):
-        current = require_session(request)
-        if isinstance(current, JSONResponse):
-            return current
-        return {"default_provider": translation_service.default_provider(), "providers": {
-            "gemini": {"configured": translation_service.provider_configured("gemini"), "model_id": "gemini-3.1-flash-lite"},
-        }}
-
-    @app.get("/api/v1/providers/gemini/status")
-    def legacy_gemini_provider_status(request: Request):
-        current = require_session(request)
-        if isinstance(current, JSONResponse): return current
-        return {"configured": translation_service.provider_configured("gemini")}
-
     @app.post("/api/v1/projects/{project_id}/translations/jobs", status_code=202)
-    def create_translation_job(project_id: str, body: TranslationJobRequest, request: Request):
+    def create_translation_job(project_id: str, request: Request):
         current = require_mutation_session(request)
         if isinstance(current, JSONResponse):
             return current
-        try:
-            project = uuid.UUID(project_id)
-            revision = uuid.UUID(str(body.accepted_transcript_revision_id))
-            if str(project) != project_id.lower():
-                raise ValueError
-        except ValueError:
-            return api_error(422, "invalid_translation_id", "Project hoặc phiên bản lời thoại không hợp lệ.")
-        if database.get_project(str(project)) is None:
-            return api_error(404, "project_not_found", "Project không tồn tại.")
-        try:
-            result = translation_service.create_job(str(project), str(revision), body.privacy_consent_confirmed, request.headers.get("idempotency-key", ""), body.provider, body.privacy_consent_provider)
-            return JSONResponse(status_code=202, content=result)
-        except (TranslationError, IdempotencyConflict) as exc:
-            return translation_exception(exc)
+        return api_error(503, "translation_engine_unavailable", "Chức năng dịch đang được chuyển sang AI Local.")
 
     @app.get("/api/v1/projects/{project_id}/translations/runs")
     def list_translation_runs(project_id: str, request: Request):

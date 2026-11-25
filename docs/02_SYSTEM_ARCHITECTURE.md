@@ -2,7 +2,7 @@
 
 > **Phase rule:** `14_SCOPE_BASELINE.md` defines mandatory MVP vs V1/V2 scope; advanced designs in this document do not imply MVP implementation.
 
-**Status:** Target design, not an implemented codebase.
+**Status:** Architecture reference; implementation slices and owner acceptance are tracked in `TASK.md`. TRANS-03A removed Local Translation execution; new translation remains unavailable pending LOCAL-01A.
 
 ## 1. Context diagram
 
@@ -22,7 +22,7 @@ flowchart TD
   TR <--> DB
   TTS <--> FS
   REN <--> FS
-  TR --> GEMINI[(Gemini API Internet)]
+  TR --> GEMINI[(Local Translation API Internet)]
   TTS --> EDGE[(Edge speech Internet)]
 ```
 
@@ -36,7 +36,7 @@ flowchart TD
 | Persistent metadata | SQLite WAL, schema migrations via Alembic or explicit SQL | Project, Run, Unit, artifact, Job, edit revisions | Single-user local persistence, transactional updates |
 | Media | FFmpeg/FFprobe CLI, `soundfile`, optional `PyAV` | Decode/extract, combine, measure, render | Avoid handling full video frames in Python |
 | ASR | Faster-Whisper / CTranslate2 | Speech segments with start/end | GPU float16 or CPU int8 fallback |
-| Translation | Gemini engine + `google-genai` adapter | Gemini `gemini-3.1-flash-lite` only | One prompt/chunk/mapping/persistence path; provider/model/adapter snapshot per Run |
+| Translation | Local Translation engine + `google-genai` adapter | Local Translation `gemini-3.1-flash-lite` only | One prompt/chunk/mapping/persistence path; provider/model/adapter snapshot per Run |
 | Speech | `edge-tts` as default adapter | Vietnamese voice TTS, MP3/format metadata | Match legacy user preference; requires internet |
 | Voice preview | Bounded file cache | Short sample by exact voice/rate/pitch/config | Avoid repeated network generation |
 | Subtitle OCR (optional) | OpenCV + EasyOCR/other measured implementation | Suggest old subtitle location | Costly stage, opt-in, verify visually |
@@ -119,4 +119,4 @@ Edits invalidate only descendants whose *actual input fingerprint* changes. Exam
 
 ## 8. Trust boundaries
 
-Local UI on `127.0.0.1`, backend on `127.0.0.1`, Windows filesystem trusted only after user selection, and external Gemini/Edge endpoints remain separate consented boundaries. Translation consent is Gemini-specific; historical provider provenance remains readable. Validate files based on probing, not extension alone. Rate-limit local endpoints and ensure no remote web page can invoke destructive local APIs through weak CORS/CSRF protections.
+Local UI on `127.0.0.1`, backend on `127.0.0.1`, Windows filesystem trusted only after user selection, and external Local Translation/Edge endpoints remain separate consented boundaries. Translation consent is Local Translation-specific; historical provider provenance remains readable. Validate files based on probing, not extension alone. Rate-limit local endpoints and ensure no remote web page can invoke destructive local APIs through weak CORS/CSRF protections.

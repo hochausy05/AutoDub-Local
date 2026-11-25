@@ -2,6 +2,8 @@
 
 > **Phase rule:** `14_SCOPE_BASELINE.md` defines mandatory MVP vs V1/V2 scope; advanced designs in this document do not imply MVP implementation.
 
+**Runtime note (TRANS-03A):** Gemini translation execution has been removed. Canonical Unit mapping, coverage validation and historical Run reads remain; new translation is unavailable until LOCAL-01A. Gemini algorithms below are historical design context, not active runtime behavior.
+
 **Rule:** Time represented as integer microseconds (`*_us`) for timeline operations; audio sample/frame counts where possible. Floats only at API boundaries and diagnostic displays. Algorithms below are design targets; none are runtime-verified in the new app.
 
 ## 1. Source intake and media probing

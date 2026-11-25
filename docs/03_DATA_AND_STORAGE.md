@@ -14,7 +14,7 @@ Maintain user edits and processing artifacts across application restarts, crashe
 | `media_assets` | `id`, `project_id`, `role SOURCE/OUTPUT/PREVIEW`, `import_mode COPY/LINK`, `relative_path` or approved external path, `size`, `sha256`, duration_us, streams JSON, verified_at |
 | `transcription_runs` | `id`, `project_id`, `source_asset_id`, model/device/language/VAD config JSON, immutable provenance, status |
 | `segments` | `id`, `run_id`, position, start_us, end_us, source_text, confidence/flags; unique(run_id,position), start < end |
-| `translation_runs` | Immutable provider/model/route/adapter/provider-strategy/prompt/wire/pass-strategy snapshot; new Runs use `gemini`; historical `cloudflare` provenance remains readable; provider SDK version is nullable so REST adapters do not invent an SDK provenance. Existing rows migrate with `legacy-shared-v1` and remain readable. |
+| `translation_runs` | Schema v23 is retained in TRANS-03A. Immutable provider/model/route/adapter/provider-strategy/prompt/wire/pass-strategy provenance remains readable for historical Gemini and Cloudflare Runs; no migration or provenance cleanup is performed. New Runs are unavailable pending LOCAL-01A. |
 | `translation_units` | `id`, `run_id`, ordered index, start_us/end_us, `source_segment_ids`, proposed_text, final_text, revision, status |
 | `translation_edits` | `id`, `unit_id`, old/new text, revision, author=local, timestamp, optional reason |
 | `tts_runs` | Implemented by migration v18: immutable accepted-revision/source/config snapshot, producer Job, dependency generations, provider/adapter/synthesis versions and aggregate status. |

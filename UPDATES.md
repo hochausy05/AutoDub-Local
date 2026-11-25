@@ -1,3 +1,5 @@
+Gemini Translation Engine has been removed from execution. New translation is temporarily unavailable while Local Translation is prepared; saved translation history remains available in the editor and TTS. Local Translation is not implemented. Backend focused API/recovery checks and frontend build/smoke pass; translation/TTS regression fixtures still require replacement.
+
 # AutoDub Local vNext — Product Updates
 
 TRANS-02C retires Cloudflare and restores Gemini as the sole provider for new translation Runs. Prior Runs retain provenance; retired active Jobs are reconciled and cannot retry. Focused backend tests and frontend build pass with mocks; live providers and Windows browser are NOT RUN. G4 remains previously accepted; G5 remains unaccepted.

@@ -123,7 +123,7 @@ export function TTSPanel({ projectId, revision, isCurrent, locked }: { projectId
     <h3 id="tts-title">Tạo giọng đọc</h3>
     <p className="tts-consent-message">Bản dịch tiếng Việt được gửi đến dịch vụ Edge-TTS để tạo giọng đọc. Video và âm thanh gốc vẫn được lưu trên máy tính.</p>
     <label className="consent-row"><input type="checkbox" checked={consent} onChange={(event) => rememberConsent(event.target.checked)} /> Tôi đồng ý gửi bản dịch đã duyệt đến Edge-TTS.</label>
-    {consent ? <button type="button" className="text-button" onClick={() => rememberConsent(false)}>Thu hồi đồng ý</button> : <small>Đồng ý Edge-TTS độc lập với đồng ý Gemini.</small>}
+    {consent ? <button type="button" className="text-button" onClick={() => rememberConsent(false)}>Thu hồi đồng ý</button> : <small>Đồng ý riêng cho Edge-TTS.</small>}
     <div className="tts-controls">
       <label>Giọng đọc <select value={voice} onChange={(event) => setVoice(event.target.value)} disabled={!voices.length}>{voiceOptions}</select></label>
       <label>Tốc độ <select value={rate} onChange={(event) => setRate(Number(event.target.value))}><option value={-20}>Chậm hơn</option><option value={0}>Bình thường</option><option value={20}>Nhanh hơn</option></select></label>

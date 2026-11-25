@@ -10,7 +10,7 @@ The previous blueprint put a distributed-style SQLite lease/heartbeat system, co
 
 1. One active local Project, file import, configurable data/output folder, FFprobe metadata and source-video player.
 2. ASR with Faster-Whisper; model/language/device selection; GPU use only after capability probe and CPU fallback.
-3. Gemini contextual translation using `gemini-3.1-flash-lite` and the versioned Single-Pass strategy; legacy Two-Pass Runs remain readable, conservative grouping and strict ID mapping.
+3. Translation review and TTS must use a local translation engine. TRANS-03A has removed Gemini execution and temporarily disables new Runs until LOCAL-01A. Historical Gemini/Cloudflare Runs remain readable; this does not implement Local Translation.
 4. Edge-TTS voice/rate preview; bounded retries; generated per-Unit artifact playable as soon as verified; no silent failure substitution; regenerate changed Units only where fingerprints match.
 5. **Simple timing editor as a table**, not multitrack UI: start_us, source window, real TTS duration, allowed shift/gap, overlap/conflict, manual numeric override and seek to video. Limit safe strategies to text reduction/explicit revoice + rate adjustment + bounded gap/offset shift **while source video duration is unchanged**. Conflicts require user action; no automatic video stretch.
 6. Render original-duration MP4 with configurable original-audio mute/gain/ducking, narration gain, optional basic subtitles, output path, quality/encoder and FFprobe validation. Short-range render preview is a desirable MVP deliverable after the first successful full render, not a prerequisite for the first end-to-end gate.

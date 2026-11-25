@@ -95,14 +95,6 @@ async function checked(response: Response) {
       translation_review_required: "Hãy hoàn tất việc kiểm tra lời thoại trước khi dịch.",
       translation_unit_coverage_invalid: "Không thể xác minh đầy đủ các câu lời thoại.",
       translation_no_units: "Không có câu lời thoại cần dịch.",
-      privacy_consent_required: "Cần xác nhận việc gửi lời thoại tới Gemini.",
-      gemini_api_key_missing: "Chưa cấu hình khóa Gemini trong môi trường backend.",
-      gemini_api_key_invalid: "Gemini không chấp nhận khóa API đã cấu hình.",
-      gemini_quota_exceeded: "Gemini đang giới hạn lượt gọi. Bạn có thể thử lại sau.",
-      gemini_network_error: "Không kết nối được Gemini. Hãy kiểm tra mạng rồi thử lại.",
-      gemini_model_unsupported: "Model Gemini hiện không hỗ trợ yêu cầu này.",
-      gemini_response_mapping_invalid: "Gemini trả về thiếu hoặc sai mapping câu. Kết quả chưa được chấp nhận.",
-      gemini_response_schema_invalid: "Gemini trả về dữ liệu không đúng định dạng. Kết quả chưa được chấp nhận.",
       translation_unit_too_long_review_required: "Một đoạn quá dài để gửi an toàn. Hãy chia lời thoại thành các câu nhỏ hơn.",
     };
     const code = body.error?.code;
@@ -280,23 +272,6 @@ export async function reviewTranscriptGroup(projectId: string, revisionId: strin
 
 export async function acceptTranscriptRevision(projectId: string, revision: TranscriptRevision, expectedActiveRevisionId: string | null) {
   return transcriptMutation(`/api/v1/projects/${projectId}/transcripts/revisions/${revision.id}/accept`, { expected_lock_version: revision.lock_version, expected_active_revision_id: expectedActiveRevisionId });
-}
-
-export type TranslationProviderStatus = { default_provider: "gemini"; providers: Record<"gemini", { configured: boolean; model_id: string }> };
-
-export async function fetchTranslationProviders() {
-  const response = await fetch("/api/v1/providers/status", { credentials: "same-origin", cache: "no-store" });
-  await checked(response);
-  return await response.json() as TranslationProviderStatus;
-}
-
-export async function createTranslationJob(projectId: string, revisionId: string, provider: "gemini", consentConfirmed: boolean) {
-  if (!consentConfirmed) throw new Error("Cần xác nhận quyền riêng tư trước khi gửi lời thoại.");
-  const csrf = currentCsrfToken();
-  if (!csrf) throw new Error("Phiên cục bộ chưa sẵn sàng.");
-  const response = await fetch(`/api/v1/projects/${projectId}/translations/jobs`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf, "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ accepted_transcript_revision_id: revisionId, target_language: "vi", provider, privacy_consent_confirmed: consentConfirmed, privacy_consent_provider: consentConfirmed ? provider : null }) });
-  await checked(response);
-  return await response.json() as { run_id: string; job: ASRJob };
 }
 
 export async function fetchTranslationRuns(projectId: string) {

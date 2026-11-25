@@ -79,6 +79,26 @@ class LocalApiSmokeTests(unittest.TestCase):
         self.assertEqual(accepted.status_code, 204)
         self.assertEqual(self.client.get("/api/v1/health", headers=self.headers).status_code, 401)
 
+    def test_translation_creation_is_disabled_without_creating_a_job(self):
+        csrf = self.bootstrap()
+        project_id = "00000000-0000-4000-8000-000000000001"
+        revision_id = "00000000-0000-4000-8000-000000000002"
+        before = self.app.state.database.connect()
+        try:
+            existing = before.execute("SELECT COUNT(*) FROM jobs WHERE kind IN ('gemini_translation','cloudflare_translation')").fetchone()[0]
+        finally:
+            before.close()
+        response = self.client.post(
+            f"/api/v1/projects/{project_id}/translations/jobs",
+            headers={**self.headers, "x-csrf-token": csrf, "idempotency-key": "translation-disabled-api-0001"},
+            json={"accepted_transcript_revision_id": revision_id, "target_language": "vi", "privacy_consent_confirmed": False},
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "translation_engine_unavailable")
+        with closing(self.app.state.database.connect()) as connection:
+            after = connection.execute("SELECT COUNT(*) FROM jobs WHERE kind IN ('gemini_translation','cloudflare_translation')").fetchone()[0]
+        self.assertEqual(after, existing)
+
     def test_openapi_is_not_exposed(self):
         self.bootstrap()
         self.assertEqual(self.client.get("/docs", headers=self.headers).status_code, 404)

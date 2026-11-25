@@ -46,6 +46,12 @@
 - TRANS-01B translation editor implementation slice: immutable provider output and accepted revisions, separate CAS draft, transactional Save All, current-run/active-revision checks, and two-tab UI. Focused revision/migration/session-CSRF tests pass; backend suite and frontend build results are recorded in the CHANGELOG. Browser acceptance NOT RUN.
 - TTS-01A implementation slice: Edge-TTS adapter, accepted-revision batch snapshots, per-Unit verified MP3 artifacts, content-fingerprint reuse, bounded retry/concurrency, preview, cancellation, project-scoped Range playback and minimal consent UI. Synthetic integration tests pass; one real synthetic-text Edge-TTS adapter smoke produced verified non-silent MP3. Browser UI and 50-Unit mixed-outcome acceptance are NOT RUN; G5 remains unaccepted.
 
+### TRANS-03A ? Remove Gemini translation engine (implementation in progress; owner acceptance unchecked)
+- PO approved direct implementation. Gemini provider/worker/request, token/chunk planning, retries/diagnostics, credential module and dependency were removed. Canonical Unit construction and historical Run/Unit reads remain, without provider limits or snapshot fields. New translation Job API returns `translation_engine_unavailable`; Local Translation is not implemented.
+- Retired Gemini/Cloudflare Jobs are reconciled at startup, retries are blocked, and history is retained. Translation UI execution controls/status/consent were removed; the disabled action explains the Local AI transition. Historical editor and TTS paths remain.
+- Schema stays v23; no migration and no database edits outside recovery state updates. Backend compileall, translation-domain (2), focused health/API (13) and recovery (14) tests PASS; frontend build and smoke (2) PASS; startup without Gemini credential env vars PASS. Full backend suite: 118 tests, 9 import errors because legacy translation/TTS fixtures import removed `TranslationWorker`; historical editor/TTS regression is NOT RUN and these tests still need replacement. Full status is recorded in CHANGELOG.
+- [ ] Owner acceptance and remaining regression tests.
+
 ### TRANS-02C - Gemini-only cleanup (pending PO review)
 - PO retired Cloudflare; new Translation Runs use Gemini only. Historical provenance remains readable and unfinished Cloudflare Jobs are retired during recovery. TRANS-02A/B were not accepted. G4 was previously accepted; G5 remains unaccepted. Local AI is a separate future task.
 

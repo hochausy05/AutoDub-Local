@@ -1,6 +1,6 @@
 # 08 — Practical Implementation Roadmap & Acceptance Gates
 
-**State:** Design proposal. **Scope authority:** `docs/14_SCOPE_BASELINE.md`. No implementation or acceptance evidence exists yet. One focused Codex prompt per implementation slice; no mega-prompt.
+**State:** Mixed design and implementation history; see `TASK.md` and `CHANGELOG.md` for verified slices and owner acceptance. **Scope authority:** `docs/14_SCOPE_BASELINE.md`.
 
 ## Dependency chain
 

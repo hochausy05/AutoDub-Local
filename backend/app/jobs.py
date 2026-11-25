@@ -153,7 +153,7 @@ class JobService:
         retry_block_reason = None
         retry_available = False
         if row["status"] in {"FAILED", "INTERRUPTED"}:
-            if row["kind"] == "cloudflare_translation":
+            if row["kind"] in {"gemini_translation", "cloudflare_translation"}:
                 retry_block_reason = "translation_provider_retired"
             elif latest is None or not latest["retryable"]:
                 retry_block_reason = "job_not_retryable"
@@ -174,7 +174,7 @@ class JobService:
                     retry_available = True
             else:
                 retry_available = True
-        if row["kind"] == "cloudflare_translation" and row["status"] == "CANCELLED":
+        if row["kind"] in {"gemini_translation", "cloudflare_translation"} and row["status"] == "CANCELLED":
             retry_block_reason = "translation_provider_retired"
         return {
             "id": row["id"],
@@ -190,7 +190,7 @@ class JobService:
             "attempt": latest,
             "attempts": values,
             "progress": latest["progress"] if latest else None,
-            "error_code": latest["error_code"] if latest else "translation_provider_retired" if row["kind"] == "cloudflare_translation" and row["status"] == "CANCELLED" else None,
+            "error_code": latest["error_code"] if latest else "translation_provider_retired" if row["kind"] in {"gemini_translation", "cloudflare_translation"} and row["status"] == "CANCELLED" else None,
             "retry_available": retry_available,
             "retry_block_reason": retry_block_reason,
             "activation_stage": row["activation_stage"],
@@ -394,7 +394,7 @@ class JobService:
             ).fetchone()
             if job is None:
                 raise JobNotFound
-            if job["kind"] == "cloudflare_translation":
+            if job["kind"] in {"gemini_translation", "cloudflare_translation"}:
                 raise JobConflict("translation_provider_retired")
             previous = connection.execute(
                 "SELECT request_digest FROM idempotency_records WHERE scope=? AND idempotency_key=?",

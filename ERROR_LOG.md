@@ -1,5 +1,10 @@
 # ERROR_LOG — Reproducible Incidents in the New Project
 
+## TRANS-03A — Legacy translation tests import removed worker
+- **Date/time:** 2026-11-25 12:00 UTC+7
+- **Observed:** Full backend `unittest discover` ran 118 tests but reported 9 import errors. `backend/tests/test_translation.py` imports removed `TranslationWorker`; eight TTS tests load that fixture and fail at the same import. This is a test-suite compatibility issue after removing Gemini execution code; no production API error was observed.
+- **Verification:** Focused translation-domain tests (2), health/API tests (13), and recovery tests (14) pass. Backend startup succeeds with Gemini credential environment variables unset. Frontend production build and development smoke tests (2) pass. Historical editor/TTS integration remains unverified until the fixture uses persisted history instead of Gemini execution.
+
 ## TRANS-02C - Recovery rejected invalid queued transition
 - During focused synthetic recovery testing, SQLite rejected a direct QUEUED to FAILED update with `invalid job state transition`; the transaction rolled back.
 - Corrected recovery to transition queued/cancellation-requested retired Jobs to CANCELLED and running Jobs to FAILED, preserving the existing state machine. Recovery regression PASS (14 tests), including queued, running and cancellation-requested cases. No user database was modified by this test.

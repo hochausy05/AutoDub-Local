@@ -1,6 +1,6 @@
 # FILE INDEX — AutoDub Local vNext (project root)
 
-**Design-only skeleton**; source directories are empty placeholders, not executable applications. All user media stays outside this repository. New canonical scope: `docs/14_SCOPE_BASELINE.md`.
+**Implemented local application slices** are tracked in `TASK.md` and `CHANGELOG.md`; no stage is owner-accepted unless explicitly stated. All user media stays outside this repository. Current scope: `docs/14_SCOPE_BASELINE.md`.
 
 ## Root controls
 
@@ -12,15 +12,15 @@
 - `PROJECT_BLUEPRINT.md`: consolidated technical specification (source for detailed report).
 - `BAO_CAO_DU_AN_VI.md`: readable Vietnamese overview (source for Vietnamese report).
 
-## Source skeleton (not implemented)
+## Runtime source
 
-- `backend/app/{api,core,domain,db,services,workers}`, `backend/tests`.
-- `frontend/src/{api,components,features,shared}`, `frontend/public`.
-- `scripts/windows/`, `tests/fixtures/`. Their README/empty placeholders are intentional.
+- `backend/app/`: FastAPI, SQLite, Jobs/recovery, media, ASR, translation history/editor, TTS and artifact services.
+- `backend/tests/`: backend unit and integration tests.
+- `frontend/src/`: React UI and local API clients; `scripts/windows/`: Windows development launcher.
 
 ## Primary scope and specs
 
-- `docs/14_SCOPE_BASELINE.md`: **MVP/V1/V2 authoritative split**.
+- `docs/14_SCOPE_BASELINE.md`: **MVP/V1/V2 authoritative split**; TRANS-03A currently disables new translation until LOCAL-01A.
 - `docs/01_PRODUCT_REQUIREMENTS.md`: MVP product contract.
 - `docs/02_SYSTEM_ARCHITECTURE.md`: architecture details.
 - `docs/03_DATA_AND_STORAGE.md`: SQLite/artifacts; full portable backup is V1.

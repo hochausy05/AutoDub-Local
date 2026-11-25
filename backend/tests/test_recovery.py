@@ -128,7 +128,11 @@ class StartupRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(JobConflict, "translation_provider_retired"):
             jobs.retry_job(old["id"], "FAILED", "retired-retry-key-000001")
         new = jobs.create_job(self.project_id, "gemini_translation", {"schema_version": 1}, "gemini-after-retired-001")
-        self.assertEqual(new["status"], "QUEUED")
+        self.app.state.startup_recovery.reconcile()
+        retired_gemini = jobs.get_job(new["id"])
+        self.assertEqual(retired_gemini["status"], "CANCELLED")
+        self.assertEqual(retired_gemini["error_code"], "translation_provider_retired")
+        self.assertFalse(retired_gemini["retry_available"])
 
     def test_restart_interrupts_running_and_cancel_requested_jobs_idempotently(self):
         running_job = self.create_job()
