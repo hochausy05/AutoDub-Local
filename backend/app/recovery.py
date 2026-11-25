@@ -53,6 +53,7 @@ class StartupRecovery:
                 # A runtime request cannot survive a backend process. Keep its history and cursor,
                 # then let the existing Job retry path continue from committed READY Units.
                 connection.execute("UPDATE local_translation_requests SET status='INTERRUPTED',error_code='process_interrupted',completed_at=? WHERE status='RUNNING'", (stamp,))
+                connection.execute("UPDATE tts_provider_calls SET status='INTERRUPTED',completed_at=?,error_code='process_interrupted' WHERE status='RUNNING' AND job_attempt_id IN (SELECT id FROM job_attempts WHERE status='RUNNING')", (stamp,))
                 local_state_errors = {}
                 local_states = connection.execute("""SELECT s.run_id,r.producer_job_id,s.next_position,
                     SUM(CASE WHEN u.status='READY' THEN 1 ELSE 0 END) AS ready_count,
@@ -84,6 +85,10 @@ class StartupRecovery:
                         (stamp, job["id"], job["status"]),
                     ).rowcount
                     interrupted_jobs += changed
+                    tts_run = connection.execute("SELECT id FROM tts_runs WHERE producer_job_id=?", (job["id"],)).fetchone()
+                    if tts_run:
+                        connection.execute("UPDATE tts_run_units SET status='QUEUED',retryable=1,error_code='process_interrupted',updated_at=? WHERE tts_run_id=? AND status='RUNNING'", (stamp,tts_run["id"]))
+                        connection.execute("UPDATE tts_runs SET status=CASE WHEN EXISTS(SELECT 1 FROM tts_run_units WHERE tts_run_id=? AND status='READY') THEN 'PARTIAL' ELSE 'FAILED' END,completed_at=? WHERE id=? AND status NOT IN ('READY','STALE','CANCELLED')", (tts_run["id"],stamp,tts_run["id"]))
                     if local_error:
                         connection.execute("UPDATE translation_runs SET status='FAILED',error_code='local_recovery_state_invalid',completed_at=? WHERE id=? AND status NOT IN ('READY','STALE')",(stamp,local_state_errors[job["id"]]))
                     elif connection.execute("SELECT 1 FROM jobs WHERE id=? AND kind='local_translation'",(job["id"],)).fetchone():
@@ -103,6 +108,10 @@ class StartupRecovery:
                            WHERE id=? AND status IN ('CANCELLED','READY','FAILED')""",
                         (stamp, job["id"]),
                     ).rowcount
+                    tts_run = connection.execute("SELECT id FROM tts_runs WHERE producer_job_id=?", (job["id"],)).fetchone()
+                    if tts_run:
+                        connection.execute("UPDATE tts_run_units SET status='QUEUED',retryable=1,error_code='process_interrupted',updated_at=? WHERE tts_run_id=? AND status='RUNNING'", (stamp,tts_run["id"]))
+                        connection.execute("UPDATE tts_runs SET status=CASE WHEN EXISTS(SELECT 1 FROM tts_run_units WHERE tts_run_id=? AND status='READY') THEN 'PARTIAL' ELSE 'FAILED' END,completed_at=? WHERE id=? AND status NOT IN ('READY','STALE','CANCELLED')", (tts_run["id"],stamp,tts_run["id"]))
                 connection.commit()
             except BaseException:
                 connection.rollback()

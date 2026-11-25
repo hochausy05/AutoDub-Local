@@ -81,6 +81,8 @@
 - [ ] Voice/rate preview, bounded concurrency and error diagnostics.
 - [ ] Publish genuine verified audio per Unit immediately, allow play while other Units run.
 - [ ] Reuse unchanged Unit artifacts, never silently truncate or insert fake silence.
+- [x] **TTS-01B provider qualification run:** real direct/adapter calls, bounded concurrency comparison, selective delayed recovery and isolated Preview API pipeline are recorded in CHANGELOG. Matrix stopped safely after three consecutive `NoAudioReceived`; Tests E/F remain NOT RUN. No production code or dependency changes.
+- [x] **TTS-01C reliability/control slice:** migration v25 adds content-free per-call diagnostics; batch Job/stage/Run/Unit creation is transactional with compact hashed snapshots; synthesis uses global cancellable pacing and up to three separated rounds, preserves ready Units, records recovery, and gates retry eligibility. Preview shares pacing/retry policy; UI syncs active preview and locks settings during work. Focused backend regressions and frontend build recorded in CHANGELOG; G5 remains pending.
 - [ ] **G5:** Mixed 50-Unit case, retry/cancel/replay and audio identity tests.
 
 ### SYNC-01 — Simple sync table

@@ -15,7 +15,7 @@ from app.database import Database, SCHEMA_VERSION
 from app.main import create_app
 from app.jobs import JobService
 from app.recovery import StartupRecovery
-from app.tts import EdgeTTSAdapter, TTSError, TTSService, TTSWorker
+from app.tts import EdgeTTSAdapter, TTSError, TTSService, TTSWorker, _RequestPacer
 from app.translation_revisions import TranslationRevisionService
 
 
@@ -71,6 +71,22 @@ class TTSIntegrationTests(unittest.TestCase):
         self.assertEqual(first["run_id"], replay["run_id"])
         self.assertEqual(first["job"]["id"], replay["job"]["id"])
 
+    def test_batch_creation_rollback_keeps_stage_pointer_and_job_rows_unchanged(self):
+        snapshot = {"schema_version": 1, "kind": "edge_tts_batch", "unit_count": 2, "units_sha256": "a" * 64}
+        with closing(self.db.connect()) as connection:
+            before_jobs = connection.execute("SELECT COUNT(*) FROM jobs WHERE project_id=? AND kind='edge_tts_batch'", (self.project["id"],)).fetchone()[0]
+            before_stage = connection.execute("SELECT input_fingerprint,input_generation FROM stage_pointers WHERE project_id=? AND stage='tts'", (self.project["id"],)).fetchone()
+        def fail_hook(_connection, _job_id):
+            raise RuntimeError("synthetic rollback")
+        with self.assertRaisesRegex(RuntimeError, "synthetic rollback"):
+            self.jobs.create_job(self.project["id"],"edge_tts_batch",snapshot,"tts-atomic-rollback-0001",
+                activation_stage="tts",update_stage_input="tts",creation_hook=fail_hook)
+        with closing(self.db.connect()) as connection:
+            after_jobs = connection.execute("SELECT COUNT(*) FROM jobs WHERE project_id=? AND kind='edge_tts_batch'", (self.project["id"],)).fetchone()[0]
+            after_stage = connection.execute("SELECT input_fingerprint,input_generation FROM stage_pointers WHERE project_id=? AND stage='tts'", (self.project["id"],)).fetchone()
+        self.assertEqual(after_jobs,before_jobs)
+        self.assertEqual(tuple(after_stage) if after_stage else None,tuple(before_stage) if before_stage else None)
+
     def test_verified_unit_audio_and_projected_duration(self):
         created = self._create("tts-verified-key-00001")
         self.assertTrue(self.tts_worker.run_once())
@@ -97,23 +113,19 @@ class TTSIntegrationTests(unittest.TestCase):
         self.assertEqual(recovered["status"], "READY")
         self.assertEqual(recovered["progress"]["ready_units"], len(run["units"]))
 
-    def test_batch_retry_keeps_ready_units_and_retries_only_retryable_failure(self):
+    def test_batch_retries_only_failed_retryable_unit_across_bounded_rounds(self):
         accepted = self.translation_revisions.editor_state(self.project["id"], self.translation_run_id)["accepted"]
         failing_text = accepted["units"][1]["final_text"]
         self.tts_adapter.fail_text = failing_text
-        self.tts_adapter.fail_calls = 2  # Exhaust the single automatic retry.
+        self.tts_adapter.fail_calls = 2  # Two failed rounds; third round succeeds.
         created = self._create("tts-retry-key-000001", accepted["id"])
         self.assertTrue(self.tts_worker.run_once())
-        partial = self.tts.get_run(self.project["id"], created["run_id"])
-        self.assertEqual(partial["progress"]["ready_units"], partial["progress"]["total_units"] - 1)
-        failed = next(unit for unit in partial["units"] if unit["status"] == "FAILED")
-        self.assertEqual(failed["error_code"], "tts_provider_timeout")
-        self.assertTrue(failed["retryable"])
-        self.jobs.retry_job(created["job"]["id"], "FAILED", "tts-retry-attempt-key-01")
-        self.assertTrue(self.tts_worker.run_once())
         ready = self.tts.get_run(self.project["id"], created["run_id"])
-        self.assertEqual(ready["status"], "READY")
+        self.assertEqual(ready["status"], "READY", ready)
         self.assertEqual(len(self.tts_adapter.calls), 5)
+        with closing(self.db.connect()) as connection:
+            calls = connection.execute("SELECT round_no,status FROM tts_provider_calls WHERE tts_run_id=? AND unit_id=? ORDER BY call_no", (created["run_id"], accepted["units"][1]["unit_id"])).fetchall()
+        self.assertEqual([(row["round_no"], row["status"]) for row in calls], [(1, "FAILED"), (2, "FAILED"), (3, "READY")])
 
     def test_unchanged_units_reuse_artifacts_when_accepted_revision_changes(self):
         initial = self._create("tts-cache-first-key-01")
@@ -147,6 +159,22 @@ class TTSIntegrationTests(unittest.TestCase):
         run = self.tts.get_run(self.project["id"], created["run_id"])
         self.assertEqual(run["status"], "CANCELLED")
         self.assertEqual({unit["status"] for unit in run["units"]}, {"CANCELLED"})
+
+    def test_recovery_interrupts_call_and_requeues_only_running_tts_unit(self):
+        created = self._create("tts-recovery-key-00001")
+        claimed = self.jobs.claim_next_job(kind="edge_tts_batch")
+        self.assertEqual(claimed["id"], created["job"]["id"])
+        attempt_id = claimed["attempt"]["id"]
+        with closing(self.db.connect()) as connection:
+            unit = connection.execute("SELECT unit_id FROM tts_run_units WHERE tts_run_id=? ORDER BY position LIMIT 1", (created["run_id"],)).fetchone()
+            connection.execute("UPDATE tts_run_units SET status='RUNNING' WHERE tts_run_id=? AND unit_id=?", (created["run_id"], unit["unit_id"]))
+            connection.execute("INSERT INTO tts_provider_calls(id,project_id,tts_run_id,unit_id,job_attempt_id,call_kind,round_no,call_no,status,started_at) VALUES(?,?,?,?,?,'batch_unit',1,1,'RUNNING',?)", (str(uuid.uuid4()),self.project["id"],created["run_id"],unit["unit_id"],attempt_id,"2026-01-01T00:00:00Z"))
+        StartupRecovery(self.db, self.jobs, self.artifacts).reconcile()
+        with closing(self.db.connect()) as connection:
+            unit_status = connection.execute("SELECT status,retryable FROM tts_run_units WHERE tts_run_id=? AND unit_id=?", (created["run_id"],unit["unit_id"])).fetchone()
+            call_status = connection.execute("SELECT status,error_code FROM tts_provider_calls WHERE job_attempt_id=?", (attempt_id,)).fetchone()
+        self.assertEqual((unit_status["status"],unit_status["retryable"]), ("QUEUED",1))
+        self.assertEqual((call_status["status"],call_status["error_code"]), ("INTERRUPTED","process_interrupted"))
 
     def test_preview_is_separate_verified_cached_artifact(self):
         config = {"voice": "vi-VN-NamMinhNeural", "rate_percent": 0}
@@ -191,7 +219,10 @@ class TTSIntegrationTests(unittest.TestCase):
                     break
                 time.sleep(0.05)
             self.assertIsNotNone(body)
-            self.assertEqual(body["status"], "READY")
+            if body["status"] != "READY":
+                with closing(self.db.connect()) as connection:
+                    diagnostics = [dict(row) for row in connection.execute("SELECT call_kind,round_no,call_no,status,error_code,exception_class,http_status FROM tts_provider_calls WHERE tts_run_id=?", (run_id,)).fetchall()]
+                self.fail(f"TTS run did not complete: status={body['status']}; safe diagnostics={diagnostics}")
             unit_id = body["units"][0]["unit_id"]
             url = f"/api/v1/projects/{self.project['id']}/tts/runs/{run_id}/units/{unit_id}/audio"
             ranged = client.get(url, headers={**base_headers, "Range": "bytes=0-63"})
@@ -201,6 +232,17 @@ class TTSIntegrationTests(unittest.TestCase):
 
 
 class TTSAdapterContractTests(unittest.TestCase):
+    def test_request_pacer_spaces_calls_and_checks_cancellation(self):
+        pacer = _RequestPacer()
+        with patch("app.tts.TTS_REQUEST_INTERVAL_SECONDS", 0.03):
+            pacer.wait_turn(lambda: False)
+            started = time.monotonic()
+            pacer.wait_turn(lambda: False)
+            self.assertGreaterEqual(time.monotonic() - started, 0.02)
+            with self.assertRaises(TTSError) as caught:
+                pacer.wait_turn(lambda: True)
+        self.assertEqual(caught.exception.code, "job_cancelled")
+
     def test_text_integrity_rejects_lossy_transform_and_preserves_unicode(self):
         self.assertEqual(EdgeTTSAdapter._validate_text_integrity("Xin chào — tiếng Việt."), "Xin chào — tiếng Việt.")
         self.assertEqual(EdgeTTSAdapter._validate_text_integrity("câu\x00nối"), "câu nối")

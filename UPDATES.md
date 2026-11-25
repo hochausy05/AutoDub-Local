@@ -2,6 +2,8 @@ LOCAL-01B verified real Windows inference through the Local Translation API with
 
 # AutoDub Local vNext — Product Updates
 
+TTS-01C adds safer Edge-TTS operation: paced, bounded retries; visible round and retry state; active Preview recovery after reload; and controls locked while synthesis is active. Verified Unit audio remains playable during a batch. Only synthetic adapters were used for automated checks; live provider and browser acceptance were not run. G5 remains unaccepted.
+
 TRANS-02C retires Cloudflare and restores Gemini as the sole provider for new translation Runs. Prior Runs retain provenance; retired active Jobs are reconciled and cannot retry. Focused backend tests and frontend build pass with mocks; live providers and Windows browser are NOT RUN. G4 remains previously accepted; G5 remains unaccepted.
 
 TTS-01A adds a working Edge-TTS voice panel for an active accepted translation: live Vietnamese voice catalog, explicit Edge-specific consent, actual voice preview, one-action per-Unit batch, measured MP3 duration, selective retry, cancellation, reuse of unchanged verified Unit artifacts and project-scoped audio playback. Automated synthetic integration tests passed, and one real synthetic-text provider smoke produced a verified non-silent MP3. Windows browser visual acceptance and the 50-Unit mixed-outcome G5 gate remain NOT RUN; G5 is not accepted.

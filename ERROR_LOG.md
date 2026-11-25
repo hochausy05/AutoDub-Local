@@ -1,5 +1,17 @@
 # ERROR_LOG — Reproducible Incidents in the New Project
 
+## TTS-01C — Per-call diagnostic INSERT had a placeholder mismatch (resolved)
+- **Date/time:** 2026-11-25 22:39 UTC+7
+- **Observed:** Focused synthetic TTS retry tests intermittently ended Units as `tts_unit_failed` before the adapter call began; the per-call diagnostics INSERT supplied one extra value.
+- **Resolution/verification:** Corrected the INSERT column/value mapping. The three-round retry regression now records FAILED/FAILED/READY across rounds 1/2/3; the complete 14-test TTS suite and focused recovery checks pass.
+- **Scope:** Test-only synthetic adapter and temporary test databases; no provider request or user data was involved.
+
+## TTS-01B — Edge-TTS intermittently returned no audio (observed; root cause inconclusive)
+- **Date/time:** 2026-11-25 21:50–21:55 UTC+7
+- **Observed:** In synthetic Windows provider qualification, direct Edge-TTS and the application adapter both intermittently raised `NoAudioReceived` / `tts_no_audio_received`. A direct NamMinh/+20% group had 10/12 valid audio files; sequential adapter had 11/12; adapter concurrency 3 had 11/12. A NamMinh/0% direct group was stopped after 11 attempts at 6 successes, 5 NoAudioReceived and three consecutive failures. No HTTP 429, HTTP status, Retry-After or WebSocket close code was exposed.
+- **Recovery evidence:** Two case-specific repeats succeeded after longer waits (one after 15 seconds; another after 1 second); this does not establish an optimal retry delay. Current isolated Preview API → Worker → artifact validation/publication → result/playback path passed and did not reproduce the earlier Preview failure.
+- **Scope/limitation:** Only synthetic text/audio in a temporary directory/DataRoot was used. Test E/F and browser playback were stopped/not run. No production code, dependency, configuration, user database or user audio was changed. See TTS-01B in CHANGELOG and `%TEMP%\tts01b-provider-eo1l5cin\diagnostics.json` for per-request results.
+
 ## LOCAL-01B — Runtime version probe read the wrong output stream (resolved)
 - **Date/time:** 2026-11-25 16:03 UTC+7
 - **Observed:** The installed `llama-server.exe --version` exits successfully and reports `build 12676` on stderr with empty stdout. The first synthetic Local Translation Job therefore failed before model loading with `local_runtime_version_mismatch`.

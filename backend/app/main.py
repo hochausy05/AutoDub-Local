@@ -991,6 +991,18 @@ def create_app(
         except ValueError:return api_error(422,"invalid_project_id","Project ID phải là UUID chuẩn.")
         except TTSError as exc:return tts_exception(exc)
 
+    @app.get("/api/v1/projects/{project_id}/tts/activity")
+    def get_tts_activity(project_id: str, request: Request):
+        current=require_session(request)
+        if isinstance(current,JSONResponse):return current
+        try:
+            project=uuid.UUID(project_id)
+            if str(project)!=project_id.lower():raise ValueError
+            if database.get_project(str(project)) is None:return api_error(404,"project_not_found","Project không tồn tại.")
+            return {"run":tts_service.latest_run(str(project)),"preview":tts_service.active_preview(str(project))}
+        except ValueError:return api_error(422,"invalid_project_id","Project ID phải là UUID chuẩn.")
+        except (TTSError,JobNotFound) as exc:return tts_exception(exc)
+
     @app.get("/api/v1/projects/{project_id}/tts/runs/{run_id}")
     def get_tts_run(project_id: str, run_id: str, request: Request):
         current=require_session(request)

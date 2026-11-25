@@ -157,6 +157,10 @@ class JobService:
                 retry_block_reason = "translation_provider_retired"
             elif latest is None or not latest["retryable"]:
                 retry_block_reason = "job_not_retryable"
+            elif row["kind"] == "edge_tts_batch" and not connection.execute(
+                "SELECT 1 FROM tts_run_units u JOIN tts_runs r ON r.id=u.tts_run_id WHERE r.producer_job_id=? AND (u.status='QUEUED' OR (u.status='FAILED' AND u.retryable=1)) LIMIT 1", (job_id,)
+            ).fetchone():
+                retry_block_reason = "tts_no_retryable_units"
             elif len(values) >= MAX_ATTEMPTS:
                 retry_block_reason = "retry_limit_reached"
             elif latest["retry_after_at"] and latest["retry_after_at"] > utc_now():
@@ -239,7 +243,7 @@ class JobService:
         self, project_id: str, kind: str, input_snapshot: dict[str, Any], idempotency_key: str,
         *, activation_stage: ActivationStage | str | None = None,
         creation_hook: Callable[[sqlite3.Connection, str], None] | None = None,
-        update_stage_input: bool = False,
+        update_stage_input: bool | str = False,
         request_digest_value: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         project_id = self._uuid(project_id, "project_id")
@@ -256,7 +260,8 @@ class JobService:
         snapshot_json = self._canonical(input_snapshot)
         if len(snapshot_json.encode("utf-8")) > MAX_SNAPSHOT_BYTES:
             raise JobInputError("input_snapshot_too_large")
-        if update_stage_input and activation_stage != ActivationStage.TRANSLATION.value:
+        update_stage = ActivationStage.TRANSLATION.value if update_stage_input is True else update_stage_input if update_stage_input else None
+        if update_stage and (not isinstance(update_stage, str) or update_stage != activation_stage):
             raise JobInputError("invalid_activation_stage")
         request_digest = self._digest(request_digest_value if request_digest_value is not None else {"project_id": project_id, "kind": kind, "input_snapshot": input_snapshot, "activation_stage": activation_stage})
         input_fingerprint = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
@@ -283,8 +288,13 @@ class JobService:
                 if active_translation:
                     raise JobConflict("job_already_active")
 
-            if update_stage_input:
-                self._set_stage_input_in_transaction(connection, project_id, "translation", input_fingerprint)
+            if kind in {"edge_tts_batch", "edge_tts_preview"}:
+                active_tts = connection.execute("SELECT id FROM jobs WHERE project_id=? AND kind IN ('edge_tts_batch','edge_tts_preview') AND status IN ('QUEUED','RUNNING','CANCEL_REQUESTED') LIMIT 1", (project_id,)).fetchone()
+                if active_tts:
+                    raise JobConflict("tts_job_already_active")
+
+            if update_stage:
+                self._set_stage_input_in_transaction(connection, project_id, update_stage, input_fingerprint)
 
             expected_input_generation = None
             expected_pointer_generation = None
@@ -424,6 +434,12 @@ class JobService:
                 ).fetchone()
                 if active:
                     raise JobConflict("job_already_active")
+            if job["kind"] in {"edge_tts_batch", "edge_tts_preview"}:
+                active = connection.execute("SELECT id FROM jobs WHERE project_id=? AND id<>? AND kind IN ('edge_tts_batch','edge_tts_preview') AND status IN ('QUEUED','RUNNING','CANCEL_REQUESTED') LIMIT 1", (job["project_id"], job_id)).fetchone()
+                if active:
+                    raise JobConflict("job_already_active")
+            if job["kind"] == "edge_tts_batch" and not connection.execute("SELECT 1 FROM tts_run_units u JOIN tts_runs r ON r.id=u.tts_run_id WHERE r.producer_job_id=? AND (u.status='QUEUED' OR (u.status='FAILED' AND u.retryable=1)) LIMIT 1", (job_id,)).fetchone():
+                raise JobConflict("tts_no_retryable_units")
             latest_attempt = connection.execute(
                 "SELECT retryable,retry_after_at FROM job_attempts WHERE job_id=? ORDER BY attempt_no DESC LIMIT 1", (job_id,)
             ).fetchone()
@@ -458,7 +474,7 @@ class JobService:
     def update_attempt_progress(self, job_id: str, attempt_id: str, progress: dict[str, Any]) -> dict[str, Any]:
         job_id = self._uuid(job_id, "job_id")
         attempt_id = self._uuid(attempt_id, "attempt_id")
-        if not isinstance(progress, dict) or set(progress) - {"phase", "completed_units", "total_units", "fraction", "retry_after_at"}:
+        if not isinstance(progress, dict) or set(progress) - {"phase", "completed_units", "total_units", "fraction", "retry_after_at", "current_round", "round_count", "running_units", "queued_units", "failed_units"}:
             raise JobInputError("invalid_progress")
         phase = progress.get("phase")
         if phase is not None and (not isinstance(phase, str) or not _PHASE.fullmatch(phase)):
@@ -469,6 +485,12 @@ class JobService:
             raise JobInputError("invalid_progress")
         if completed is not None and (type(completed) is not int or type(total) is not int or completed < 0 or total < completed):
             raise JobInputError("invalid_progress")
+        for field in ("current_round", "round_count", "running_units", "queued_units", "failed_units"):
+            value = progress.get(field)
+            if value is not None and (type(value) is not int or value < 0 or
+                (field in {"current_round", "round_count"} and not 1 <= value <= 3) or
+                (field.endswith("_units") and total is not None and value > total)):
+                raise JobInputError("invalid_progress")
         fraction = progress.get("fraction")
         if fraction is not None and (isinstance(fraction, bool) or not isinstance(fraction, (float, int)) or not math.isfinite(fraction) or not 0 <= fraction <= 1):
             raise JobInputError("invalid_progress")

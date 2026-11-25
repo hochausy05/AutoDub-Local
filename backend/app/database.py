@@ -14,7 +14,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 BUSY_TIMEOUT_MS = 5000
 
 
@@ -845,6 +845,46 @@ class Database:
 
         if target_version >= 24:
             self._migrate_v24()
+        if target_version >= 25:
+            self._migrate_v25()
+
+    def _migrate_v25(self) -> None:
+        """Add private, content-free per-call TTS diagnostics."""
+        with closing(self.connect()) as connection:
+            current = connection.execute("SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0]
+            if current >= 25:
+                return
+            if current != 24:
+                raise RuntimeError(f"Migration v25 requires schema v24, found {current}.")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute("""CREATE TABLE tts_provider_calls (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    project_id TEXT NOT NULL,
+                    tts_run_id TEXT,
+                    unit_id TEXT,
+                    job_attempt_id TEXT NOT NULL REFERENCES job_attempts(id) ON DELETE RESTRICT,
+                    call_kind TEXT NOT NULL CHECK(call_kind IN ('batch_unit','preview')),
+                    round_no INTEGER NOT NULL CHECK(round_no BETWEEN 1 AND 3),
+                    call_no INTEGER NOT NULL CHECK(call_no>=1),
+                    status TEXT NOT NULL CHECK(status IN ('RUNNING','READY','FAILED','CANCELLED','INTERRUPTED')),
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    elapsed_ms INTEGER CHECK(elapsed_ms IS NULL OR elapsed_ms>=0),
+                    error_code TEXT,
+                    exception_class TEXT,
+                    http_status INTEGER CHECK(http_status IS NULL OR http_status BETWEEN 100 AND 599),
+                    retry_after TEXT,
+                    CHECK((tts_run_id IS NULL)=(unit_id IS NULL)),
+                    FOREIGN KEY(project_id,tts_run_id) REFERENCES tts_runs(project_id,id) ON DELETE RESTRICT,
+                    FOREIGN KEY(tts_run_id,unit_id) REFERENCES tts_run_units(tts_run_id,unit_id) ON DELETE RESTRICT
+                )""")
+                connection.execute("CREATE INDEX tts_provider_calls_unit_idx ON tts_provider_calls(tts_run_id,unit_id,call_no)")
+                connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(25,?)", (utc_now(),))
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
 
     def _migrate_v24(self) -> None:
         """Rebuild only Translation tables with FK checks around the atomic swap."""

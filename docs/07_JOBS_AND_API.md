@@ -34,6 +34,7 @@ FastAPI on `http://127.0.0.1:8000/api/v1`, strictly local. Responses JSON valida
 | `GET` | `/tts/voices?provider=edge` | Current voice options (cacheable) |
 | `POST` | `/tts/previews` | Cached sample by config |
 | `POST` | `/projects/{id}/tts/jobs` | Generate selected/all stale Units |
+| `GET` | `/projects/{id}/tts/activity` | Restore latest TTS Run and active Preview after UI reload |
 | `GET` | `/projects/{id}/tts/units/{unit_id}/audio` | Local artifact stream after active-revision check |
 | `POST` | `/projects/{id}/sync/plans` | Compute conflict plan |
 | `PATCH` | `/projects/{id}/sync/plans/{plan_id}` | Save manual decisions |
@@ -147,5 +148,7 @@ Use secure `GET .../stream`, `206 Partial Content`, correct `Content-Range`, MIM
 TanStack Query refreshes safe read endpoints; SSE or polling for progress. UI uses request generations to ignore late responses. Dirty edits persist in local UI until explicit Save All; on revision conflict show diff/resolve, don't discard local draft.
 
 ## 9. Observability
+
+Implemented TTS reliability controls use the shared Job/Attempt lifecycle. Batch creation updates the TTS stage input and creates the Job, immutable Run and Units in one SQLite transaction. The Job snapshot stores configuration and source/revision identity plus Unit count/hash; Unit dialogue remains in `tts_run_units`. Synthesis uses a process-wide minimum one-second request start interval, at most three concurrent calls, and up to three rounds with at least five seconds between retry rounds. Only failed retryable Units are retried; verified Units remain reusable. Per-call `tts_provider_calls` rows retain timing, safe error metadata, HTTP status and Retry-After without source text or URLs. Startup recovery marks in-flight calls interrupted and requeues only in-flight Units while preserving verified audio. G5 remains pending owner acceptance.
 
 JSONL Job logs with `job_id`, attempt, timestamp UTC, stage, duration, device, sanitized error code; secret/media text omitted. Metrics time to first preview, time to first unit READY, total runtime, rendering fps and optional GPU utilization. Separate cold vs warm; no invented percent progress for Gemini/Edge latency.
