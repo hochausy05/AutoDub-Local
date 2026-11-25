@@ -50,6 +50,19 @@ class StartupRecovery:
                 connection.execute("UPDATE jobs SET status='CANCELLED',cancel_requested=1,lock_version=lock_version+1,updated_at=? WHERE kind IN ('gemini_translation','cloudflare_translation') AND status IN ('QUEUED','CANCEL_REQUESTED')", (stamp,))
                 connection.execute("UPDATE jobs SET status='FAILED',cancel_requested=0,lock_version=lock_version+1,updated_at=? WHERE kind IN ('gemini_translation','cloudflare_translation') AND status='RUNNING'", (stamp,))
                 connection.execute("UPDATE translation_runs SET error_code='translation_provider_retired' WHERE status NOT IN ('READY','STALE') AND producer_job_id IN (SELECT id FROM jobs WHERE kind IN ('gemini_translation','cloudflare_translation') AND status IN ('FAILED','INTERRUPTED','CANCELLED'))")
+                # A runtime request cannot survive a backend process. Keep its history and cursor,
+                # then let the existing Job retry path continue from committed READY Units.
+                connection.execute("UPDATE local_translation_requests SET status='INTERRUPTED',error_code='process_interrupted',completed_at=? WHERE status='RUNNING'", (stamp,))
+                local_state_errors = {}
+                local_states = connection.execute("""SELECT s.run_id,r.producer_job_id,s.next_position,
+                    SUM(CASE WHEN u.status='READY' THEN 1 ELSE 0 END) AS ready_count,
+                    SUM(CASE WHEN u.position>=s.next_position AND u.status='READY' THEN 1 ELSE 0 END) AS ready_after_cursor,
+                    SUM(CASE WHEN u.position<s.next_position AND u.status<>'READY' THEN 1 ELSE 0 END) AS missing_before_cursor
+                    FROM local_translation_state s JOIN translation_runs r ON r.id=s.run_id
+                    JOIN translation_units u ON u.run_id=s.run_id GROUP BY s.run_id""").fetchall()
+                for state in local_states:
+                    if state["ready_count"] != state["next_position"] or state["ready_after_cursor"] or state["missing_before_cursor"]:
+                        local_state_errors[state["producer_job_id"]] = state["run_id"]
                 rows = connection.execute(
                     """SELECT j.id,j.status,
                               EXISTS(SELECT 1 FROM job_attempts a WHERE a.job_id=j.id AND a.status='RUNNING') AS has_running
@@ -59,10 +72,11 @@ class StartupRecovery:
                        ORDER BY j.created_at,j.id"""
                 ).fetchall()
                 for job in rows:
+                    local_error = job["id"] in local_state_errors
                     interrupted_attempts += connection.execute(
-                        """UPDATE job_attempts SET status='INTERRUPTED',ended_at=?,error_code='process_interrupted',retryable=1
+                        """UPDATE job_attempts SET status='INTERRUPTED',ended_at=?,error_code=?,retryable=?
                            WHERE job_id=? AND status='RUNNING'""",
-                        (stamp, job["id"]),
+                        (stamp, "local_recovery_state_invalid" if local_error else "process_interrupted", 0 if local_error else 1, job["id"]),
                     ).rowcount
                     changed = connection.execute(
                         """UPDATE jobs SET status='INTERRUPTED',cancel_requested=0,lock_version=lock_version+1,updated_at=?
@@ -70,6 +84,10 @@ class StartupRecovery:
                         (stamp, job["id"], job["status"]),
                     ).rowcount
                     interrupted_jobs += changed
+                    if local_error:
+                        connection.execute("UPDATE translation_runs SET status='FAILED',error_code='local_recovery_state_invalid',completed_at=? WHERE id=? AND status NOT IN ('READY','STALE')",(stamp,local_state_errors[job["id"]]))
+                    elif connection.execute("SELECT 1 FROM jobs WHERE id=? AND kind='local_translation'",(job["id"],)).fetchone():
+                        connection.execute("UPDATE translation_runs SET status='FAILED',error_code='process_interrupted',completed_at=? WHERE producer_job_id=? AND status NOT IN ('READY','STALE')",(stamp,job["id"]))
                 inconsistent_terminal = connection.execute(
                     """SELECT j.id FROM jobs j WHERE j.status IN ('CANCELLED','READY','FAILED','INTERRUPTED')
                          AND EXISTS(SELECT 1 FROM job_attempts a WHERE a.job_id=j.id AND a.status='RUNNING')"""

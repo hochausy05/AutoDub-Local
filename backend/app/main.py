@@ -8,7 +8,7 @@ import os
 import secrets
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal
@@ -18,7 +18,7 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from app.database import Database, IdempotencyConflict
+from app.database import Database, IdempotencyConflict, utc_now
 from app.artifacts import ArtifactError, ArtifactPublicationService
 from app.jobs import JobConflict, JobInputError, JobNotFound, JobService
 from app.recovery import StartupRecovery
@@ -28,6 +28,7 @@ from app.transcripts import TranscriptError, TranscriptService
 from app.translation import TranslationError, TranslationService, TranslationArtifactValidator
 from app.translation_revisions import TranslationRevisionError, TranslationRevisionService
 from app.tts import TTSError, TTSService, TTSWorker
+from app.translation.worker import LocalTranslationService, LocalTranslationWorker
 
 
 SESSION_COOKIE = "autodub_session"
@@ -153,6 +154,12 @@ class ASRJobRequest(BaseModel):
     allow_model_download: bool = False
 
 
+class TranslationJobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    accepted_transcript_revision_id: uuid.UUID
+    target_language: Literal["vi"] = "vi"
+
+
 class ProcessingSourceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     media_asset_id: uuid.UUID
@@ -267,6 +274,8 @@ def create_app(
     transcript_service = TranscriptService(database)
     artifact_service.validators["translation_json"] = TranslationArtifactValidator(database)
     translation_service = TranslationService(database, job_service)
+    local_translation_service = LocalTranslationService(database, job_service, artifact_service)
+    local_translation_worker = LocalTranslationWorker(local_translation_service)
     translation_revision_service = TranslationRevisionService(database)
     tts_service = TTSService(database, job_service, artifact_service, translation_revision_service)
     tts_worker = TTSWorker(tts_service)
@@ -279,11 +288,13 @@ def create_app(
         _app.state.recovery_report["media_assets_recovered"] = media_service.reconcile_pending_assets()
         media_worker.start()
         asr_worker.start()
+        local_translation_worker.start()
         tts_worker.start()
         try:
             yield
         finally:
             tts_worker.stop()
+            local_translation_worker.stop()
             asr_worker.stop()
             media_worker.stop()
 
@@ -296,6 +307,8 @@ def create_app(
     )
     app.state.transcript_service = transcript_service
     app.state.translation_service = translation_service
+    app.state.local_translation_service = local_translation_service
+    app.state.local_translation_worker = local_translation_worker
     app.state.translation_revision_service = translation_revision_service
     app.state.tts_service = tts_service
     app.state.tts_worker = tts_worker
@@ -806,11 +819,36 @@ def create_app(
             return transcript_exception(exc)
 
     @app.post("/api/v1/projects/{project_id}/translations/jobs", status_code=202)
-    def create_translation_job(project_id: str, request: Request):
+    def create_translation_job(project_id: str, body: TranslationJobRequest, request: Request):
         current = require_mutation_session(request)
         if isinstance(current, JSONResponse):
             return current
-        return api_error(503, "translation_engine_unavailable", "Chức năng dịch đang được chuyển sang AI Local.")
+        try:
+            project = uuid.UUID(project_id)
+            if str(project) != project_id.lower(): raise ValueError
+        except ValueError:
+            return api_error(422, "invalid_project_id", "Project ID không hợp lệ.")
+        if database.get_project(str(project)) is None:
+            return api_error(404, "project_not_found", "Project không tồn tại.")
+        if local_translation_service.cleanup_blocked:
+            return api_error(503, "local_runtime_cleanup_failed", "AI Local chưa xác nhận đã dừng; chưa thể chạy Job dịch mới.")
+        try:
+            result = translation_service.create_local_job(str(project), str(body.accepted_transcript_revision_id), request.headers.get("idempotency-key", ""))
+            return JSONResponse(status_code=202, content=result)
+        except (TranslationError, JobInputError, JobConflict, IdempotencyConflict) as exc:
+            code = getattr(exc, "code", "idempotency_key_reused" if isinstance(exc, IdempotencyConflict) else "translation_job_invalid")
+            status = getattr(exc, "status", 422)
+            if code == "job_already_active": status = 409
+            return api_error(status, code, "Không thể tạo bản dịch Local với đầu vào hiện hành.")
+
+    @app.get("/api/v1/translations/status")
+    def local_translation_status(request: Request):
+        current = require_session(request)
+        if isinstance(current, JSONResponse): return current
+        status = translation_service.local_status()
+        if local_translation_service.cleanup_blocked:
+            return {**status, "configured": False, "error_code": "local_runtime_cleanup_failed"}
+        return status
 
     @app.get("/api/v1/projects/{project_id}/translations/runs")
     def list_translation_runs(project_id: str, request: Request):
@@ -1202,6 +1240,9 @@ def create_app(
             result = job_service.request_cancel(job_id, key)
             if job.get("kind") == "edge_tts_batch":
                 tts_service.reconcile_cancelled_job(job_id)
+            elif job.get("kind") == "local_translation" and result["status"] == "CANCELLED":
+                with closing(database.connect()) as connection:
+                    connection.execute("UPDATE translation_runs SET status='CANCELLED',error_code='job_cancelled',completed_at=? WHERE producer_job_id=? AND status='QUEUED'", (utc_now(), job_id))
         except (JobNotFound, JobInputError, JobConflict, IdempotencyConflict) as exc:
             return job_exception(exc)
         response = JSONResponse(status_code=202 if result["status"] == "CANCEL_REQUESTED" else 200, content=result)

@@ -69,9 +69,9 @@ Mutation and read routes use the existing exact localhost Host/Origin/session/CS
 
 Translation Run responses include an immutable `pass_strategy` (`SINGLE_PASS` for new production Runs, `TWO_PASS` for existing Runs) and Unit `final_text`. Single-Pass results leave `pass1_text` and `pass2_text` null; clients render `final_text` and must not infer a second generation. The create request continues to require `privacy_consent_confirmed: true`; local UI remembers consent but sends that assertion on each Job creation request.
 
-The translation create request accepts Gemini only with affirmative Gemini consent. A legacy Cloudflare create or retry request is rejected with `translation_provider_retired`. Provider/model/route/adapter/strategy provenance remains readable for historical Runs; the status endpoint reports Gemini only.
+LOCAL-01A exposes `GET /api/v1/translations/status` and accepts `POST /api/v1/projects/{project_id}/translations/jobs` with an accepted transcript revision and `target_language: "vi"`. Creation snapshots model/runtime/prompt policy and Canonical Unit count/hash without embedding dialogue. The request uses the existing session, CSRF, project scope and idempotency controls. A claimed `local_translation` Job starts the owned runtime; no configuration/status request loads the model. Historical provider/model/route/adapter/strategy provenance remains readable. Gemini and Cloudflare execution is retired, and their historical Job retry remains blocked.
 
-Migration v23 adds `provider_strategy_version` and redacted per-request fields to `translation_provider_calls`: `exception_class`, timeout phase (`connect/read/write/pool/other`), serialized request-body bytes, effective output budget, per-physical-request latency, provider-operation elapsed time, and Attempt elapsed at capture. No request/response text, reasoning or credentials are persisted. Older ledger rows retain `legacy-shared-v1`; missing historical exception details are not backfilled or inferred.
+Migration v23 adds `provider_strategy_version` and redacted historical per-request fields to `translation_provider_calls`. Migration v24 adds Local request/cursor persistence; request rows keep status, range, token counts and safe error codes, never prompt, dialogue, response or key material. No new provider-call ledger is written for Local inference.
 
 ```json
 {

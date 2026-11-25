@@ -100,6 +100,16 @@ try {
     Set-ChildEnvironment "APP_PORT" ([string]$backendPort)
     Set-ChildEnvironment "APP_ALLOWED_ORIGIN" $allowedOrigin
     Set-ChildEnvironment "AUTODUB_BOOTSTRAP_SECRET" $secret
+    # Local inference settings are non-secret and may be overridden in the parent process.
+    if (-not [Environment]::GetEnvironmentVariable("AUTODUB_LOCAL_LLAMA_PATH", "Process")) {
+        Set-ChildEnvironment "AUTODUB_LOCAL_LLAMA_PATH" "D:\LocalAI\llama\llama-server.exe"
+    }
+    if (-not [Environment]::GetEnvironmentVariable("AUTODUB_LOCAL_MODEL_PATH", "Process")) {
+        Set-ChildEnvironment "AUTODUB_LOCAL_MODEL_PATH" "D:\LocalAI\models\Hy-MT3-7B-Q4_K_M.gguf"
+    }
+    if (-not [Environment]::GetEnvironmentVariable("AUTODUB_LOCAL_PORT", "Process")) {
+        Set-ChildEnvironment "AUTODUB_LOCAL_PORT" "8080"
+    }
 
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
     $backendOut = Join-Path $runLogRoot "backend-$stamp.out.log"

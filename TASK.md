@@ -46,11 +46,26 @@
 - TRANS-01B translation editor implementation slice: immutable provider output and accepted revisions, separate CAS draft, transactional Save All, current-run/active-revision checks, and two-tab UI. Focused revision/migration/session-CSRF tests pass; backend suite and frontend build results are recorded in the CHANGELOG. Browser acceptance NOT RUN.
 - TTS-01A implementation slice: Edge-TTS adapter, accepted-revision batch snapshots, per-Unit verified MP3 artifacts, content-fingerprint reuse, bounded retry/concurrency, preview, cancellation, project-scoped Range playback and minimal consent UI. Synthetic integration tests pass; one real synthetic-text Edge-TTS adapter smoke produced verified non-silent MP3. Browser UI and 50-Unit mixed-outcome acceptance are NOT RUN; G5 remains unaccepted.
 
-### TRANS-03A ? Remove Gemini translation engine (implementation in progress; owner acceptance unchecked)
-- PO approved direct implementation. Gemini provider/worker/request, token/chunk planning, retries/diagnostics, credential module and dependency were removed. Canonical Unit construction and historical Run/Unit reads remain, without provider limits or snapshot fields. New translation Job API returns `translation_engine_unavailable`; Local Translation is not implemented.
-- Retired Gemini/Cloudflare Jobs are reconciled at startup, retries are blocked, and history is retained. Translation UI execution controls/status/consent were removed; the disabled action explains the Local AI transition. Historical editor and TTS paths remain.
-- Schema stays v23; no migration and no database edits outside recovery state updates. Backend compileall, translation-domain (2), focused health/API (13) and recovery (14) tests PASS; frontend build and smoke (2) PASS; startup without Gemini credential env vars PASS. Full backend suite: 118 tests, 9 import errors because legacy translation/TTS fixtures import removed `TranslationWorker`; historical editor/TTS regression is NOT RUN and these tests still need replacement. Full status is recorded in CHANGELOG.
-- [ ] Owner acceptance and remaining regression tests.
+### TRANS-03A — Remove Gemini translation engine (implementation; owner acceptance unchecked)
+- Removed Gemini execution while preserving Canonical Unit identity/mapping and historical Run/Unit reads. Retired unfinished Gemini/Cloudflare Jobs cannot retry; history and completed Jobs remain intact.
+- [x] Implementation and focused history/recovery checks are recorded in CHANGELOG; Local Translation was implemented in the dependent LOCAL-01A slice below.
+- [ ] Owner acceptance.
+
+### LOCAL-01A — Implement Local Translation Engine (implementation; owner acceptance unchecked)
+- [x] Added schema v24 Local Run support, durable 80/60 cursor and per-request history; migration verified with integrity and foreign-key checks.
+- [x] Added atomic Local Job/Run/Unit creation and stage input update; Job idempotency and transaction rollback are covered.
+- [x] Added pinned Vietnamese labeled-line prompt, response validation, stateless llama.cpp HTTP client, context fallback, timeout restart policy, cancellation checks and verified artifact publication path.
+- [x] Added Local Translation status/create API, progress/cancel/retry UI and non-secret launcher settings; backend API and frontend build checks pass.
+- [x] LOCAL-01B verified the installed Windows llama-server/model startup, inference and shutdown; details are in the LOCAL-01B CHANGELOG entry.
+- [x] Replaced tests that only exercised retired Gemini execution; retained editor revision/CAS, migration and TTS fixture coverage.
+- [ ] Owner acceptance.
+
+### LOCAL-01B — Local Translation real-world validation (implementation verification; owner acceptance unchecked)
+- [x] Real Windows inference through the application API with 160 Unicode-verified synthetic Chinese Units, two sequential default batches of 80 and verified artifact publication.
+- [x] Unit identity, source mapping, positions, timestamps, output completeness and Han-character residuals checked; Editor, multi-Unit Save All, Approval and restart readback verified.
+- [x] Runtime cancellation checked during inference; Job/Run/Request became CANCELLED, cursor stayed at zero and the owned runtime listener closed.
+- [x] A runtime version probe defect was fixed: this installed llama.cpp build reports its version on stderr. Focused regression tests pass; measured results are in CHANGELOG.
+- [ ] Owner acceptance.
 
 ### TRANS-02C - Gemini-only cleanup (pending PO review)
 - PO retired Cloudflare; new Translation Runs use Gemini only. Historical provenance remains readable and unfinished Cloudflare Jobs are retired during recovery. TRANS-02A/B were not accepted. G4 was previously accepted; G5 remains unaccepted. Local AI is a separate future task.

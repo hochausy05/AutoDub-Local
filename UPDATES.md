@@ -1,4 +1,4 @@
-Gemini Translation Engine has been removed from execution. New translation is temporarily unavailable while Local Translation is prepared; saved translation history remains available in the editor and TTS. Local Translation is not implemented. Backend focused API/recovery checks and frontend build/smoke pass; translation/TTS regression fixtures still require replacement.
+LOCAL-01B verified real Windows inference through the Local Translation API with 160 synthetic Chinese Units and two sequential 80-Unit requests. The installed llama.cpp runtime started and stopped under backend control; outputs and artifact passed integrity checks, and Editor, Save All, Approval and restart readback worked. The installed runtime version probe was corrected to accept its version text on stderr. Owner acceptance is pending.
 
 # AutoDub Local vNext — Product Updates
 

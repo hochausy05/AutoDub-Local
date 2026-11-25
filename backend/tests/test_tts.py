@@ -45,7 +45,7 @@ class TTSIntegrationTests(unittest.TestCase):
 
     def setUp(self):
         from importlib import import_module
-        fixture = getattr(import_module("test_translation"), "TranslationTests")
+        fixture = getattr(import_module("tests.test_translation"), "TranslationTests")
         self._translation_fixture = fixture
         fixture.setUp(self)
         if not self.ffmpeg:

@@ -79,25 +79,21 @@ class LocalApiSmokeTests(unittest.TestCase):
         self.assertEqual(accepted.status_code, 204)
         self.assertEqual(self.client.get("/api/v1/health", headers=self.headers).status_code, 401)
 
-    def test_translation_creation_is_disabled_without_creating_a_job(self):
+    def test_local_translation_status_is_read_only_and_job_requires_current_accepted_revision(self):
         csrf = self.bootstrap()
-        project_id = "00000000-0000-4000-8000-000000000001"
-        revision_id = "00000000-0000-4000-8000-000000000002"
-        before = self.app.state.database.connect()
-        try:
-            existing = before.execute("SELECT COUNT(*) FROM jobs WHERE kind IN ('gemini_translation','cloudflare_translation')").fetchone()[0]
-        finally:
-            before.close()
+        project_id = self.create(csrf=csrf).json()["id"]
+        status = self.client.get("/api/v1/translations/status", headers=self.headers)
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["model_id"], "Hy-MT3-7B-Q4_K_M")
         response = self.client.post(
             f"/api/v1/projects/{project_id}/translations/jobs",
-            headers={**self.headers, "x-csrf-token": csrf, "idempotency-key": "translation-disabled-api-0001"},
-            json={"accepted_transcript_revision_id": revision_id, "target_language": "vi", "privacy_consent_confirmed": False},
+            headers={**self.headers, "x-csrf-token": csrf, "idempotency-key": "translation-local-api-test-0001"},
+            json={"accepted_transcript_revision_id": "00000000-0000-4000-8000-000000000002", "target_language": "vi"},
         )
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.json()["error"]["code"], "translation_engine_unavailable")
+        self.assertIn(response.status_code, {404, 422, 503})
         with closing(self.app.state.database.connect()) as connection:
-            after = connection.execute("SELECT COUNT(*) FROM jobs WHERE kind IN ('gemini_translation','cloudflare_translation')").fetchone()[0]
-        self.assertEqual(after, existing)
+            after = connection.execute("SELECT COUNT(*) FROM jobs WHERE project_id=? AND kind='local_translation'", (project_id,)).fetchone()[0]
+        self.assertEqual(after, 0)
 
     def test_openapi_is_not_exposed(self):
         self.bootstrap()

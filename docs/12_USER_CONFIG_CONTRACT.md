@@ -38,18 +38,17 @@ A Run stores effective merged config with schema version and hash, so editing ap
 
 | Setting | Default candidate | Description |
 |---|---|---|
-| `provider` | Gemini | no offline translation in MVP |
-| `model_id` | compatible runtime choice | provider-discovered, no stale hardcoded name |
-| `source_language` | inherit ASR | editable |
-| `target_language` | vi | editable future extension |
-| `genre` | General | review, tutorial, narrative, manhua, custom |
-| `tone` | natural spoken | concise, formal, lively, custom |
-| `two_pass` | true | explicit Pass1 context + Pass2 length/speakability |
-| `glossary` | Project-scoped | named entities, terms, pronouns |
-| `max_group_gap_ms` | 750 candidate | grouping only; don't lose IDs |
-| `translation_length_policy` | balanced | preserve meaning; suggest shorter version |
-| `punctuation_policy` | natural | no forced trailing period |
-| `manual_review_required` | true on validation warning | never silently accept missing translation |
+| `engine` | Local Translation | only local execution is supported for new Runs |
+| `model_id` | `Hy-MT3-7B-Q4_K_M` | configured local GGUF identity |
+| `context_size` | 4096 | fixed runtime setting |
+| `gpu_layers` | 99 | fixed requested CUDA layer count; runtime startup must succeed |
+| `target_language` | `vi` | Vietnamese output |
+| `batch_limit` | 80, fallback 60 | durable Run cursor policy |
+| `inference_timeout_seconds` | 300 | one runtime restart/retry at the same cursor |
+| `prompt_version` | `local-vi-tts-v1` | immutable prompt contract |
+| `normalization_version` | `translation-normalize-v1` | output normalization contract |
+
+Windows paths/port are non-secret settings: `AUTODUB_LOCAL_LLAMA_PATH`, `AUTODUB_LOCAL_MODEL_PATH`, `AUTODUB_LOCAL_PORT`. Runtime starts only when a Translation Job is claimed. Local inference requires no provider credential or consent.
 
 ## 5. TTS (Edge default)
 

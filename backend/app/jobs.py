@@ -211,30 +211,36 @@ class JobService:
         with self._write() as connection:
             if connection.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone() is None:
                 raise JobNotFound
-            row = connection.execute(
-                "SELECT input_fingerprint,input_generation,pointer_generation,active_artifact_id FROM stage_pointers WHERE project_id=? AND stage=?",
-                (project_id, stage),
-            ).fetchone()
-            stamp = utc_now()
-            if row is None:
-                connection.execute(
-                    "INSERT INTO stage_pointers(project_id,stage,input_fingerprint,input_generation,pointer_generation,updated_at) VALUES(?,?,?,1,0,?)",
-                    (project_id, stage, fingerprint, stamp),
-                )
-                return {"stage": stage, "input_fingerprint": fingerprint, "input_generation": 1, "pointer_generation": 0, "active_artifact_id": None}
-            generation = row["input_generation"] + int(row["input_fingerprint"] != fingerprint)
-            if generation != row["input_generation"]:
-                connection.execute(
-                    "UPDATE stage_pointers SET input_fingerprint=?,input_generation=?,updated_at=? WHERE project_id=? AND stage=?",
-                    (fingerprint, generation, stamp, project_id, stage),
-                )
-            return {"stage": stage, "input_fingerprint": fingerprint, "input_generation": generation,
-                    "pointer_generation": row["pointer_generation"], "active_artifact_id": row["active_artifact_id"]}
+            return self._set_stage_input_in_transaction(connection, project_id, stage, fingerprint)
+
+    @staticmethod
+    def _set_stage_input_in_transaction(connection: sqlite3.Connection, project_id: str, stage: str, fingerprint: str) -> dict[str, Any]:
+        row = connection.execute(
+            "SELECT input_fingerprint,input_generation,pointer_generation,active_artifact_id FROM stage_pointers WHERE project_id=? AND stage=?",
+            (project_id, stage),
+        ).fetchone()
+        stamp = utc_now()
+        if row is None:
+            connection.execute(
+                "INSERT INTO stage_pointers(project_id,stage,input_fingerprint,input_generation,pointer_generation,updated_at) VALUES(?,?,?,1,0,?)",
+                (project_id, stage, fingerprint, stamp),
+            )
+            return {"stage": stage, "input_fingerprint": fingerprint, "input_generation": 1, "pointer_generation": 0, "active_artifact_id": None}
+        generation = row["input_generation"] + int(row["input_fingerprint"] != fingerprint)
+        if generation != row["input_generation"]:
+            connection.execute(
+                "UPDATE stage_pointers SET input_fingerprint=?,input_generation=?,updated_at=? WHERE project_id=? AND stage=?",
+                (fingerprint, generation, stamp, project_id, stage),
+            )
+        return {"stage": stage, "input_fingerprint": fingerprint, "input_generation": generation,
+                "pointer_generation": row["pointer_generation"], "active_artifact_id": row["active_artifact_id"]}
 
     def create_job(
         self, project_id: str, kind: str, input_snapshot: dict[str, Any], idempotency_key: str,
         *, activation_stage: ActivationStage | str | None = None,
         creation_hook: Callable[[sqlite3.Connection, str], None] | None = None,
+        update_stage_input: bool = False,
+        request_digest_value: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         project_id = self._uuid(project_id, "project_id")
         self.validate_idempotency_key(idempotency_key)
@@ -250,7 +256,9 @@ class JobService:
         snapshot_json = self._canonical(input_snapshot)
         if len(snapshot_json.encode("utf-8")) > MAX_SNAPSHOT_BYTES:
             raise JobInputError("input_snapshot_too_large")
-        request_digest = self._digest({"project_id": project_id, "kind": kind, "input_snapshot": input_snapshot, "activation_stage": activation_stage})
+        if update_stage_input and activation_stage != ActivationStage.TRANSLATION.value:
+            raise JobInputError("invalid_activation_stage")
+        request_digest = self._digest(request_digest_value if request_digest_value is not None else {"project_id": project_id, "kind": kind, "input_snapshot": input_snapshot, "activation_stage": activation_stage})
         input_fingerprint = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
         scope = f"job:create:{project_id}:{kind}"
         with self._write() as connection:
@@ -267,13 +275,16 @@ class JobService:
                 prior_job_id = json.loads(previous["response_json"])["job_id"]
                 return self._job_detail(connection, prior_job_id)
 
-            if kind in {"gemini_translation", "cloudflare_translation"}:
+            if activation_stage == ActivationStage.TRANSLATION.value or kind in {"gemini_translation", "cloudflare_translation", "local_translation"}:
                 active_translation = connection.execute(
-                    "SELECT id FROM jobs WHERE project_id=? AND kind IN ('gemini_translation','cloudflare_translation') AND status IN ('QUEUED','RUNNING','CANCEL_REQUESTED') LIMIT 1",
+                    "SELECT id FROM jobs WHERE project_id=? AND (activation_stage='translation' OR kind IN ('gemini_translation','cloudflare_translation','local_translation')) AND status IN ('QUEUED','RUNNING','CANCEL_REQUESTED') LIMIT 1",
                     (project_id,),
                 ).fetchone()
                 if active_translation:
                     raise JobConflict("job_already_active")
+
+            if update_stage_input:
+                self._set_stage_input_in_transaction(connection, project_id, "translation", input_fingerprint)
 
             expected_input_generation = None
             expected_pointer_generation = None
@@ -406,6 +417,13 @@ class JobService:
                 return self._job_detail(connection, job_id)
             if job["status"] != expected_status:
                 raise JobConflict("job_status_conflict")
+            if job["activation_stage"] == "translation":
+                active = connection.execute(
+                    "SELECT id FROM jobs WHERE project_id=? AND id<>? AND activation_stage='translation' AND status IN ('QUEUED','RUNNING','CANCEL_REQUESTED') LIMIT 1",
+                    (job["project_id"], job_id),
+                ).fetchone()
+                if active:
+                    raise JobConflict("job_already_active")
             latest_attempt = connection.execute(
                 "SELECT retryable,retry_after_at FROM job_attempts WHERE job_id=? ORDER BY attempt_no DESC LIMIT 1", (job_id,)
             ).fetchone()

@@ -2,7 +2,7 @@
 
 > **Phase rule:** `14_SCOPE_BASELINE.md` defines mandatory MVP vs V1/V2 scope; advanced designs in this document do not imply MVP implementation.
 
-**Status:** Architecture reference; implementation slices and owner acceptance are tracked in `TASK.md`. TRANS-03A removed Local Translation execution; new translation remains unavailable pending LOCAL-01A.
+**Status:** Architecture reference; implementation slices and owner acceptance are tracked in `TASK.md`. LOCAL-01B verified real Windows inference and downstream Editor/Approval integration; owner acceptance remains pending.
 
 ## 1. Context diagram
 
@@ -22,7 +22,7 @@ flowchart TD
   TR <--> DB
   TTS <--> FS
   REN <--> FS
-  TR --> GEMINI[(Local Translation API Internet)]
+  TR --> LLAMA[llama-server loopback runtime]
   TTS --> EDGE[(Edge speech Internet)]
 ```
 
@@ -36,7 +36,7 @@ flowchart TD
 | Persistent metadata | SQLite WAL, schema migrations via Alembic or explicit SQL | Project, Run, Unit, artifact, Job, edit revisions | Single-user local persistence, transactional updates |
 | Media | FFmpeg/FFprobe CLI, `soundfile`, optional `PyAV` | Decode/extract, combine, measure, render | Avoid handling full video frames in Python |
 | ASR | Faster-Whisper / CTranslate2 | Speech segments with start/end | GPU float16 or CPU int8 fallback |
-| Translation | Local Translation engine + `google-genai` adapter | Local Translation `gemini-3.1-flash-lite` only | One prompt/chunk/mapping/persistence path; provider/model/adapter snapshot per Run |
+| Translation | Local Translation engine + pinned llama.cpp server | Hy-MT3-7B-Q4_K_M, 4096 context, CUDA 99 layers | Sequential stateless 80/60 Unit batches; strict labeled-line mapping and durable cursor |
 | Speech | `edge-tts` as default adapter | Vietnamese voice TTS, MP3/format metadata | Match legacy user preference; requires internet |
 | Voice preview | Bounded file cache | Short sample by exact voice/rate/pitch/config | Avoid repeated network generation |
 | Subtitle OCR (optional) | OpenCV + EasyOCR/other measured implementation | Suggest old subtitle location | Costly stage, opt-in, verify visually |
@@ -119,4 +119,6 @@ Edits invalidate only descendants whose *actual input fingerprint* changes. Exam
 
 ## 8. Trust boundaries
 
-Local UI on `127.0.0.1`, backend on `127.0.0.1`, Windows filesystem trusted only after user selection, and external Local Translation/Edge endpoints remain separate consented boundaries. Translation consent is Local Translation-specific; historical provider provenance remains readable. Validate files based on probing, not extension alone. Rate-limit local endpoints and ensure no remote web page can invoke destructive local APIs through weak CORS/CSRF protections.
+Local UI and API bind to `127.0.0.1`; the owned llama-server also binds loopback and receives a process-local random API key. Translation dialogue stays on the local machine. Edge-TTS remains an external service. Historical provider provenance remains readable. Validate files based on probing, not extension alone. Ensure no remote web page can invoke destructive local APIs through weak CORS/CSRF protections.
+
+LOCAL-01A uses a Local Translation package under `backend/app/translation/`: Canonical Unit/read contracts, prompt and validation, HTTP client, batch policy, repository, runtime manager, artifact contract and worker. Runtime startup is demand-driven by a claimed `local_translation` Job. Schema v24 adds local execution state/request records and preserves existing Run, Unit and provenance data. LOCAL-01B exercised the installed Windows runtime with 160 synthetic Chinese Units in two 80-Unit requests, verified the published artifact and Editor/Approval lifecycle, and confirmed cancellation closes the owned runtime. See `CHANGELOG.md` for measured results; owner acceptance remains pending.

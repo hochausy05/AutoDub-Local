@@ -14,7 +14,9 @@ Maintain user edits and processing artifacts across application restarts, crashe
 | `media_assets` | `id`, `project_id`, `role SOURCE/OUTPUT/PREVIEW`, `import_mode COPY/LINK`, `relative_path` or approved external path, `size`, `sha256`, duration_us, streams JSON, verified_at |
 | `transcription_runs` | `id`, `project_id`, `source_asset_id`, model/device/language/VAD config JSON, immutable provenance, status |
 | `segments` | `id`, `run_id`, position, start_us, end_us, source_text, confidence/flags; unique(run_id,position), start < end |
-| `translation_runs` | Schema v23 is retained in TRANS-03A. Immutable provider/model/route/adapter/provider-strategy/prompt/wire/pass-strategy provenance remains readable for historical Gemini and Cloudflare Runs; no migration or provenance cleanup is performed. New Runs are unavailable pending LOCAL-01A. |
+| `translation_runs` | Schema v24 adds `local` as a provider while preserving historical Gemini/Cloudflare provenance. Local Runs use SINGLE_PASS and `provider_sdk_version=NULL`; existing provenance is not rewritten. |
+| `local_translation_state` | One row per local Run: next uncommitted position, 80/60 batch limit and one-time timeout-restart state. |
+| `local_translation_requests` | Immutable request identity and terminal execution records per Run/Attempt; at most one RUNNING request per Run. |
 | `translation_units` | `id`, `run_id`, ordered index, start_us/end_us, `source_segment_ids`, proposed_text, final_text, revision, status |
 | `translation_edits` | `id`, `unit_id`, old/new text, revision, author=local, timestamp, optional reason |
 | `tts_runs` | Implemented by migration v18: immutable accepted-revision/source/config snapshot, producer Job, dependency generations, provider/adapter/synthesis versions and aggregate status. |
@@ -31,7 +33,7 @@ Maintain user edits and processing artifacts across application restarts, crashe
 
 Relationships: one Project -> multiple source/video Runs -> many Segments/Translation Units/TTS artifacts -> immutable sync plan -> render. Existing Run rows never silently overwrite; active pointers move transactionally after validation.
 
-Migrations v20–v22 widen the translation provider discriminator for Cloudflare, make Google SDK provenance nullable for non-SDK REST calls, and add immutable provider adapter versions. Migration v23 adds immutable provider strategy identity and redacted request/timeout diagnostics; prior rows receive `legacy-shared-v1` and nullable diagnostic fields. It is additive and preserves existing Runs and artifacts.
+Migrations v20–v23 preserve historical provider metadata and request diagnostics. Migration v24 safely rebuilds only Translation Run/Unit tables to allow provider `local`, nullable SDK provenance and nullable `chunk_no`, and adds Local execution tables/guards. It preserves explicit indexes, triggers, rows, foreign keys and fingerprints, then checks foreign keys and database integrity before commit.
 
 ## 3. Example invariants
 

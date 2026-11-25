@@ -3,7 +3,7 @@ import { fetchBackendHealth, type BackendHealth } from "../api/health";
 import { createProject, fetchProjects, type Project } from "../api/projects";
 import { establishSession } from "../api/session";
 import { TTSPanel } from "./TTSPanel";
-import { acceptOriginalTranslation, acceptTranscriptRevision, acceptTranslationDraft, cancelLocalJob, chooseSource, createASRJob, createTranscriptDraft, createTranslationDraft, fetchTranslationEditor, fetchTranslationRuns, fetchASRModels, fetchASRRun, fetchASRRuns, fetchMedia, fetchProcessingSource, fetchTranscriptRevisions, getImportJob, importSelected, mediaStreamUrl, relinkMedia, retryLocalJob, saveTranscriptDraft, saveTranslationDraft, selectProcessingSource, type ASRJob, type ASRRun, type ASRRunSummary, type ImportJob, type MediaAsset, type ProcessingSource, type TranscriptRevision, type TranslationEditorState, type TranslationRevisionUnit, type TranslationRun } from "../api/media";
+import { acceptOriginalTranslation, acceptTranscriptRevision, acceptTranslationDraft, cancelLocalJob, chooseSource, createASRJob, createLocalTranslationJob, createTranscriptDraft, createTranslationDraft, fetchLocalTranslationStatus, fetchTranslationEditor, fetchTranslationRun, fetchTranslationRuns, fetchASRModels, fetchASRRun, fetchASRRuns, fetchMedia, fetchProcessingSource, fetchTranscriptRevisions, getImportJob, importSelected, mediaStreamUrl, relinkMedia, retryLocalJob, saveTranscriptDraft, saveTranslationDraft, selectProcessingSource, type ASRJob, type ASRRun, type ASRRunSummary, type ImportJob, type LocalTranslationStatus, type MediaAsset, type ProcessingSource, type TranscriptRevision, type TranslationEditorState, type TranslationRevisionUnit, type TranslationRun } from "../api/media";
 
 type Connection =
   | { state: "checking"; message: string; health: null }
@@ -107,6 +107,10 @@ export function App() {
   const [transcriptSaving, setTranscriptSaving] = useState(false);
   const [transcriptError, setTranscriptError] = useState<string | null>(null);
   const [translationRun, setTranslationRun] = useState<TranslationRun | null>(null);
+  const [translationJob, setTranslationJob] = useState<ImportJob | null>(null);
+  const [localTranslationStatus, setLocalTranslationStatus] = useState<LocalTranslationStatus | null>(null);
+  const [startingTranslation, setStartingTranslation] = useState(false);
+  const [translationActionBusy, setTranslationActionBusy] = useState(false);
   const [translationEditor, setTranslationEditor] = useState<TranslationEditorState | null>(null);
   const [translationTab, setTranslationTab] = useState<"original" | "approved">("original");
   const [translationEditing, setTranslationEditing] = useState(false);
@@ -197,6 +201,14 @@ export function App() {
   }, [connection.state]);
 
   useEffect(() => {
+    if (connection.state !== "online") { setLocalTranslationStatus(null); return; }
+    let stopped = false;
+    void fetchLocalTranslationStatus().then((status) => { if (!stopped) setLocalTranslationStatus(status); })
+      .catch(() => { if (!stopped) setLocalTranslationStatus({ configured: false, model_id: "Hy-MT3-7B-Q4_K_M", error_code: "local_translation_status_unavailable" }); });
+    return () => { stopped = true; };
+  }, [connection.state]);
+
+  useEffect(() => {
     setAsrRuns([]); setSelectedRun(null); setAsrJob(null);
     if (!selectedProject) return;
     void refreshProcessingSource(selectedProject);
@@ -230,11 +242,34 @@ export function App() {
       const runs = await fetchTranslationRuns(context.projectId);
       if (!stillCurrent()) return;
       const current = runs.find((run) => run.project_id === context.projectId && run.source_asset_id === context.mediaId && run.transcript_revision_id === context.revisionId);
-      if (!current) { setTranslationRun(null); return; }
+      if (!current) { setTranslationRun(null); setTranslationJob(null); return; }
       setTranslationRun(current);
     })().catch((error) => { if (stillCurrent()) setTranslationReviewError(error instanceof Error ? error.message : "Không tải được bản dịch đã lưu."); });
     return () => { stopped = true; };
   }, [selectedProject, selectedMediaId, transcriptRevision?.id]);
+
+  useEffect(() => {
+    let stopped = false;
+    const run = translationRun;
+    setTranslationJob(null);
+    if (!run || run.provider !== "local" || !["QUEUED", "RUNNING", "FAILED", "INTERRUPTED", "CANCELLED"].includes(run.status)) return;
+    const refresh = async () => {
+      try {
+        const job = await getImportJob(run.producer_job_id, run.project_id);
+        if (!stopped && selectedContext.current.projectId === run.project_id && selectedContext.current.revisionId === run.transcript_revision_id) {
+          setTranslationJob(job);
+          if (["READY", "FAILED", "INTERRUPTED", "CANCELLED"].includes(job.status)) {
+            const latest = await fetchTranslationRun(run.project_id, run.id);
+            if (!stopped && selectedContext.current.projectId === run.project_id && selectedContext.current.revisionId === run.transcript_revision_id) setTranslationRun(latest);
+          }
+        }
+      } catch { /* Run history remains readable if Job details are temporarily unavailable. */ }
+    };
+    void refresh();
+    if (!["QUEUED", "RUNNING"].includes(run.status)) return () => { stopped = true; };
+    const timer = window.setInterval(() => void refresh(), 1000);
+    return () => { stopped = true; window.clearInterval(timer); };
+  }, [translationRun?.id, translationRun?.status, translationRun?.producer_job_id, translationRun?.project_id, translationRun?.transcript_revision_id]);
 
   useEffect(() => {
     let stopped = false;
@@ -509,6 +544,35 @@ export function App() {
     try { setAsrJob(await retryLocalJob(asrJob)); }
     catch (error) { setAsrError(error instanceof Error ? error.message : "Job chưa thể chạy lại."); }
     finally { setAsrActionBusy(false); }
+  };
+
+  const startTranslation = async () => {
+    if (!selectedProject || !activeTranscriptAccepted || !localTranslationStatus?.configured) return;
+    setStartingTranslation(true); setTranslationReviewError(null);
+    const context = { projectId: selectedProject, mediaId: selectedMediaId, revisionId: activeTranscriptAccepted.id };
+    try {
+      const created = await createLocalTranslationJob(context.projectId, context.revisionId);
+      if (selectedContext.current.projectId !== context.projectId || selectedContext.current.mediaId !== context.mediaId || selectedContext.current.revisionId !== context.revisionId) return;
+      setTranslationJob(created.job);
+      if (created.run_id) setTranslationRun(await fetchTranslationRun(context.projectId, created.run_id));
+    } catch (error) { if (selectedContext.current.projectId === context.projectId && selectedContext.current.revisionId === context.revisionId) setTranslationReviewError(error instanceof Error ? error.message : "Không thể bắt đầu dịch Local."); }
+    finally { setStartingTranslation(false); }
+  };
+
+  const cancelTranslation = async () => {
+    if (!translationJob) return;
+    setTranslationActionBusy(true);
+    try { setTranslationJob(await cancelLocalJob(translationJob.id, translationJob.project_id)); }
+    catch (error) { setTranslationReviewError(error instanceof Error ? error.message : "Không thể hủy Job dịch."); }
+    finally { setTranslationActionBusy(false); }
+  };
+
+  const retryTranslation = async () => {
+    if (!translationJob) return;
+    setTranslationActionBusy(true); setTranslationReviewError(null);
+    try { setTranslationJob(await retryLocalJob(translationJob)); }
+    catch (error) { setTranslationReviewError(error instanceof Error ? error.message : "Job dịch chưa thể chạy lại."); }
+    finally { setTranslationActionBusy(false); }
   };
 
   const editTranscript = () => {
@@ -798,8 +862,12 @@ export function App() {
                       {translationRun ? <span className={`transcript-state transcript-${translationRun.status.toLowerCase()}`}>{translationStatusLabel(translationRun.status)}</span> : null}
                     </header>
 
-                    <button type="button" disabled aria-disabled="true">Dịch sang tiếng Việt</button>
-                    <p role="status">Chức năng dịch đang được chuyển sang AI Local.</p>
+                    <p>AI Local · Hy-MT3-7B</p>
+                    <button type="button" disabled={startingTranslation || !activeTranscriptAccepted || !localTranslationStatus?.configured || ["QUEUED", "RUNNING", "CANCEL_REQUESTED"].includes(translationJob?.status ?? "") || ["QUEUED", "RUNNING"].includes(translationRun?.status ?? "") || translationDirtyCount > 0 || translationSaving} onClick={() => void startTranslation()}>{startingTranslation ? "Đang tạo Job…" : "Dịch sang tiếng Việt"}</button>
+                    {!localTranslationStatus?.configured ? <p role="status">AI Local chưa sẵn sàng. Kiểm tra llama-server.exe và model Hy-MT3-7B-Q4_K_M.</p> : null}
+                    {translationJob?.progress?.total_units ? <p role="status">{translationJob.status === "RUNNING" ? `Đang dịch ${translationJob.progress.completed_units ?? 0}/${translationJob.progress.total_units} câu` : translationStatusLabel(translationRun?.status)}</p> : null}
+                    {translationJob && ["QUEUED", "RUNNING", "CANCEL_REQUESTED"].includes(translationJob.status) ? <button type="button" disabled={translationActionBusy} onClick={() => void cancelTranslation()}>{translationActionBusy ? "Đang xử lý…" : "Hủy dịch"}</button> : null}
+                    {translationJob && ["FAILED", "INTERRUPTED"].includes(translationJob.status) && translationJob.retry_available ? <button type="button" disabled={translationActionBusy} onClick={() => void retryTranslation()}>{translationActionBusy ? "Đang xử lý…" : "Thử lại"}</button> : null}
                     <div className="transcript-tabs" role="tablist" aria-label="Phiên bản bản dịch">
                       <button type="button" role="tab" aria-selected={translationTab === "original"} onClick={() => changeTranslationTab("original")}>Bản dịch gốc</button>
                       <button type="button" role="tab" aria-selected={translationTab === "approved"} onClick={() => changeTranslationTab("approved")}>Bản đã duyệt</button>

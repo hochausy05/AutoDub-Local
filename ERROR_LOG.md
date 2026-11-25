@@ -1,5 +1,10 @@
 # ERROR_LOG — Reproducible Incidents in the New Project
 
+## LOCAL-01B — Runtime version probe read the wrong output stream (resolved)
+- **Date/time:** 2026-11-25 16:03 UTC+7
+- **Observed:** The installed `llama-server.exe --version` exits successfully and reports `build 12676` on stderr with empty stdout. The first synthetic Local Translation Job therefore failed before model loading with `local_runtime_version_mismatch`.
+- **Resolution/verification:** Runtime identity validation now checks stdout and stderr. Focused regression tests pass (2); the subsequent Windows API Job loaded the installed model and completed 160/160 Units with a READY artifact. No user data was involved.
+
 ## TRANS-03A — Legacy translation tests import removed worker
 - **Date/time:** 2026-11-25 12:00 UTC+7
 - **Observed:** Full backend `unittest discover` ran 118 tests but reported 9 import errors. `backend/tests/test_translation.py` imports removed `TranslationWorker`; eight TTS tests load that fixture and fail at the same import. This is a test-suite compatibility issue after removing Gemini execution code; no production API error was observed.

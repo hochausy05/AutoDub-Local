@@ -14,13 +14,13 @@
 
 ## Runtime source
 
-- `backend/app/`: FastAPI, SQLite, Jobs/recovery, media, ASR, translation history/editor, TTS and artifact services.
+- `backend/app/`: FastAPI, SQLite, Jobs/recovery, media, ASR, Local Translation package, translation history/editor, TTS and artifact services.
 - `backend/tests/`: backend unit and integration tests.
 - `frontend/src/`: React UI and local API clients; `scripts/windows/`: Windows development launcher.
 
 ## Primary scope and specs
 
-- `docs/14_SCOPE_BASELINE.md`: **MVP/V1/V2 authoritative split**; TRANS-03A currently disables new translation until LOCAL-01A.
+- `docs/14_SCOPE_BASELINE.md`: **MVP/V1/V2 authoritative split**; Local Translation execution is implemented in LOCAL-01A; real model inference acceptance is tracked separately in LOCAL-01B.
 - `docs/01_PRODUCT_REQUIREMENTS.md`: MVP product contract.
 - `docs/02_SYSTEM_ARCHITECTURE.md`: architecture details.
 - `docs/03_DATA_AND_STORAGE.md`: SQLite/artifacts; full portable backup is V1.

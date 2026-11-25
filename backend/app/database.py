@@ -14,7 +14,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 BUSY_TIMEOUT_MS = 5000
 
 
@@ -842,6 +842,142 @@ class Database:
             except BaseException:
                 connection.rollback()
                 raise
+
+        if target_version >= 24:
+            self._migrate_v24()
+
+    def _migrate_v24(self) -> None:
+        """Rebuild only Translation tables with FK checks around the atomic swap."""
+        with closing(self.connect()) as connection:
+            current = connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
+            if current >= 24:
+                return
+            if current != 23:
+                raise RuntimeError(f"Migration v24 requires schema v23, found {current}.")
+            connection.execute("PRAGMA foreign_keys=OFF")
+            connection.execute("PRAGMA legacy_alter_table=ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                sql_by_table = {}
+                for table in ("translation_runs", "translation_units"):
+                    row = connection.execute(
+                        "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?", (table,)
+                    ).fetchone()
+                    if row is None or not isinstance(row["sql"], str):
+                        raise RuntimeError(f"Migration v24 cannot find {table} schema.")
+                    sql_by_table[table] = row["sql"]
+                objects = connection.execute(
+                    "SELECT type,name,sql FROM sqlite_schema WHERE tbl_name IN ('translation_runs','translation_units') "
+                    "AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY type,name"
+                ).fetchall()
+
+                run_sql = sql_by_table["translation_runs"]
+                run_sql = run_sql.replace("CREATE TABLE translation_runs", "CREATE TABLE translation_runs_v24", 1)
+                old_provider = "CHECK(provider IN ('gemini','cloudflare'))"
+                if old_provider not in run_sql:
+                    raise RuntimeError("Migration v24 found an unexpected Translation provider constraint.")
+                run_sql = run_sql.replace(old_provider, "CHECK(provider IN ('gemini','cloudflare','local'))", 1)
+                old_sdk = "provider_sdk_version TEXT NOT NULL"
+                if old_sdk in run_sql:
+                    run_sql = run_sql.replace(old_sdk, "provider_sdk_version TEXT", 1)
+
+                unit_sql = sql_by_table["translation_units"]
+                unit_sql = unit_sql.replace("CREATE TABLE translation_units", "CREATE TABLE translation_units_v24", 1)
+                old_chunk = "chunk_no INTEGER NOT NULL CHECK(chunk_no>=0)"
+                if old_chunk not in unit_sql:
+                    raise RuntimeError("Migration v24 found an unexpected Translation Unit chunk constraint.")
+                unit_sql = unit_sql.replace(old_chunk, "chunk_no INTEGER CHECK(chunk_no IS NULL OR chunk_no>=0)", 1)
+
+                connection.execute(run_sql)
+                connection.execute(unit_sql)
+                connection.execute(
+                    "INSERT INTO translation_runs_v24 SELECT * FROM translation_runs"
+                )
+                connection.execute(
+                    "INSERT INTO translation_units_v24 SELECT * FROM translation_units"
+                )
+                connection.execute("DROP TABLE translation_units")
+                connection.execute("DROP TABLE translation_runs")
+                connection.execute("ALTER TABLE translation_runs_v24 RENAME TO translation_runs")
+                connection.execute("ALTER TABLE translation_units_v24 RENAME TO translation_units")
+                for item in objects:
+                    connection.execute(item["sql"])
+
+                connection.execute("""CREATE TABLE local_translation_state (
+                    run_id TEXT PRIMARY KEY NOT NULL REFERENCES translation_runs(id) ON DELETE RESTRICT,
+                    next_position INTEGER NOT NULL DEFAULT 0 CHECK(next_position>=0),
+                    batch_limit INTEGER NOT NULL CHECK(batch_limit IN (80,60)),
+                    timeout_restart_used INTEGER NOT NULL DEFAULT 0 CHECK(timeout_restart_used IN (0,1)),
+                    updated_at TEXT NOT NULL
+                )""")
+                connection.execute("""CREATE TABLE local_translation_requests (
+                    request_id TEXT PRIMARY KEY NOT NULL,
+                    run_id TEXT NOT NULL REFERENCES translation_runs(id) ON DELETE RESTRICT,
+                    job_attempt_id TEXT NOT NULL REFERENCES job_attempts(id) ON DELETE RESTRICT,
+                    request_no INTEGER NOT NULL CHECK(request_no>=1),
+                    start_position INTEGER NOT NULL CHECK(start_position>=0),
+                    unit_count INTEGER NOT NULL CHECK(unit_count BETWEEN 1 AND 80),
+                    status TEXT NOT NULL CHECK(status IN ('RUNNING','READY','TIMEOUT','CONTEXT_LIMIT','INVALID','FAILED','CANCELLED','INTERRUPTED')),
+                    input_tokens INTEGER CHECK(input_tokens IS NULL OR input_tokens>=0),
+                    output_tokens INTEGER CHECK(output_tokens IS NULL OR output_tokens>=0),
+                    finish_reason TEXT,
+                    elapsed_ms INTEGER CHECK(elapsed_ms IS NULL OR elapsed_ms>=0),
+                    error_code TEXT,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    UNIQUE(run_id,request_no)
+                )""")
+                connection.execute("CREATE UNIQUE INDEX local_translation_one_running_idx ON local_translation_requests(run_id) WHERE status='RUNNING'")
+                connection.execute("CREATE INDEX local_translation_requests_attempt_idx ON local_translation_requests(job_attempt_id,request_no)")
+                connection.execute("""CREATE TRIGGER local_translation_state_insert_guard
+                    BEFORE INSERT ON local_translation_state
+                    WHEN (SELECT provider FROM translation_runs WHERE id=NEW.run_id)<>'local'
+                      OR NEW.next_position>(SELECT COUNT(*) FROM translation_units WHERE run_id=NEW.run_id)
+                    BEGIN SELECT RAISE(ABORT,'invalid local translation state'); END""")
+                connection.execute("""CREATE TRIGGER local_translation_state_update_guard
+                    BEFORE UPDATE OF run_id,next_position,batch_limit,timeout_restart_used ON local_translation_state
+                    WHEN NEW.run_id<>OLD.run_id
+                      OR NEW.next_position>(SELECT COUNT(*) FROM translation_units WHERE run_id=NEW.run_id)
+                    BEGIN SELECT RAISE(ABORT,'invalid local translation state update'); END""")
+                connection.execute("""CREATE TRIGGER local_translation_request_insert_guard
+                    BEFORE INSERT ON local_translation_requests
+                    WHEN NEW.status<>'RUNNING'
+                      OR (SELECT producer_job_id FROM translation_runs WHERE id=NEW.run_id)<>
+                         (SELECT job_id FROM job_attempts WHERE id=NEW.job_attempt_id)
+                      OR (SELECT provider FROM translation_runs WHERE id=NEW.run_id)<>'local'
+                      OR (SELECT COUNT(*) FROM translation_units WHERE run_id=NEW.run_id
+                            AND position>=NEW.start_position AND position<NEW.start_position+NEW.unit_count)<>NEW.unit_count
+                    BEGIN SELECT RAISE(ABORT,'invalid local translation request'); END""")
+                connection.execute("""CREATE TRIGGER local_translation_request_identity_immutable
+                    BEFORE UPDATE OF request_id,run_id,job_attempt_id,request_no,start_position,unit_count,started_at
+                    ON local_translation_requests
+                    BEGIN SELECT RAISE(ABORT,'local request identity is immutable'); END""")
+                connection.execute("""CREATE TRIGGER local_translation_request_terminal_immutable
+                    BEFORE UPDATE ON local_translation_requests WHEN OLD.status<>'RUNNING'
+                    BEGIN SELECT RAISE(ABORT,'terminal local request is immutable'); END""")
+                connection.execute("""CREATE TRIGGER local_translation_request_status_guard
+                    BEFORE UPDATE OF status ON local_translation_requests
+                    WHEN OLD.status<>'RUNNING' OR NEW.status='RUNNING'
+                    BEGIN SELECT RAISE(ABORT,'invalid local request transition'); END""")
+                connection.execute("""CREATE TRIGGER local_translation_final_text_immutable
+                    BEFORE UPDATE OF final_text ON translation_units
+                    WHEN OLD.final_text IS NOT NULL AND OLD.final_text IS NOT NEW.final_text
+                    BEGIN SELECT RAISE(ABORT,'final translation text is immutable'); END""")
+
+                connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(24,?)", (utc_now(),))
+                fk_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+                if fk_errors:
+                    raise RuntimeError("Migration v24 failed foreign_key_check.")
+                integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+                if integrity != "ok":
+                    raise RuntimeError("Migration v24 failed integrity_check.")
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.execute("PRAGMA legacy_alter_table=OFF")
+                connection.execute("PRAGMA foreign_keys=ON")
 
     def create_project(self, name: str, key: str) -> tuple[dict[str, Any], bool]:
         digest = hashlib.sha256(json.dumps({"name": name}, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()

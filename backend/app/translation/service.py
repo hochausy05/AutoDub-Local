@@ -2,10 +2,14 @@
 from __future__ import annotations
 import json
 import uuid
-from contextlib import closing
+from contextlib import closing, nullcontext
+import hashlib
+import os
+import time
 from pathlib import Path
 from typing import Any
-from app.database import Database
+from app.database import Database, utc_now
+from app.jobs import ActivationStage
 
 class TranslationError(Exception):
     def __init__(self, code: str, *, status: int = 422):
@@ -61,10 +65,21 @@ class TranslationArtifactValidator:
             raise TranslationError("translation_artifact_invalid")
         if self.database is not None:
             with closing(self.database.connect()) as connection:
-                run = connection.execute("SELECT input_fingerprint,pass_strategy FROM translation_runs WHERE id=?", (value["run_id"],)).fetchone()
+                run = connection.execute("SELECT input_fingerprint,pass_strategy,provider,model_id,prompt_version,source_asset_id,transcript_revision_id,producer_job_id,normalization_policy_version FROM translation_runs WHERE id=?", (value["run_id"],)).fetchone()
+                job = connection.execute("SELECT input_snapshot FROM jobs WHERE id=(SELECT producer_job_id FROM translation_runs WHERE id=?)", (value["run_id"],)).fetchone()
                 expected = connection.execute("SELECT unit_id,position,revision_segment_ids_json,source_segment_ids_json,source_text,pass1_text,pass2_text,final_text,final_notes_json FROM translation_units WHERE run_id=? ORDER BY position", (value["run_id"],)).fetchall()
             if run is None or run["input_fingerprint"] != value["input_fingerprint"] or run["pass_strategy"] != strategy or len(expected) != len(value["units"]):
                 raise TranslationError("translation_artifact_input_mismatch")
+            if run["provider"] == "local":
+                try: snapshot=json.loads(job["input_snapshot"]) if job else None
+                except (TypeError, json.JSONDecodeError): snapshot=None
+                fields=("model_sha256","runtime_identity","context_size","gpu_layers","parallel_slots","prompt_sha256","batch_policy","timeout_policy")
+                if (snapshot is None or value.get("provider")!="local" or value.get("model_id")!=run["model_id"]
+                    or value.get("prompt_version")!=run["prompt_version"] or value.get("source_asset_id")!=run["source_asset_id"]
+                    or value.get("transcript_revision_id")!=run["transcript_revision_id"]
+                    or value.get("normalization_version")!=run["normalization_policy_version"]
+                    or any(value.get(field)!=snapshot.get(field) for field in fields)):
+                    raise TranslationError("translation_artifact_input_mismatch")
             for stored, published in zip(expected, value["units"], strict=True):
                 if (stored["unit_id"] != published.get("unit_id") or stored["position"] != published.get("position")
                         or json.loads(stored["revision_segment_ids_json"]) != published.get("revision_segment_ids")
@@ -93,74 +108,69 @@ class TranslationService:
         if str(parsed) != value.lower(): raise TranslationError(f"invalid_{field}")
         return str(parsed)
 
-    def _build_input(self, project_id: str, revision_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        with closing(self.database.connect()) as connection:
-            revision = connection.execute(
-                """SELECT r.*,t.status AS run_status,t.source_asset_id,t.artifact_id AS asr_artifact_id,
-                          p.revision_id AS active_revision,p.generation AS transcript_generation,
-                          ps.media_asset_id AS selected_asset,ps.generation AS source_generation,
-                          asp.active_artifact_id AS active_asr,asp.input_fingerprint AS asr_fingerprint,
-                          a.status AS source_status
-                   FROM transcript_revisions r JOIN transcription_runs t ON t.project_id=r.project_id AND t.id=r.run_id
-                   JOIN project_active_transcript_revisions p ON p.project_id=r.project_id
-                   JOIN project_processing_sources ps ON ps.project_id=r.project_id
-                   JOIN stage_pointers asp ON asp.project_id=r.project_id AND asp.stage='asr'
-                   JOIN media_assets a ON a.project_id=r.project_id AND a.id=t.source_asset_id
-                   WHERE r.project_id=? AND r.id=?""", (project_id, revision_id),
-            ).fetchone()
-            if revision is None:
-                raise TranslationError("accepted_transcript_required")
-            if revision["status"] != "ACCEPTED" or revision["active_revision"] != revision_id or revision["selected_asset"] != revision["source_asset_id"] or revision["source_status"] != "READY":
+    def _build_input(self, project_id: str, revision_id: str, connection=None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        from app.translation.units import CanonicalUnitBuilder
+        return CanonicalUnitBuilder(self.database).build(project_id, revision_id, connection)
+
+    @staticmethod
+    def _hash_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def local_status(self) -> dict[str, Any]:
+        from app.translation.runtime import PORT_VALID, RUNTIME, MODEL
+        if not PORT_VALID:
+            return {"configured": False, "model_id": "Hy-MT3-7B-Q4_K_M", "error_code": "local_runtime_config_invalid"}
+        configured = RUNTIME.is_absolute() and RUNTIME.is_file() and MODEL.is_absolute() and MODEL.is_file()
+        return {"configured": configured, "model_id": "Hy-MT3-7B-Q4_K_M", "error_code": None if configured else "local_model_or_runtime_missing"}
+
+    def create_local_job(self, project_id: str, revision_id: str, idempotency_key: str) -> dict[str, Any]:
+        from app.translation.prompt import PROMPT_FINGERPRINT, PROMPT_VERSION
+        from app.translation.runtime import MODEL, RUNTIME, PORT
+        if not self.local_status()["configured"]:
+            raise TranslationError("local_model_or_runtime_missing", status=503)
+        model_fingerprint = self._hash_file(MODEL)
+        # Hash prompt and runtime policy, but never include transcript contents or units in the Job snapshot.
+        with closing(self.database.connect()) as c:
+            input_data, units = self._build_input(project_id, revision_id, c)
+            unit_digest = hashlib.sha256(self._json(units).encode("utf-8")).hexdigest()
+            snapshot = {**input_data, "canonical_unit_count": len(units), "canonical_units_sha256": unit_digest,
+                "model_id": "Hy-MT3-7B-Q4_K_M", "model_sha256": model_fingerprint,
+                "runtime_identity": f"llama.cpp/b12676:{self._hash_file(RUNTIME)}", "runtime_port": PORT,
+                "prompt_version": PROMPT_VERSION, "prompt_sha256": PROMPT_FINGERPRINT,
+                "context_size": 4096, "gpu_layers": 99, "parallel_slots": 1,
+                "batch_policy": {"default": 80, "fallback": 60},
+                "timeout_policy": {"startup_seconds":120,"inference_seconds":300,"restart_once":True},
+                "normalization_version": "translation-normalize-v1"}
+        run_id = str(uuid.uuid4())
+        def create_rows(connection, job_id):
+            # Rebuild under this write lock to bind accepted transcript and source generations atomically.
+            current, current_units = self._build_input(project_id, revision_id, connection)
+            if current != input_data or hashlib.sha256(self._json(current_units).encode("utf-8")).hexdigest() != unit_digest:
                 raise TranslationError("accepted_transcript_stale")
-            if revision["run_status"] not in {"READY", "REVIEW_REQUIRED"} or revision["active_asr"] != revision["asr_artifact_id"]:
-                raise TranslationError("accepted_transcript_stale")
-            groups = connection.execute("SELECT * FROM coverage_groups WHERE revision_id=?", (revision_id,)).fetchall()
-            def group_position(group):
-                member = connection.execute("SELECT MIN(rs.position) FROM coverage_group_members gm JOIN revision_segments rs ON rs.row_id=gm.row_id WHERE gm.revision_id=? AND gm.group_id=?", (revision_id, group["group_id"])).fetchone()[0]
-                if member is not None: return member
-                source_position = connection.execute("SELECT MIN(s.position) FROM coverage_group_sources gs JOIN segments s ON s.id=gs.source_id WHERE gs.revision_id=? AND gs.group_id=?", (revision_id, group["group_id"])).fetchone()[0]
-                return source_position if source_position is not None else 0
-            groups = sorted(groups, key=group_position)
-            units: list[dict[str, Any]] = []
-            seen_rows: set[str] = set()
-            seen_sources: set[str] = set()
-            for group in groups:
-                sources = connection.execute("SELECT source_id FROM coverage_group_sources WHERE revision_id=? AND group_id=? ORDER BY ordinal", (revision_id, group["group_id"])).fetchall()
-                source_ids = [row["source_id"] for row in sources]
-                if seen_sources.intersection(source_ids):
-                    raise TranslationError("source_coverage_invalid")
-                seen_sources.update(source_ids)
-                if group["review_status"] != "REVIEWED":
-                    raise TranslationError("transcript_review_required")
-                if group["disposition"] == "SKIPPED":
-                    continue
-                members = connection.execute(
-                    """SELECT rs.row_id,rs.stable_segment_key,rs.position,rs.text,rs.start_us,rs.end_us
-                       FROM coverage_group_members gm JOIN revision_segments rs ON rs.project_id=gm.project_id AND rs.revision_id=gm.revision_id AND rs.row_id=gm.row_id
-                       WHERE gm.revision_id=? AND gm.group_id=? ORDER BY gm.ordinal""", (revision_id, group["group_id"]),
-                ).fetchall()
-                row_ids = [row["row_id"] for row in members]
-                stable_keys = [row["stable_segment_key"] for row in members]
-                if not members or seen_rows.intersection(row_ids):
-                    raise TranslationError("translation_unit_coverage_invalid")
-                seen_rows.update(row_ids)
-                texts = [row["text"] for row in members]
-                source_text = "".join(texts)
-                if not source_text.strip():
-                    raise TranslationError("translation_unit_empty")
-                unit_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"autodub:{project_id}:translation-unit:{':'.join(stable_keys)}"))
-                units.append({"unit_id": unit_id, "logical_unit_key": unit_id, "position": len(units),
-                    "revision_segment_ids": row_ids, "source_segment_ids": source_ids, "source_text": source_text,
-                    "start_us": min(row["start_us"] for row in members), "end_us": max(row["end_us"] for row in members)})
-            included_rows = connection.execute("SELECT row_id FROM revision_segments WHERE revision_id=? ORDER BY position", (revision_id,)).fetchall()
-            all_rows = [row["row_id"] for row in included_rows]
-            source_rows = connection.execute("SELECT id FROM segments WHERE run_id=? ORDER BY position", (revision["run_id"],)).fetchall()
-            if not units or set(all_rows) != seen_rows or len(all_rows) != len(seen_rows) or set(row["id"] for row in source_rows) != seen_sources:
-                raise TranslationError("translation_unit_coverage_invalid")
-            return {"schema_version": 1, "project_id": project_id, "transcript_revision_id": revision_id,
-                "source_asset_id": revision["source_asset_id"], "source_generation": revision["source_generation"],
-                "transcript_generation": revision["transcript_generation"], "asr_artifact_id": revision["asr_artifact_id"],
-                "asr_input_fingerprint": revision["asr_fingerprint"]}, units
+            job = connection.execute("SELECT input_fingerprint FROM jobs WHERE id=?", (job_id,)).fetchone()
+            stamp = utc_now()
+            connection.execute("""INSERT INTO translation_runs(id,project_id,producer_job_id,transcript_revision_id,source_asset_id,input_fingerprint,
+                provider,model_id,provider_sdk_version,prompt_version,status,created_at,api_type,api_version,wire_protocol_version,pass_strategy,
+                normalization_policy_version,adapter_version,provider_strategy_version)
+                VALUES(?,?,?,?,?,?,'local','Hy-MT3-7B-Q4_K_M',NULL,?,'QUEUED',?,'chat_completions','v1','local-labeled-lines-v1','SINGLE_PASS',?,'llama.cpp/b12676','local-batch-80-60-v1')""",
+                (run_id,project_id,job_id,revision_id,current["source_asset_id"],job["input_fingerprint"],PROMPT_VERSION,stamp,"translation-normalize-v1"))
+            for unit in current_units:
+                connection.execute("""INSERT INTO translation_units(run_id,project_id,unit_id,logical_unit_key,position,chunk_no,
+                    revision_segment_ids_json,source_segment_ids_json,source_text,start_us,end_us,status)
+                    VALUES(?,?,?,?,?,NULL,?,?,?,?,?,'PENDING')""",(run_id,project_id,unit["unit_id"],unit["logical_unit_key"],unit["position"],
+                    self._json(unit["revision_segment_ids"]),self._json(unit["source_segment_ids"]),unit["source_text"],unit["start_us"],unit["end_us"]))
+            connection.execute("INSERT INTO local_translation_state(run_id,next_position,batch_limit,timeout_restart_used,updated_at) VALUES(?,0,80,0,?)",(run_id,stamp))
+        request_digest = {"project_id":project_id,"kind":"local_translation","accepted_transcript_revision_id":revision_id,
+                          "target_language":"vi","snapshot":snapshot}
+        job = self.jobs.create_job(project_id,"local_translation",snapshot,idempotency_key,activation_stage=ActivationStage.TRANSLATION,
+                                   creation_hook=create_rows,update_stage_input=True,request_digest_value=request_digest)
+        with closing(self.database.connect()) as c:
+            run = c.execute("SELECT id FROM translation_runs WHERE producer_job_id=?",(job["id"],)).fetchone()
+        return {"job":job,"run_id":run["id"] if run else None}
 
 
     def get_run(self, project_id: str, run_id: str) -> dict[str, Any] | None:
