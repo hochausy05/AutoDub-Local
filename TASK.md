@@ -28,6 +28,7 @@
 - [ ] FFprobe metadata, HTTP Range player, Unicode paths, missing-source relink.
 - [x] **MEDIA-01B automated implementation slice:** migration v6 relink contracts, guarded GET/HEAD Range playback, verified COPY/LINK source checks and same-content relink CAS; backend suite (64 tests), frontend build and helper parser pass. Browser/native picker manual acceptance was NOT RUN/BLOCKED at this slice; PO G2 acceptance was subsequently recorded below.
 - [x] **G2:** Product Owner accepted (2026-11-23; per explicit ASR-01A handoff).
+- [x] **MEDIA-01C Project & Video Management implementation:** migration v26 adds logical deletion; project/video delete use lock checks and preserve source files/history; deleted scope is hidden, stale selections are revoked, active source/downstream pointers are invalidated; second undeleted video/import Job is blocked. Focused backend tests and frontend build pass; project owner acceptance is not asserted.
 
 ### ASR-01 — Faster-Whisper
 - [x] **ASR-01A implementation slice:** real FFmpeg extraction, pinned Faster-Whisper adapter, model/device/VAD controls, durable immutable runs/segments and API/UI; 77 backend tests, frontend build and Windows launcher smoke pass. Real speech inference is NOT RUN; G3 remains pending PO acceptance (see CHANGELOG).
@@ -83,6 +84,7 @@
 - [ ] Reuse unchanged Unit artifacts, never silently truncate or insert fake silence.
 - [x] **TTS-01B provider qualification run:** real direct/adapter calls, bounded concurrency comparison, selective delayed recovery and isolated Preview API pipeline are recorded in CHANGELOG. Matrix stopped safely after three consecutive `NoAudioReceived`; Tests E/F remain NOT RUN. No production code or dependency changes.
 - [x] **TTS-01C reliability/control slice:** migration v25 adds content-free per-call diagnostics; batch Job/stage/Run/Unit creation is transactional with compact hashed snapshots; synthesis uses global cancellable pacing and up to three separated rounds, preserves ready Units, records recovery, and gates retry eligibility. Preview shares pacing/retry policy; UI syncs active preview and locks settings during work. Focused backend regressions and frontend build recorded in CHANGELOG; G5 remains pending.
+- [x] **TTS-01D lifecycle & retry state fix:** rounds stay within one Job/Run/Attempt, preserve READY Units, show retry wait/progress from Job state, respect Retry-After cooldown, verify all artifacts and mapping before completion, and close children consistently on cancel/error/recovery. Focused synthetic regressions and frontend build pass; G5 remains unaccepted.
 - [ ] **G5:** Mixed 50-Unit case, retry/cancel/replay and audio identity tests.
 
 ### SYNC-01 — Simple sync table

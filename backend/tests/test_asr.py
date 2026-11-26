@@ -204,27 +204,27 @@ class ASRTests(unittest.TestCase):
         duplicate_name = self.root / "another" / self.source.name
         duplicate_name.parent.mkdir()
         subprocess.run([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=96x64:r=10", "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000", "-t", "2", "-shortest", "-c:v", "mpeg4", "-c:a", "aac", "-y", str(duplicate_name)], check=True, timeout=30)
+        with self.assertRaisesRegex(MediaError,"project_video_limit"):
+            self._import_asset(duplicate_name)
+        self.media.delete_asset(self.project["id"],self.asset["id"],self.asset["lock_version"],"asr-delete-before-replace-01")
         second = self._import_asset(duplicate_name)
         self.assertEqual(second["display_name"], self.asset["display_name"])
         self.assertNotEqual(second["id"], self.asset["id"])
-        self.assertEqual(service.get_processing_source(self.project["id"])["media_asset_id"], self.asset["id"])
-        with closing(self.db.connect()) as connection:
-            connection.execute("DELETE FROM project_processing_sources WHERE project_id=?", (self.project["id"],))
-        self.assertEqual(service.get_processing_source(self.project["id"])["status"], "UNSELECTED")
-        selected = service.select_processing_source(self.project["id"], second["id"], 0)
-        self.assertEqual(selected["generation"], 1)
+        current=service.get_processing_source(self.project["id"])
+        self.assertEqual(current["status"],"UNSELECTED")
+        selected = service.select_processing_source(self.project["id"], second["id"], current["generation"])
+        self.assertEqual(selected["generation"], current["generation"]+1)
         restarted_db = Database(self.root / "data")
         restarted_db.initialize()
         restarted_artifacts = ArtifactPublicationService(restarted_db, {"source_video": SourceVideoValidator(self.ffprobe), "media_link_manifest": LinkManifestValidator(), "transcript_json": TranscriptArtifactValidator()})
         restarted_jobs = JobService(restarted_db, restarted_artifacts)
         restarted_media = MediaImportService(restarted_db, restarted_jobs, restarted_artifacts, self.ffprobe)
         restarted = ASRService(restarted_db, restarted_jobs, restarted_artifacts, restarted_media).get_processing_source(self.project["id"])
-        self.assertEqual((restarted["media_asset_id"], restarted["generation"]), (second["id"], 1))
+        self.assertEqual((restarted["media_asset_id"], restarted["generation"]), (second["id"], 3))
 
     def test_source_switch_during_job_keeps_snapshot_and_blocks_late_activation(self):
         source_b = self.root / "source-b.mp4"
         source_b.write_bytes(self.source.read_bytes())
-        second = self._import_asset(source_b)
         entered, resume = threading.Event(), threading.Event()
 
         class BlockingAdapter(FakeASRAdapter):
@@ -242,20 +242,26 @@ class ASRTests(unittest.TestCase):
         worker = threading.Thread(target=service.run_once)
         worker.start()
         self.assertTrue(entered.wait(5))
-        current = service.get_processing_source(self.project["id"])
-        service.select_processing_source(self.project["id"], second["id"], current["generation"])
+        with self.assertRaisesRegex(MediaError,"project_has_active_job"):
+            self.media.delete_asset(self.project["id"],self.asset["id"],self.asset["lock_version"],"asr-delete-while-active-01")
         resume.set()
         worker.join(10)
         self.assertFalse(worker.is_alive())
         self.assertEqual(self.jobs.get_job(job["id"])["status"], "READY")
-        self.assertEqual(self.jobs.get_job(job["id"])["attempts"][-1]["activation_outcome"], "STALE")
+        self.assertEqual(self.jobs.get_job(job["id"])["attempts"][-1]["activation_outcome"], "ACTIVE")
         old_run = service.list_runs(self.project["id"])[0]
         self.assertEqual(old_run["source_asset_id"], self.asset["id"])
-        self.assertFalse(old_run["is_active"])
+        self.assertTrue(old_run["is_active"])
+        self.media.delete_asset(self.project["id"],self.asset["id"],self.asset["lock_version"],"asr-delete-after-active-01")
+        second=self._import_asset(source_b)
+        current=service.get_processing_source(self.project["id"])
+        service.select_processing_source(self.project["id"],second["id"],current["generation"])
+        self.assertFalse(next(run for run in service.list_runs(self.project["id"]) if run["id"]==old_run["id"])["is_active"])
 
     def test_missing_selected_source_blocks_job_without_erasing_old_runs(self):
         linked_path = self.root / "linked-source.mp4"
         linked_path.write_bytes(self.source.read_bytes())
+        self.media.delete_asset(self.project["id"],self.asset["id"],self.asset["lock_version"],"asr-delete-before-link-01")
         linked = self._import_asset(linked_path, "LINK")
         service = self._service()
         current = service.get_processing_source(self.project["id"])
@@ -272,6 +278,7 @@ class ASRTests(unittest.TestCase):
             "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "1.5", "-shortest",
             "-c:v", "mpeg4", "-c:a", "aac", "-y", str(silent),
         ], check=True, timeout=30)
+        self.media.delete_asset(self.project["id"],self.asset["id"],self.asset["lock_version"],"asr-delete-before-silence-01")
         silent_asset = self._import_asset(silent)
         result = FakeASRAdapter().run(None, ASRConfig(), source_duration_us=2_000_000, source_offset_us=0, cancelled=lambda: False, progress=lambda _phase: None)
         result["segments"] = []
@@ -287,6 +294,7 @@ class ASRTests(unittest.TestCase):
     def test_no_audio_stream_fails_job_without_transcription_run(self):
         silent_video = self.root / "no-audio.mp4"
         subprocess.run([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=64x48:r=10", "-t", "1", "-an", "-c:v", "mpeg4", "-y", str(silent_video)], check=True, timeout=30)
+        self.media.delete_asset(self.project["id"],self.asset["id"],self.asset["lock_version"],"asr-delete-before-no-audio-01")
         asset = self._import_asset(silent_video)
         service = self._service()
         job = self._create_job(service, ASRConfig(device="cpu"), "asr-no-audio-idempotency-key-01", asset["id"])

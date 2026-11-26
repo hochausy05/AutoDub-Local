@@ -15,6 +15,7 @@
 ## Runtime source
 
 - `backend/app/`: FastAPI, SQLite, Jobs/recovery, media, ASR, Local Translation package, translation history/editor, TTS and artifact services.
+- SQLite schema is v26; MEDIA-01C logical Project/video deletion preserves media files and historical Job/Run data.
 - `backend/tests/`: backend unit and integration tests.
 - `frontend/src/`: React UI and local API clients; `scripts/windows/`: Windows development launcher.
 

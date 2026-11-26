@@ -14,7 +14,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 BUSY_TIMEOUT_MS = 5000
 
 
@@ -847,6 +847,35 @@ class Database:
             self._migrate_v24()
         if target_version >= 25:
             self._migrate_v25()
+        if target_version >= 26:
+            self._migrate_v26()
+
+    def _migrate_v26(self) -> None:
+        """Add logical deletion and allow an explicitly unselected processing source."""
+        with closing(self.connect()) as connection:
+            current = connection.execute("SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0]
+            if current >= 26:
+                return
+            if current != 25:
+                raise RuntimeError(f"Migration v26 requires schema v25, found {current}.")
+            connection.execute("PRAGMA foreign_keys=OFF")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute("ALTER TABLE projects ADD COLUMN deleted_at TEXT")
+                connection.execute("ALTER TABLE media_assets ADD COLUMN deleted_at TEXT")
+                connection.execute("CREATE TABLE project_processing_sources_v26 (project_id TEXT PRIMARY KEY NOT NULL REFERENCES projects(id) ON DELETE RESTRICT, media_asset_id TEXT, generation INTEGER NOT NULL CHECK(generation>=1), updated_at TEXT NOT NULL, FOREIGN KEY(project_id,media_asset_id) REFERENCES media_assets(project_id,id) ON DELETE RESTRICT)")
+                connection.execute("INSERT INTO project_processing_sources_v26 SELECT project_id,media_asset_id,generation,updated_at FROM project_processing_sources")
+                connection.execute("DROP TABLE project_processing_sources")
+                connection.execute("ALTER TABLE project_processing_sources_v26 RENAME TO project_processing_sources")
+                connection.execute("CREATE INDEX project_processing_source_asset_idx ON project_processing_sources(project_id,media_asset_id)")
+                connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(26,?)", (utc_now(),))
+                errors=connection.execute("PRAGMA foreign_key_check").fetchall()
+                if errors: raise RuntimeError("Migration v26 failed foreign_key_check.")
+                connection.commit()
+            except BaseException:
+                connection.rollback(); raise
+            finally:
+                connection.execute("PRAGMA foreign_keys=ON")
 
     def _migrate_v25(self) -> None:
         """Add private, content-free per-call TTS diagnostics."""
@@ -1060,7 +1089,7 @@ class Database:
     def list_projects(self, limit: int, offset: int) -> list[dict[str, Any]]:
         with closing(self.connect()) as connection:
             rows = connection.execute(
-                "SELECT id,name,status,created_at,updated_at,lock_version,schema_version FROM projects ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
+                "SELECT id,name,status,created_at,updated_at,lock_version,schema_version FROM projects WHERE deleted_at IS NULL ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
                 (limit, offset),
             ).fetchall()
         return [self._project(row) for row in rows]
@@ -1068,7 +1097,32 @@ class Database:
     def get_project(self, project_id: str) -> dict[str, Any] | None:
         with closing(self.connect()) as connection:
             row = connection.execute(
-                "SELECT id,name,status,created_at,updated_at,lock_version,schema_version FROM projects WHERE id=?",
+                "SELECT id,name,status,created_at,updated_at,lock_version,schema_version FROM projects WHERE id=? AND deleted_at IS NULL",
                 (project_id,),
             ).fetchone()
         return self._project(row) if row else None
+
+    def delete_project(self, project_id: str, expected_lock_version: int, key: str) -> str:
+        """Logically delete a project while retaining its complete history and files."""
+        digest = hashlib.sha256(json.dumps({"project_id": project_id, "expected_lock_version": expected_lock_version}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        with closing(self.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            prior=connection.execute("SELECT request_digest FROM idempotency_records WHERE scope='project:delete' AND idempotency_key=?",(key,)).fetchone()
+            if prior:
+                if prior["request_digest"]!=digest: raise IdempotencyConflict
+                connection.commit(); return "deleted"
+            row=connection.execute("SELECT lock_version,deleted_at FROM projects WHERE id=?",(project_id,)).fetchone()
+            if row is None: raise KeyError("project_not_found")
+            if row["deleted_at"] is not None: raise KeyError("project_deleted")
+            if row["lock_version"]!=expected_lock_version: raise ValueError("project_revision_conflict")
+            if connection.execute("SELECT 1 FROM jobs WHERE project_id=? AND status IN ('QUEUED','RUNNING','CANCEL_REQUESTED') LIMIT 1",(project_id,)).fetchone(): raise ValueError("project_has_active_job")
+            stamp=utc_now()
+            connection.execute("UPDATE projects SET deleted_at=?,lock_version=lock_version+1,updated_at=? WHERE id=? AND lock_version=?",(stamp,stamp,project_id,expected_lock_version))
+            connection.execute("UPDATE media_assets SET deleted_at=? WHERE project_id=? AND deleted_at IS NULL",(stamp,project_id))
+            connection.execute("UPDATE project_processing_sources SET media_asset_id=NULL,generation=generation+1,updated_at=? WHERE project_id=?",(stamp,project_id))
+            connection.execute("UPDATE media_import_state SET active_asset_id=NULL,active_generation=desired_generation WHERE project_id=?",(project_id,))
+            connection.execute("UPDATE selections SET state='REVOKED' WHERE project_id=? AND state='ISSUED'",(project_id,))
+            connection.execute("UPDATE stage_pointers SET active_artifact_id=NULL,pointer_generation=pointer_generation+1,updated_at=? WHERE project_id=? AND active_artifact_id IS NOT NULL",(stamp,project_id))
+            connection.execute("INSERT INTO idempotency_records(scope,idempotency_key,request_digest,project_id,response_json,created_at) VALUES('project:delete',?,?,?, '{}',?)",(key,digest,project_id,stamp))
+            connection.commit()
+        return "deleted"

@@ -1,9 +1,9 @@
 ﻿import { memo, useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { fetchBackendHealth, type BackendHealth } from "../api/health";
-import { createProject, fetchProjects, type Project } from "../api/projects";
+import { createProject, deleteProject as deleteProjectApi, fetchProjects, type Project } from "../api/projects";
 import { establishSession } from "../api/session";
 import { TTSPanel } from "./TTSPanel";
-import { acceptOriginalTranslation, acceptTranscriptRevision, acceptTranslationDraft, cancelLocalJob, chooseSource, createASRJob, createLocalTranslationJob, createTranscriptDraft, createTranslationDraft, fetchLocalTranslationStatus, fetchTranslationEditor, fetchTranslationRun, fetchTranslationRuns, fetchASRModels, fetchASRRun, fetchASRRuns, fetchMedia, fetchProcessingSource, fetchTranscriptRevisions, getImportJob, importSelected, mediaStreamUrl, relinkMedia, retryLocalJob, saveTranscriptDraft, saveTranslationDraft, selectProcessingSource, type ASRJob, type ASRRun, type ASRRunSummary, type ImportJob, type LocalTranslationStatus, type MediaAsset, type ProcessingSource, type TranscriptRevision, type TranslationEditorState, type TranslationRevisionUnit, type TranslationRun } from "../api/media";
+import { acceptOriginalTranslation, acceptTranscriptRevision, acceptTranslationDraft, cancelLocalJob, chooseSource, createASRJob, createLocalTranslationJob, createTranscriptDraft, createTranslationDraft, deleteMedia, fetchLocalTranslationStatus, fetchTranslationEditor, fetchTranslationRun, fetchTranslationRuns, fetchASRModels, fetchASRRun, fetchASRRuns, fetchMedia, fetchProcessingSource, fetchTranscriptRevisions, getImportJob, importSelected, mediaStreamUrl, relinkMedia, retryLocalJob, saveTranscriptDraft, saveTranslationDraft, selectProcessingSource, type ASRJob, type ASRRun, type ASRRunSummary, type ImportJob, type LocalTranslationStatus, type MediaAsset, type ProcessingSource, type TranscriptRevision, type TranslationEditorState, type TranslationRevisionUnit, type TranslationRun } from "../api/media";
 
 type Connection =
   | { state: "checking"; message: string; health: null }
@@ -176,6 +176,27 @@ export function App() {
     } finally {
       setSavingProject(false);
     }
+  };
+
+  const retireMedia = async (asset:MediaAsset) => {
+    if ((transcriptDirty || translationDirtyCount>0) && !window.confirm("Bạn còn thay đổi chưa lưu. Xóa video sẽ bỏ các thay đổi đang nhập. Tiếp tục?")) return;
+    if (!window.confirm(`Xóa “${asset.display_name}” khỏi Project? Video sẽ biến mất khỏi ứng dụng; file trên máy vẫn được giữ nguyên.`)) return;
+    try {
+      await deleteMedia(selectedProject,asset);
+      if(videoRef.current){videoRef.current.pause();videoRef.current.removeAttribute("src");videoRef.current.load();}
+      setPlayingMediaId("");setMediaAssets((items)=>items.filter((item)=>item.id!==asset.id));
+      if(selectedMediaId===asset.id){setSelectedMediaId("");setProcessingSource(null);setSelectedRun(null);setAsrRuns([]);setTranscriptRevision(null);setTranscriptRevisions([]);setTranslationRun(null);setTranslationEditor(null);setTranslationJob(null);}
+      await refreshMedia(selectedProject); await refreshProcessingSource(selectedProject);
+    } catch(error){setMediaError(error instanceof Error?error.message:"Không xóa được video.");}
+  };
+
+  const retireProject = async(project:Project)=>{
+    if((transcriptDirty||translationDirtyCount>0)&&!window.confirm("Bạn còn thay đổi chưa lưu. Xóa Project sẽ bỏ trạng thái đang nhập. Tiếp tục?"))return;
+    if(!window.confirm(`Xóa Project “${project.name}”? Project và video sẽ biến mất khỏi ứng dụng; các file trên máy vẫn được giữ nguyên.`))return;
+    try{
+      await deleteProjectApi(project); const next=await fetchProjects(); setProjects(next);
+      if(selectedProject===project.id){setSelectedProject("");setMediaAssets([]);setImportJob(null);setSelectedMediaId("");setPlayingMediaId("");setProcessingSource(null);setSelectedRun(null);setAsrRuns([]);setAsrJob(null);setTranscriptRevision(null);setTranscriptRevisions([]);setTranslationRun(null);setTranslationEditor(null);setTranslationJob(null);setLocalTranslationStatus(null);if(videoRef.current){videoRef.current.pause();videoRef.current.removeAttribute("src");videoRef.current.load();}}
+    }catch(error){setProjectError(error instanceof Error?error.message:"Không xóa được Project.");}
   };
 
   const refreshMedia = useCallback(async (projectId: string) => {
@@ -748,13 +769,14 @@ export function App() {
             </form>
             {projectError ? <p className="project-error" role="alert">{projectError}</p> : null}
             {projects.length ? <>
-              <ul className="project-list">{projects.map((project) => <li key={project.id}><span><strong>{project.name}</strong><small>{project.status} · {new Date(project.created_at).toLocaleString()}</small></span><code>{project.id}</code></li>)}</ul>
+              <ul className="project-list">{projects.map((project) => <li key={project.id}><span><strong>{project.name}</strong><small>{project.status} · {new Date(project.created_at).toLocaleString()}</small></span><code>{project.id}</code><button type="button" disabled={!!importJob&&["QUEUED","RUNNING","CANCEL_REQUESTED"].includes(importJob.status)} onClick={()=>void retireProject(project)}>Xóa Project</button></li>)}</ul>
               <div className="media-import">
                 <label htmlFor="media-project">Project nhận video</label>
                 <select id="media-project" value={selectedProject} onChange={(event) => { if (!(transcriptDirty || translationDirtyCount > 0) || window.confirm("Bạn còn thay đổi chưa lưu trong lời thoại hoặc bản dịch. Đổi Project sẽ bỏ phần đang nhập chưa lưu. Tiếp tục?")) setSelectedProject(event.target.value); }}><option value="">Chọn Project</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select>
                 <label htmlFor="import-mode">Chế độ lưu nguồn</label>
                 <select id="import-mode" value={importMode} onChange={(event) => setImportMode(event.target.value as "COPY" | "LINK")}><option value="COPY">COPY · quản lý bản sao</option><option value="LINK">LINK · giữ nguyên file gốc</option></select>
-                <button type="button" onClick={() => void startImport()} disabled={!selectedProject || selectingMedia || connection.state !== "online"}>{selectingMedia ? "Đang mở hộp thoại…" : "Thêm video mới"}</button>
+                <button type="button" onClick={() => void startImport()} disabled={!selectedProject || mediaAssets.length>0 || selectingMedia || connection.state !== "online"}>{selectingMedia ? "Đang mở hộp thoại…" : "Thêm video mới"}</button>
+                {mediaAssets.length>0?<small>Xóa video hiện tại trước khi thêm video khác. Xóa chỉ gỡ khỏi Project; file trên máy vẫn được giữ.</small>:null}
                 {importJob ? <p role="status">Import {importJob.status}{importJob.error_code ? ` · ${importJob.error_code}` : ""}</p> : null}
                 {mediaError ? <p className="project-error" role="alert">{mediaError}</p> : null}
                 <h3 id="video-library">Video đã nhập</h3>
@@ -766,6 +788,7 @@ export function App() {
                     <button type="button" disabled={asset.status !== "READY"} onClick={() => setPlayingMediaId(asset.id)}>Phát video</button>
                     <button type="button" disabled={asset.status !== "READY" || savingProcessingSource || selectedMediaId === asset.id} onClick={() => void chooseProcessingVideo(asset)}>{selectedMediaId === asset.id ? "Đang sử dụng để xử lý" : "Chọn làm video xử lý"}</button>
                     {asset.mode === "LINK" && asset.status !== "READY" ? <button type="button" disabled={relinkingAssetId === asset.id} onClick={() => void startRelink(asset)}>{relinkingAssetId === asset.id ? "Đang chọn lại…" : "Chọn lại video"}</button> : null}
+                    <button type="button" disabled={!!importJob&&["QUEUED","RUNNING","CANCEL_REQUESTED"].includes(importJob.status)} onClick={()=>void retireMedia(asset)}>Xóa video khỏi Project</button>
                     <small>ID: {asset.id}</small>
                   </div>
                 </li>)}</ul>

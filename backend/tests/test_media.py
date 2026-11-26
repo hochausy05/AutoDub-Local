@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 
 from app.artifacts import ArtifactPublicationService
 from app.database import Database
-from app.jobs import JobService
+from app.jobs import JobNotFound, JobService
 from app.media import FFprobe, LinkManifestValidator, MediaError, MediaImportService, SourceVideoValidator, _path_identity, parse_single_byte_range
 from app.main import create_app
 from app.recovery import StartupRecovery
@@ -133,19 +133,53 @@ class MediaImportTests(unittest.TestCase):
         self.assertEqual(self.jobs.get_job(job["id"])["status"], "FAILED")
         self.assertEqual(self.service.list_assets(self.project["id"]), [])
 
-    def test_stale_import_does_not_replace_newer_project_source(self):
+    def test_second_video_is_blocked_and_logical_delete_preserves_file(self):
         first = self.service.create_import_job(self.session, self.project["id"], self.issue_selection(), "COPY", "older-import-idempotency-key-0001")
-        second = self.service.create_import_job(self.session, self.project["id"], self.issue_selection(), "COPY", "newer-import-idempotency-key-0002")
+        with self.assertRaisesRegex(MediaError,"project_video_limit"):
+            self.service.create_import_job(self.session, self.project["id"], self.issue_selection(), "COPY", "newer-import-idempotency-key-0002")
         self.assertTrue(self.service.import_once())
+        asset=self.service.list_assets(self.project["id"])[0]
+        self.service.get_processing_source(self.project["id"],auto_select_single=False)
+        self.service.select_processing_source(self.project["id"],asset["id"],0)
+        self.service.delete_asset(self.project["id"],asset["id"],asset["lock_version"],"media-delete-idempotency-key-01")
+        self.assertEqual(self.service.list_assets(self.project["id"]),[])
+        self.assertEqual(self.service.get_processing_source(self.project["id"])["status"],"UNSELECTED")
+        with self.assertRaises(JobNotFound):self.jobs.get_job(first["id"])
         with closing(self.db.connect()) as connection:
-            state = connection.execute("SELECT active_generation FROM media_import_state WHERE project_id=?", (self.project["id"],)).fetchone()
-            first_generation = connection.execute("SELECT generation FROM media_assets WHERE producer_job_id=?", (first["id"],)).fetchone()
-        self.assertEqual(first_generation["generation"], 1)
-        self.assertEqual(state["active_generation"], 0)
-        self.assertTrue(self.service.import_once())
+            row=connection.execute("SELECT deleted_at FROM media_assets WHERE id=?",(asset["id"],)).fetchone()
+            history=connection.execute("SELECT status FROM jobs WHERE id=?",(first["id"],)).fetchone()
+        self.assertIsNotNone(row["deleted_at"])
+        self.assertEqual(history["status"],"READY")
+        self.assertTrue(self.video.exists())
+
+    def test_project_logical_delete_hides_project_and_assets_without_removing_history_or_file(self):
+        job=self.service.create_import_job(self.session,self.project["id"],self.issue_selection(),"COPY","project-delete-import-key-00001")
+        self.service.import_once(); asset=self.service.list_assets(self.project["id"])[0]
+        self.db.delete_project(self.project["id"],self.project["lock_version"],"project-delete-idempotency-key-01")
+        self.assertIsNone(self.db.get_project(self.project["id"]))
+        self.assertEqual(self.service.list_assets(self.project["id"]),[])
         with closing(self.db.connect()) as connection:
-            state = connection.execute("SELECT active_generation FROM media_import_state WHERE project_id=?", (self.project["id"],)).fetchone()
-        self.assertEqual(state["active_generation"], 2)
+            self.assertIsNotNone(connection.execute("SELECT deleted_at FROM media_assets WHERE id=?",(asset["id"],)).fetchone()["deleted_at"])
+            history=connection.execute("SELECT status FROM jobs WHERE id=?",(job["id"],)).fetchone()
+            self.assertEqual(history["status"],"READY")
+        self.assertTrue(self.video.exists())
+
+    def test_project_delete_api_requires_mutation_guards_and_replays_idempotently(self):
+        app=create_app("media-delete-api-secret",data_root=self.root/"delete-api")
+        headers={"host":"127.0.0.1:8000","origin":"http://127.0.0.1:5173","sec-fetch-site":"same-origin"}
+        with TestClient(app,client=("127.0.0.1",50005)) as client:
+            boot=client.post("/api/v1/session/bootstrap",headers={**headers,"content-type":"application/json","x-local-bootstrap":"media-delete-api-secret"},json={})
+            csrf=boot.json()["csrf_token"]
+            project=client.post("/api/v1/projects",headers={**headers,"content-type":"application/json","x-csrf-token":csrf,"idempotency-key":"media-delete-project-create-01"},json={"name":"Delete API"}).json()
+            route=f"/api/v1/projects/{project['id']}"
+            denied=client.request("DELETE",route,headers={**headers,"content-type":"application/json"},json={"expected_lock_version":project["lock_version"]})
+            self.assertEqual(denied.status_code,403)
+            delete_headers={**headers,"content-type":"application/json","x-csrf-token":csrf,"idempotency-key":"media-delete-project-action-01"}
+            body={"expected_lock_version":project["lock_version"]}
+            self.assertEqual(client.request("DELETE",route,headers=delete_headers,json=body).status_code,204)
+            self.assertEqual(client.request("DELETE",route,headers=delete_headers,json=body).status_code,204)
+            self.assertEqual(client.get(route,headers=headers).status_code,404)
+            self.assertEqual(client.get("/api/v1/projects",headers=headers).json()["items"],[])
 
     def test_restart_interrupts_durable_import_and_explicit_retry_recovers(self):
         job = self.service.create_import_job(self.session, self.project["id"], self.issue_selection(), "COPY", "restart-import-idempotency-key-01")
@@ -176,8 +210,11 @@ class MediaImportTests(unittest.TestCase):
             csrf = boot.json()["csrf_token"]
             project_response = client.post("/api/v1/projects", headers={**host_headers, "content-type": "application/json", "x-csrf-token": csrf, "idempotency-key": "media-api-project-idem-0001"}, json={"name": "API media"})
             project_id = project_response.json()["id"]
+            copy_project_id=project_id
             original_hash = hashlib.sha256(self.video.read_bytes()).hexdigest()
             for index, mode in enumerate(("COPY", "LINK"), start=1):
+                if index>1:
+                    project_id=client.post("/api/v1/projects",headers={**host_headers,"content-type":"application/json","x-csrf-token":csrf,"idempotency-key":"media-api-project-idem-0002"},json={"name":"API media LINK"}).json()["id"]
                 token = uuid.uuid4().hex + uuid.uuid4().hex
                 session_token = client.cookies.get("autodub_session")
                 with closing(app.state.database.connect()) as connection:
@@ -237,7 +274,9 @@ class MediaImportTests(unittest.TestCase):
             self.assertEqual(boot.status_code, 200)
             assets = client.get(f"/api/v1/projects/{project_id}/media", headers=host_headers)
             self.assertEqual(assets.status_code, 200)
-            self.assertEqual({asset["mode"] for asset in assets.json()["items"]}, {"COPY", "LINK"})
+            self.assertEqual({asset["mode"] for asset in assets.json()["items"]}, {"LINK"})
+            copy_assets=client.get(f"/api/v1/projects/{copy_project_id}/media",headers=host_headers).json()["items"]
+            self.assertEqual({asset["mode"] for asset in copy_assets},{"COPY"})
             asset = assets.json()["items"][0]
             stream_url = f"/api/v1/projects/{project_id}/media/{asset['id']}/stream"
             self.assertEqual(client.get(stream_url, headers={**host_headers, "origin": "http://evil.invalid"}).status_code, 403)

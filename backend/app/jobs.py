@@ -202,6 +202,22 @@ class JobService:
             "expected_pointer_generation": row["expected_pointer_generation"],
         }
 
+    @staticmethod
+    def _job_asset_retired(connection:sqlite3.Connection,job_id:str)->bool:
+        job=connection.execute("SELECT kind,input_snapshot FROM jobs WHERE id=?",(job_id,)).fetchone()
+        if job is None:return False
+        asset_ids=[]
+        try:snapshot=json.loads(job["input_snapshot"])
+        except (TypeError,ValueError):snapshot={}
+        if job["kind"]=="asr_transcription" and isinstance(snapshot,dict) and isinstance(snapshot.get("source_asset_id"),str):
+            asset_ids.append(snapshot["source_asset_id"])
+        elif job["kind"]=="edge_tts_batch":
+            row=connection.execute("SELECT source_asset_id FROM tts_runs WHERE producer_job_id=?",(job_id,)).fetchone()
+            if row:asset_ids.append(row["source_asset_id"])
+        elif job["kind"]=="media_import":
+            return connection.execute("SELECT 1 FROM media_assets WHERE producer_job_id=? AND deleted_at IS NOT NULL LIMIT 1",(job_id,)).fetchone() is not None
+        return any(connection.execute("SELECT 1 FROM media_assets WHERE id=? AND deleted_at IS NOT NULL",(asset_id,)).fetchone() is not None for asset_id in asset_ids)
+
     def set_stage_input(self, project_id: str, stage: str, input_snapshot: dict[str, Any]) -> dict[str, Any]:
         project_id = self._uuid(project_id, "project_id")
         if not isinstance(stage, str) or not _STAGE.fullmatch(stage) or stage not in _STAGES:
@@ -267,7 +283,7 @@ class JobService:
         input_fingerprint = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
         scope = f"job:create:{project_id}:{kind}"
         with self._write() as connection:
-            project = connection.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone()
+            project = connection.execute("SELECT 1 FROM projects WHERE id=? AND deleted_at IS NULL", (project_id,)).fetchone()
             if project is None:
                 raise JobNotFound
             previous = connection.execute(
@@ -292,6 +308,12 @@ class JobService:
                 active_tts = connection.execute("SELECT id FROM jobs WHERE project_id=? AND kind IN ('edge_tts_batch','edge_tts_preview') AND status IN ('QUEUED','RUNNING','CANCEL_REQUESTED') LIMIT 1", (project_id,)).fetchone()
                 if active_tts:
                     raise JobConflict("tts_job_already_active")
+                cooldown = connection.execute("""SELECT a.retry_after_at FROM jobs j JOIN job_attempts a ON a.job_id=j.id
+                    WHERE j.project_id=? AND j.kind IN ('edge_tts_batch','edge_tts_preview') AND j.status='FAILED'
+                      AND a.attempt_no=(SELECT MAX(a2.attempt_no) FROM job_attempts a2 WHERE a2.job_id=j.id)
+                      AND a.retry_after_at>? ORDER BY a.retry_after_at DESC LIMIT 1""", (project_id,utc_now())).fetchone()
+                if cooldown:
+                    raise JobConflict("tts_retry_cooldown")
 
             if update_stage:
                 self._set_stage_input_in_transaction(connection, project_id, update_stage, input_fingerprint)
@@ -332,6 +354,9 @@ class JobService:
         expected_project = self._uuid(project_id, "project_id") if project_id is not None else None
         with closing(self.database.connect()) as connection:
             detail = self._job_detail(connection, job_id)
+            if connection.execute("SELECT 1 FROM projects WHERE id=? AND deleted_at IS NULL",(detail["project_id"],)).fetchone() is None:
+                raise JobNotFound
+            if self._job_asset_retired(connection,job_id):raise JobNotFound
         if expected_project is not None and detail["project_id"] != expected_project:
             raise JobNotFound
         return detail
@@ -371,9 +396,12 @@ class JobService:
         scope = f"job:cancel:{job_id}"
         digest = self._digest({"job_id": job_id, "action": "cancel"})
         with self._write() as connection:
-            job = connection.execute("SELECT project_id,status FROM jobs WHERE id=?", (job_id,)).fetchone()
+            job = connection.execute("SELECT project_id,kind,status FROM jobs WHERE id=?", (job_id,)).fetchone()
             if job is None:
                 raise JobNotFound
+            if connection.execute("SELECT 1 FROM projects WHERE id=? AND deleted_at IS NULL",(job["project_id"],)).fetchone() is None:
+                raise JobConflict("project_deleted")
+            if self._job_asset_retired(connection,job_id):raise JobConflict("asset_deleted")
             previous = connection.execute(
                 "SELECT request_digest FROM idempotency_records WHERE scope=? AND idempotency_key=?",
                 (scope, idempotency_key),
@@ -387,6 +415,9 @@ class JobService:
                         "UPDATE jobs SET status='CANCELLED',cancel_requested=1,lock_version=lock_version+1,updated_at=? WHERE id=? AND status='QUEUED'",
                         (stamp, job_id),
                     )
+                    if job["kind"] == "edge_tts_batch":
+                        connection.execute("UPDATE tts_run_units SET status='CANCELLED',retryable=0,error_code='job_cancelled',updated_at=? WHERE tts_run_id IN (SELECT id FROM tts_runs WHERE producer_job_id=?) AND status='QUEUED'", (stamp,job_id))
+                        connection.execute("UPDATE tts_runs SET status='CANCELLED',completed_at=? WHERE producer_job_id=? AND status='QUEUED'", (stamp,job_id))
                 elif job["status"] == "RUNNING":
                     connection.execute(
                         "UPDATE jobs SET status='CANCEL_REQUESTED',cancel_requested=1,lock_version=lock_version+1,updated_at=? WHERE id=? AND status='RUNNING'",
@@ -464,6 +495,11 @@ class JobService:
                 "UPDATE jobs SET status='QUEUED',cancel_requested=0,lock_version=lock_version+1,updated_at=? WHERE id=? AND status=?",
                 (stamp, job_id, expected_status),
             )
+            if job["kind"] == "edge_tts_batch":
+                run = connection.execute("SELECT id FROM tts_runs WHERE producer_job_id=?", (job_id,)).fetchone()
+                if run:
+                    connection.execute("UPDATE tts_runs SET status='QUEUED',completed_at=NULL WHERE id=? AND status IN ('PARTIAL','FAILED','INTERRUPTED')", (run["id"],))
+                    connection.execute("UPDATE tts_run_units SET status='QUEUED',error_code=NULL,updated_at=? WHERE tts_run_id=? AND (status='QUEUED' OR (status='FAILED' AND retryable=1))", (stamp,run["id"]))
             connection.execute(
                 """INSERT INTO idempotency_records(scope,idempotency_key,request_digest,project_id,response_json,created_at)
                    VALUES(?,?,?,?,?,?)""",
@@ -474,7 +510,7 @@ class JobService:
     def update_attempt_progress(self, job_id: str, attempt_id: str, progress: dict[str, Any]) -> dict[str, Any]:
         job_id = self._uuid(job_id, "job_id")
         attempt_id = self._uuid(attempt_id, "attempt_id")
-        if not isinstance(progress, dict) or set(progress) - {"phase", "completed_units", "total_units", "fraction", "retry_after_at", "current_round", "round_count", "running_units", "queued_units", "failed_units"}:
+        if not isinstance(progress, dict) or set(progress) - {"phase", "completed_units", "total_units", "fraction", "retry_after_at", "current_round", "next_round", "round_count", "running_units", "queued_units", "failed_units", "retry_units"}:
             raise JobInputError("invalid_progress")
         phase = progress.get("phase")
         if phase is not None and (not isinstance(phase, str) or not _PHASE.fullmatch(phase)):
@@ -485,10 +521,10 @@ class JobService:
             raise JobInputError("invalid_progress")
         if completed is not None and (type(completed) is not int or type(total) is not int or completed < 0 or total < completed):
             raise JobInputError("invalid_progress")
-        for field in ("current_round", "round_count", "running_units", "queued_units", "failed_units"):
+        for field in ("current_round", "next_round", "round_count", "running_units", "queued_units", "failed_units", "retry_units"):
             value = progress.get(field)
             if value is not None and (type(value) is not int or value < 0 or
-                (field in {"current_round", "round_count"} and not 1 <= value <= 3) or
+                (field in {"current_round", "next_round", "round_count"} and not 1 <= value <= 3) or
                 (field.endswith("_units") and total is not None and value > total)):
                 raise JobInputError("invalid_progress")
         fraction = progress.get("fraction")
@@ -552,6 +588,8 @@ class JobService:
                     "UPDATE jobs SET status='CANCELLED',lock_version=lock_version+1,updated_at=? WHERE id=? AND status='CANCEL_REQUESTED'",
                     (stamp, job_id),
                 )
+                if completion_hook is not None:
+                    completion_hook(connection)
             elif job["status"] == "RUNNING":
                 activation_outcome = "NOT_APPLICABLE"
                 if job["activation_stage"] is not None:
@@ -600,7 +638,8 @@ class JobService:
             return self._job_detail(connection, job_id)
 
     def fail_attempt(self, job_id: str, attempt_id: str, error_code: str, *, retryable: bool = False,
-                     retry_after_at: str | None = None) -> dict[str, Any]:
+                     retry_after_at: str | None = None,
+                     completion_hook: Callable[[sqlite3.Connection], None] | None = None) -> dict[str, Any]:
         job_id = self._uuid(job_id, "job_id")
         attempt_id = self._uuid(attempt_id, "attempt_id")
         if type(retryable) is not bool:
@@ -647,4 +686,6 @@ class JobService:
                     "UPDATE jobs SET status='FAILED',lock_version=lock_version+1,updated_at=? WHERE id=? AND status='RUNNING'",
                     (stamp, job_id),
                 )
+            if completion_hook is not None:
+                completion_hook(connection)
             return self._job_detail(connection, job_id)

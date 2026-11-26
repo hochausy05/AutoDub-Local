@@ -1,5 +1,11 @@
 # ERROR_LOG — Reproducible Incidents in the New Project
 
+## TTS-01D — Retry lifecycle and artifact metadata validation (resolved)
+- **Date/time:** 2026-11-26 UTC+7
+- **Observed:** Focused synthetic retry tests showed transient failures stopped after one round; retrying Units never reached later rounds. Additional validation treated `ArtifactPublicationService.verify_ready()` metadata as top-level fields although it is returned under `verification_metadata`, causing READY Units to be marked unavailable. A queued-cancel test also found a missing `kind` projection in cancellation.
+- **Resolution/verification:** Removed the early all-transient exit so eligible Units continue through bounded rounds, read the validator metadata from its canonical field, and included Job kind in cancel lookup. Focused retry, artifact, cancel and media logical-delete tests pass.
+- **Scope:** Temporary test DataRoots and synthetic FFmpeg audio only; no live provider or user media.
+
 ## TTS-01C — Per-call diagnostic INSERT had a placeholder mismatch (resolved)
 - **Date/time:** 2026-11-25 22:39 UTC+7
 - **Observed:** Focused synthetic TTS retry tests intermittently ended Units as `tts_unit_failed` before the adapter call began; the per-call diagnostics INSERT supplied one extra value.

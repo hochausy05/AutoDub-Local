@@ -170,6 +170,12 @@ export async function fetchMedia(projectId: string) {
   return body.items;
 }
 
+export async function deleteMedia(projectId:string,asset:MediaAsset):Promise<void>{
+  const csrf=currentCsrfToken(); if(!csrf) throw new Error("Phiên cục bộ chưa sẵn sàng.");
+  const response=await fetch(`/api/v1/projects/${projectId}/media/${asset.id}`,{method:"DELETE",credentials:"same-origin",headers:{"Content-Type":"application/json","X-CSRF-Token":csrf,"Idempotency-Key":crypto.randomUUID()},body:JSON.stringify({expected_lock_version:asset.lock_version})});
+  await checked(response);
+}
+
 export async function fetchProcessingSource(projectId: string) {
   const response = await fetch(`/api/v1/projects/${projectId}/processing-source`, { credentials: "same-origin", cache: "no-store" });
   await checked(response);

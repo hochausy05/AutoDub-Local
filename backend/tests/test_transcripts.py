@@ -227,6 +227,7 @@ class TranscriptTests(unittest.TestCase):
         draft = self.service.save_edits(self.project["id"], self.draft["id"], 1, [{"row_id": self.draft["segments"][0]["row_id"], "text": "Draft stays"}], "transcript-stale-save-00001")
         other_source = self.root / "another-video.mp4"
         other_source.write_bytes(self.source.read_bytes())
+        self.media.delete_asset(self.project["id"],self.asset["id"],self.asset["lock_version"],"transcript-delete-before-replace-01")
         other = self._import_source(other_source)
         with closing(self.db.connect()) as c:
             current = c.execute("SELECT generation FROM project_processing_sources WHERE project_id=?", (self.project["id"],)).fetchone()[0]
@@ -234,7 +235,6 @@ class TranscriptTests(unittest.TestCase):
         from app.asr import ASRService
         asr = ASRService(self.db, self.jobs, self.artifacts, self.media, adapter=self.Adapter())
         changed = asr.select_processing_source(self.project["id"], other["id"], current)
-        asr.select_processing_source(self.project["id"], self.asset["id"], changed["generation"])
         with self.assertRaisesRegex(TranscriptError, "transcript_input_stale"):
             self.service.accept(self.project["id"], self.draft["id"], draft["lock_version"], None, "transcript-stale-accept-01")
         self.assertEqual(self.service.get_revision(self.project["id"], self.draft["id"])["segments"][0]["text"], "Draft stays")

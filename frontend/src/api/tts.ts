@@ -4,7 +4,7 @@ import type { TranslationRevision } from "./media";
 export type TTSVoice = { short_name: string; locale: string; gender?: string };
 export type TTSArtifact = { id: string; duration_us: number; sample_count: number; sample_rate: number; channels: number; codec: string; container: string };
 export type TTSUnit = { unit_id: string; position: number; source_text: string; accepted_text: string; start_us: number; end_us: number; status: string; error_code: string | null; cache_hit: number; artifact: TTSArtifact | null };
-export type TTSRun = { id: string; project_id: string; producer_job_id: string; translation_revision_id: string; status: string; is_active: boolean; config: { voice: string; rate_percent: number }; retry_available: boolean; retry_block_reason: string | null; job_progress: { current_round?: number; round_count?: number; phase?: string; retry_after_at?: string } | null; progress: { total_units: number; ready_units: number; reused_units: number; running_units: number; queued_units: number; failed_units: number; review_required_units: number }; units: TTSUnit[] };
+export type TTSRun = { id: string; project_id: string; producer_job_id: string; translation_revision_id: string; status: string; job_status: string; job_error_code: string | null; is_active: boolean; config: { voice: string; rate_percent: number }; retry_available: boolean; retry_block_reason: string | null; retry_after_at: string | null; job_progress: { current_round?: number; next_round?: number; round_count?: number; phase?: string; retry_after_at?: string; retry_units?: number } | null; progress: { total_units: number; ready_units: number; reused_units: number; running_units: number; queued_units: number; failed_units: number; review_required_units: number }; units: TTSUnit[] };
 export type TTSPreview = { cached: boolean; artifact_id?: string; status: string; job?: { id: string; status: string } };
 
 async function checked(response: Response) {
@@ -41,7 +41,7 @@ export async function fetchCurrentTTSRun(projectId: string) {
 
 export async function fetchTTSActivity(projectId: string) {
   const response = await fetch(`/api/v1/projects/${projectId}/tts/activity`, { credentials: "same-origin", cache: "no-store" });
-  await checked(response); return await response.json() as { run: TTSRun | null; preview: { job_id: string; status: string; config: { voice: string; rate_percent: number } } | null };
+  await checked(response); return await response.json() as { run: TTSRun | null; preview: { job_id: string; status: string; config: { voice: string; rate_percent: number }; job: { status: string; error_code: string | null } } | null };
 }
 
 export async function createTTSRun(projectId: string, revision: TranslationRevision, voice: string, rate: number) {
@@ -56,7 +56,7 @@ export async function createTTSPreview(projectId: string, voice: string, rate: n
 
 export async function fetchTTSPreview(projectId: string, jobId: string) {
   const response = await fetch(`/api/v1/projects/${projectId}/tts/previews/${jobId}`, { credentials: "same-origin", cache: "no-store" });
-  await checked(response); return await response.json() as { job: { id: string; status: string }; artifact_id: string | null };
+  await checked(response); return await response.json() as { job: { id: string; status: string; error_code?: string | null }; artifact_id: string | null };
 }
 
 export async function cancelTTSJob(projectId: string, jobId: string) { return await mutate(`/api/v1/jobs/${jobId}/cancel?project_id=${projectId}`, {}); }

@@ -58,6 +58,14 @@ class ProjectCreated(BaseModel):
     id: uuid.UUID
     lock_version: int
 
+class ProjectDeleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_lock_version: int = Field(ge=1)
+
+class MediaDeleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_lock_version: int = Field(ge=1)
+
 
 class ProjectRead(BaseModel):
     id: uuid.UUID
@@ -341,6 +349,14 @@ def create_app(
         if request.headers.get("sec-fetch-site") != "same-origin":
             return JSONResponse(status_code=403, content={"error": "invalid_fetch_site"})
 
+        pieces=request.url.path.split("/")
+        if len(pieces)>=5 and pieces[1:3]==["api","v1"] and pieces[3]=="projects":
+            try: scoped_project=str(uuid.UUID(pieces[4]))
+            except (ValueError,AttributeError): scoped_project=None
+            is_project_delete=request.method=="DELETE" and len(pieces)==5 and pieces[3]=="projects"
+            if scoped_project is not None and not is_project_delete and get_session(request) is not None and database.get_project(scoped_project) is None:
+                return JSONResponse(status_code=404,content={"error":{"code":"project_not_found","message":"Project was not found.","retryable":False,"details":None},"request_id":str(uuid.uuid4())})
+
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -560,6 +576,23 @@ def create_app(
             return current
         return {"items": database.list_projects(limit, offset), "limit": limit, "offset": offset}
 
+    @app.delete("/api/v1/projects/{project_id}")
+    def delete_project(project_id: str, body: ProjectDeleteRequest, request: Request):
+        current=require_mutation_session(request)
+        if isinstance(current,JSONResponse): return current
+        try:
+            parsed=uuid.UUID(project_id)
+            if str(parsed)!=project_id.lower(): raise ValueError
+        except ValueError: return api_error(422,"invalid_project_id","Project ID must be a canonical UUID.")
+        key=request.headers.get("idempotency-key","")
+        if not 16<=len(key)<=255 or any(ord(char)<33 or ord(char)>126 for char in key): return api_error(422,"invalid_idempotency_key","A valid Idempotency-Key header is required.")
+        try:
+            database.delete_project(str(parsed),body.expected_lock_version,key)
+            return Response(status_code=204)
+        except IdempotencyConflict: return api_error(409,"idempotency_key_reused","Idempotency-Key đã được dùng cho nội dung khác.")
+        except KeyError: return api_error(404,"project_not_found","Project was not found.")
+        except ValueError as exc: return api_error(409,str(exc),"Project đã thay đổi hoặc còn Job đang chạy.")
+
     @app.get("/api/v1/projects/{project_id}", response_model=ProjectRead)
     def get_project(project_id: str, request: Request):
         current = require_session(request)
@@ -659,8 +692,27 @@ def create_app(
             return api_error(409, "idempotency_key_reused", "Idempotency-Key đã được dùng cho nội dung khác.")
         except (MediaError, JobInputError) as exc:
             code = exc.code if isinstance(exc, MediaError) else str(exc)
-            status = 410 if code == "selection_expired" else 409 if code in {"selection_consumed", "source_changed"} else 404 if code in {"project_not_found", "selection_invalid"} else 422
+            status = 410 if code == "selection_expired" else 409 if code in {"selection_consumed", "source_changed", "project_video_limit"} else 404 if code in {"project_not_found", "selection_invalid"} else 422
             return api_error(status, code, "Không thể tạo Import Job.")
+
+    @app.delete("/api/v1/projects/{project_id}/media/{asset_id}",status_code=204)
+    def delete_media(project_id:str,asset_id:str,body:MediaDeleteRequest,request:Request):
+        current=require_mutation_session(request)
+        if isinstance(current,JSONResponse): return current
+        try:
+            project=uuid.UUID(project_id);asset=uuid.UUID(asset_id)
+            if str(project)!=project_id.lower() or str(asset)!=asset_id.lower(): raise ValueError
+        except ValueError: return api_error(422,"invalid_media_id","Project và Asset ID phải là UUID chuẩn.")
+        try:
+            key=request.headers.get("idempotency-key","")
+            media_service.delete_asset(str(project),str(asset),body.expected_lock_version,key)
+            return Response(status_code=204)
+        except IdempotencyConflict: return api_error(409,"idempotency_key_reused","Idempotency-Key đã được dùng cho nội dung khác.")
+        except MediaError as exc:
+            status=404 if exc.code=="asset_not_found" else 409
+            return api_error(status,exc.code,"Không thể xóa video khỏi Project.")
+        except JobInputError as exc:
+            return job_exception(exc)
 
     @app.get("/api/v1/projects/{project_id}/media")
     def list_project_media(project_id: str, request: Request):
@@ -999,7 +1051,7 @@ def create_app(
             project=uuid.UUID(project_id)
             if str(project)!=project_id.lower():raise ValueError
             if database.get_project(str(project)) is None:return api_error(404,"project_not_found","Project không tồn tại.")
-            return {"run":tts_service.latest_run(str(project)),"preview":tts_service.active_preview(str(project))}
+            return {"run":tts_service.current_activity_run(str(project)),"preview":tts_service.active_preview(str(project))}
         except ValueError:return api_error(422,"invalid_project_id","Project ID phải là UUID chuẩn.")
         except (TTSError,JobNotFound) as exc:return tts_exception(exc)
 

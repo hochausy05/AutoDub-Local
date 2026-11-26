@@ -25,92 +25,91 @@ export function TTSPanel({ projectId, revision, isCurrent, locked }: { projectId
   const [remoteBatchActive, setRemoteBatchActive] = useState(false);
   const [busy, setBusy] = useState(false);
   const player = useRef<HTMLAudioElement>(null);
-  const activityLocked = busy || !!previewJob || remoteBatchActive || (!!run && activeJobs.has(run.status));
+  const previewContext = useRef("");
+  const activityLocked = busy || !!previewJob || remoteBatchActive || (!!run && activeJobs.has(run.job_status));
 
   useEffect(() => {
     let stopped = false;
-    setRun(null); setPreviewArtifact(""); setPreviewJob(""); setRemoteBatchActive(false); setError("");
+    setRun(null); setPreviewArtifact(""); setPreviewJob(""); setRemoteBatchActive(false); setError(""); previewContext.current="";
+    player.current?.pause(); if (player.current) { player.current.removeAttribute("src"); player.current.load(); }
     void Promise.all([fetchTTSVoices(), fetchTTSActivity(projectId)]).then(([catalog, activity]) => {
       if (stopped) return;
       setVoices(catalog.voices);
       const first = catalog.default_voice ?? catalog.voices[0]?.short_name ?? "";
       setVoice((existing) => catalog.voices.some((item) => item.short_name === existing) ? existing : first);
-      setRemoteBatchActive(!!activity.run && activeJobs.has(activity.run.status));
-      if (activity.run?.translation_revision_id === revision.id) setRun(activity.run);
+      setRemoteBatchActive(!!activity.run && activeJobs.has(activity.run.job_status));
+      if (activity.run) {
+        if (activity.run.config.voice) setVoice(activity.run.config.voice);
+        setRate(activity.run.config.rate_percent);
+        if (activity.run.translation_revision_id === revision.id) setRun(activity.run);
+      }
       if (activity.preview) { setPreviewJob(activity.preview.job_id); if (activity.preview.config.voice) setVoice(activity.preview.config.voice); if (Number.isInteger(activity.preview.config.rate_percent)) setRate(activity.preview.config.rate_percent); }
     }).catch((cause) => { if (!stopped) setCatalogError(cause instanceof Error ? cause.message : "Không tải được danh sách giọng đọc."); });
     return () => { stopped = true; };
   }, [projectId, revision.id]);
 
   useEffect(() => {
-    if (!remoteBatchActive) return;
+    if (!remoteBatchActive && !previewJob && !(run && activeJobs.has(run.job_status))) return;
     let stopped = false;
     let timer: number | undefined;
     const poll = async () => {
       try {
+        if (stopped) return;
         const activity = await fetchTTSActivity(projectId);
         if (stopped) return;
-        const active = !!activity.run && activeJobs.has(activity.run.status);
-        setRemoteBatchActive(active);
+        const activeRun = activity.run && activeJobs.has(activity.run.job_status);
+        setRemoteBatchActive(!!activeRun);
         if (activity.run?.translation_revision_id === revision.id) setRun(activity.run);
-      } catch { /* retain the lock until the API confirms no active batch */ }
-      if (!stopped) timer = window.setTimeout(() => void poll(), 1200);
-    };
-    timer = window.setTimeout(() => void poll(), 500);
-    return () => { stopped = true; if (timer !== undefined) window.clearTimeout(timer); };
-  }, [projectId, revision.id, remoteBatchActive]);
-
-  useEffect(() => {
-    if (!run || !activeJobs.has(run.status)) return;
-    let stopped = false;
-    let timer: number | undefined;
-    const poll = async () => {
-      try {
-        const fresh = await fetchTTSRun(projectId, run.id);
-        if (!stopped && fresh.project_id === projectId && fresh.id === run.id && fresh.translation_revision_id === revision.id) setRun(fresh);
-      } catch (cause) { if (!stopped) setError(cause instanceof Error ? cause.message : "Không theo dõi được quá trình tạo giọng."); }
-      if (!stopped) timer = window.setTimeout(() => void poll(), 900);
-    };
-    timer = window.setTimeout(() => void poll(), 300);
-    return () => { stopped = true; if (timer !== undefined) window.clearTimeout(timer); };
-  }, [projectId, revision.id, run?.id, run?.status]);
-
-  useEffect(() => {
-    if (!previewJob) return;
-    let stopped = false;
-    let timer: number | undefined;
-    const poll = async () => {
-      try {
-        const result = await fetchTTSPreview(projectId, previewJob);
-        if (stopped) return;
-        if (result.job.status === "READY" && result.artifact_id) { setPreviewArtifact(result.artifact_id); setPreviewJob(""); return; }
-        if (["FAILED", "CANCELLED", "INTERRUPTED"].includes(result.job.status)) { setError("Không tạo được audio nghe thử. Có thể thử lại khi dịch vụ sẵn sàng."); setPreviewJob(""); return; }
-      } catch (cause) { if (!stopped) { setError(cause instanceof Error ? cause.message : "Không tải được trạng thái nghe thử."); setPreviewJob(""); } }
-      if (!stopped) timer = window.setTimeout(() => void poll(), 650);
+        if (activity.run && activeRun) { setVoice(activity.run.config.voice); setRate(activity.run.config.rate_percent); }
+        if (activity.preview) {
+          setPreviewJob(activity.preview.job_id);
+          setVoice(activity.preview.config.voice); setRate(activity.preview.config.rate_percent);
+        }
+        const observedPreview = previewJob || activity.preview?.job_id;
+        if (observedPreview) {
+          const result = await fetchTTSPreview(projectId, observedPreview);
+          if (stopped) return;
+          if (result.job.status === "READY" && result.artifact_id) { previewContext.current=`${projectId}:${voice}:${rate}`; setPreviewArtifact(result.artifact_id); setPreviewJob(""); }
+          else if (["FAILED", "CANCELLED", "INTERRUPTED"].includes(result.job.status)) {
+            if (result.job.status !== "CANCELLED") setError(`Không tạo được audio nghe thử${result.job.error_code ? ` (${result.job.error_code})` : ""}.`);
+            setPreviewJob("");
+          }
+        }
+      } catch (cause) {
+        if (!stopped) setError(cause instanceof Error ? cause.message : "Mất kết nối khi theo dõi TTS; trạng thái vẫn được giữ khóa.");
+      }
+      if (!stopped && (remoteBatchActive || previewJob || (run && activeJobs.has(run.job_status)))) timer = window.setTimeout(() => void poll(), 900);
     };
     timer = window.setTimeout(() => void poll(), 300);
     return () => { stopped = true; if (timer !== undefined) window.clearTimeout(timer); };
-  }, [projectId, previewJob]);
+  }, [projectId, revision.id, previewJob, remoteBatchActive, run?.id, run?.job_status, voice, rate]);
 
   const counts = run?.progress;
-  const hasWork = !!run && ["QUEUED", "RUNNING", "CANCEL_REQUESTED"].includes(run.status);
+  const hasWork = !!run && activeJobs.has(run.job_status);
   const canGenerate = consent && !!voice && isCurrent && !locked && revision.status === "ACCEPTED" && revision.units.length > 0 && !hasWork && !busy;
   const voiceOptions = useMemo(() => voices.map((item) => <option key={item.short_name} value={item.short_name}>{item.short_name}</option>), [voices]);
   const rememberConsent = (checked: boolean) => { setConsent(checked); window.localStorage.setItem(CONSENT_KEY, checked ? "accepted" : "revoked"); };
 
   useEffect(() => {
     if (!previewArtifact || !player.current) return;
+    if (previewContext.current !== `${projectId}:${voice}:${rate}`) return;
     const audio = player.current;
     audio.pause(); audio.src = ttsPreviewUrl(projectId, previewArtifact); audio.load();
     void audio.play().then(() => setPreviewNeedsManual(false)).catch(() => setPreviewNeedsManual(true));
-  }, [projectId, previewArtifact]);
+  }, [projectId, previewArtifact, voice, rate]);
+
+  function clearPreviewAudio() {
+    previewContext.current="";
+    setPreviewArtifact(""); setPreviewNeedsManual(false);
+    if (player.current) { player.current.pause(); player.current.removeAttribute("src"); player.current.load(); }
+  }
 
   async function preview() {
     if (!consent || !voice || busy) return;
-    setBusy(true); setError(""); setPreviewArtifact("");
+    setBusy(true); setError(""); clearPreviewAudio();
     try {
       const result = await createTTSPreview(projectId, voice, rate);
-      if (result.cached && result.artifact_id) setPreviewArtifact(result.artifact_id);
+      if (result.cached && result.artifact_id) { previewContext.current=`${projectId}:${voice}:${rate}`; setPreviewArtifact(result.artifact_id); }
       else if (result.job?.id) setPreviewJob(result.job.id);
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Không tạo được audio nghe thử."); }
     finally { setBusy(false); }
@@ -132,14 +131,14 @@ export function TTSPanel({ projectId, revision, isCurrent, locked }: { projectId
   async function retry() {
     if (!run) return;
     setBusy(true);
-    try { await retryTTSJob(projectId, run.producer_job_id, run.status === "INTERRUPTED" ? "INTERRUPTED" : "FAILED"); setRun(await fetchTTSRun(projectId, run.id)); }
+    try { if (run.job_status !== "FAILED" && run.job_status !== "INTERRUPTED") return; await retryTTSJob(projectId, run.producer_job_id, run.job_status); setRun(await fetchTTSRun(projectId, run.id)); }
     catch (cause) { setError(cause instanceof Error ? cause.message : "Không thử lại được các câu lỗi."); }
     finally { setBusy(false); }
   }
   async function cancelPreview() {
     if (!previewJob) return;
     setBusy(true);
-    try { await cancelTTSJob(projectId, previewJob); setPreviewJob(""); }
+    try { await cancelTTSJob(projectId, previewJob); }
     catch (cause) { setError(cause instanceof Error ? cause.message : "Không hủy được nghe thử."); }
     finally { setBusy(false); }
   }
@@ -168,7 +167,7 @@ export function TTSPanel({ projectId, revision, isCurrent, locked }: { projectId
     {run ? <>
       <p role="status">{counts?.ready_units ?? 0}/{counts?.total_units ?? 0} câu sẵn sàng · {counts?.reused_units ?? 0} câu dùng lại · {counts?.running_units ?? 0} đang tạo · {counts?.queued_units ?? 0} đang chờ · {counts?.failed_units ?? 0} lỗi{run.job_progress?.current_round ? ` · vòng ${run.job_progress.current_round}/${run.job_progress.round_count ?? 3}` : ""}{run.job_progress?.phase === "retry_wait" ? " · đang chờ trước khi thử lại" : ""}</p>
       {hasWork ? <button type="button" disabled={busy} onClick={() => void cancel()}>Hủy tạo giọng</button> : null}
-      {["FAILED", "INTERRUPTED", "PARTIAL", "REVIEW_REQUIRED"].includes(run.status) && counts && counts.failed_units > 0 && run.retry_available ? <button type="button" disabled={busy} title={run.retry_block_reason ?? undefined} onClick={() => void retry()}>{busy ? "Đang gửi yêu cầu…" : "Thử lại các đoạn lỗi"}</button> : null}
+      {["FAILED", "INTERRUPTED"].includes(run.job_status) && counts && counts.failed_units > 0 && run.retry_available ? <button type="button" disabled={busy} title={run.retry_block_reason ?? undefined} onClick={() => void retry()}>{busy ? "Đang gửi yêu cầu…" : "Thử lại các đoạn lỗi"}</button> : null}
       <div className="tts-table-scroll"><table className="tts-table"><thead><tr><th>Thời gian</th><th>Lời thoại gốc</th><th>Bản dịch đã duyệt</th><th>Thời lượng audio</th><th>Trạng thái</th><th>Nghe</th></tr></thead><tbody>
         {run.units.map((unit) => <tr key={unit.unit_id}><td>{seconds(unit.start_us)}–{seconds(unit.end_us)}</td><td>{unit.source_text}</td><td>{unit.accepted_text}</td><td>{seconds(unit.artifact?.duration_us)}</td><td>{unitStatus(unit.status)}{unit.error_code ? ` · ${unit.error_code}` : ""}</td><td><button type="button" disabled={unit.status !== "READY" || !unit.artifact} onClick={() => play(ttsAudioUrl(projectId, run.id, unit.unit_id))}>Nghe</button></td></tr>)}
       </tbody></table></div>

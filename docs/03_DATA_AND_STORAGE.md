@@ -12,6 +12,7 @@ Maintain user edits and processing artifacts across application restarts, crashe
 |---|---|
 | `projects` | `id UUID PK`, `name`, `status`, `created_at`, `updated_at`, `active_source_asset_id`, `active_transcription_run_id`, `active_translation_revision_id`, `active_tts_run_id`, `active_sync_plan_id`, `active_render_id` |
 | `media_assets` | `id`, `project_id`, `role SOURCE/OUTPUT/PREVIEW`, `import_mode COPY/LINK`, `relative_path` or approved external path, `size`, `sha256`, duration_us, streams JSON, verified_at |
+| `projects` / `media_assets` | Schema v26 adds nullable `deleted_at`. Deletion is logical; files, artifacts, runs, revisions and Job/Attempt history remain. Normal Project/API access filters deleted records. A Project may have one undeleted source video; processing-source deletion clears the pointer and increments its generation. |
 | `transcription_runs` | `id`, `project_id`, `source_asset_id`, model/device/language/VAD config JSON, immutable provenance, status |
 | `segments` | `id`, `run_id`, position, start_us, end_us, source_text, confidence/flags; unique(run_id,position), start < end |
 | `translation_runs` | Schema v24 adds `local` as a provider while preserving historical Gemini/Cloudflare provenance. Local Runs use SINGLE_PASS and `provider_sdk_version=NULL`; existing provenance is not rewritten. |
@@ -31,9 +32,11 @@ Maintain user edits and processing artifacts across application restarts, crashe
 | `artifact_dependencies` | parent fingerprint, child ID; for invalidation and incremental reruns |
 | `backup_manifests` | ID, project, created_at, file inventory, content sha256, schema version, completeness |
 
-Relationships: one Project -> multiple source/video Runs -> many Segments/Translation Units/TTS artifacts -> immutable sync plan -> render. Existing Run rows never silently overwrite; active pointers move transactionally after validation.
+Relationships: one active Project -> at most one undeleted source video -> many historical Runs -> Segments/Translation Units/TTS artifacts -> immutable sync plan -> render. Deleted source rows and existing Run rows remain as history; active pointers move transactionally after validation.
 
 Migrations v20–v23 preserve historical provider metadata and request diagnostics. Migration v24 safely rebuilds only Translation Run/Unit tables to allow provider `local`, nullable SDK provenance and nullable `chunk_no`, and adds Local execution tables/guards. It preserves explicit indexes, triggers, rows, foreign keys and fingerprints, then checks foreign keys and database integrity before commit.
+
+Migration v26 adds logical deletion timestamps to Projects and MediaAssets and permits a processing-source row to represent `UNSELECTED` while preserving its monotonically increasing generation. Delete operations are transactional and CAS-guarded; they revoke issued selections and invalidate active downstream pointers without unlinking or removing media files.
 
 ## 3. Example invariants
 

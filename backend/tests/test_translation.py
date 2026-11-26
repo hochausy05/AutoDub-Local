@@ -35,7 +35,7 @@ class TranslationMigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             db=Database(Path(temporary)/"data"); db.initialize(target_version=22)
             project,_=db.create_project("migration fixture","translation-migration-key-0001")
-            db.initialize(target_version=23); db.initialize()
+            db.initialize(target_version=23); db.initialize(target_version=24)
             with closing(db.connect()) as c:
                 self.assertEqual(c.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0],24)
                 self.assertIsNotNone(c.execute("SELECT id FROM projects WHERE id=?",(project["id"],)).fetchone())

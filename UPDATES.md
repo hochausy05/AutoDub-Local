@@ -2,6 +2,8 @@ LOCAL-01B verified real Windows inference through the Local Translation API with
 
 # AutoDub Local vNext — Product Updates
 
+MEDIA-01C adds logical Project and video removal, while keeping source files and historical rows on disk. A Project can contain at most one undeleted video; existing multi-video Projects remain visible until users remove extras. TTS-01D keeps retrying speech Units inside one visible Job/Run lifecycle and exposes wait/progress state. Automated checks use temporary test data and synthetic speech; no live Edge-TTS request or browser acceptance was run. G5 and MEDIA-01C owner acceptance remain pending.
+
 TTS-01C adds safer Edge-TTS operation: paced, bounded retries; visible round and retry state; active Preview recovery after reload; and controls locked while synthesis is active. Verified Unit audio remains playable during a batch. Only synthetic adapters were used for automated checks; live provider and browser acceptance were not run. G5 remains unaccepted.
 
 TRANS-02C retires Cloudflare and restores Gemini as the sole provider for new translation Runs. Prior Runs retain provenance; retired active Jobs are reconciled and cannot retry. Focused backend tests and frontend build pass with mocks; live providers and Windows browser are NOT RUN. G4 remains previously accepted; G5 remains unaccepted.

@@ -6,6 +6,7 @@ import time
 import unittest
 import uuid
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 from xml.sax.saxutils import escape
@@ -232,6 +233,20 @@ class TTSIntegrationTests(unittest.TestCase):
 
 
 class TTSAdapterContractTests(unittest.TestCase):
+    def test_provider_retry_after_is_not_clamped_to_one_hour(self):
+        class ThrottledCommunicate:
+            def __init__(self,*_args,**_kwargs): self.texts=iter([b"hello"])
+            async def save(self,_filename):
+                import aiohttp
+                raise aiohttp.ClientResponseError(None,(),status=429,headers={"Retry-After":"7200"})
+        adapter=EdgeTTSAdapter()
+        with tempfile.TemporaryDirectory() as directory, patch("app.tts.edge_tts.Communicate",ThrottledCommunicate):
+            with self.assertRaises(TTSError) as caught:
+                adapter.synthesize("hello",Path(directory)/"unused.mp3",voice="vi-VN-NamMinhNeural",rate=0,pitch_hz=0,volume=0)
+        self.assertEqual(caught.exception.code,"tts_provider_throttled")
+        remaining=(datetime.fromisoformat(caught.exception.retry_after_at.replace("Z","+00:00"))-datetime.now(timezone.utc)).total_seconds()
+        self.assertGreater(remaining,7100)
+
     def test_request_pacer_spaces_calls_and_checks_cancellation(self):
         pacer = _RequestPacer()
         with patch("app.tts.TTS_REQUEST_INTERVAL_SECONDS", 0.03):

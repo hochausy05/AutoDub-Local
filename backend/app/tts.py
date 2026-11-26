@@ -57,16 +57,22 @@ class _RequestPacer:
         self._lock = threading.Lock()
         self._next_at = 0.0
 
-    def wait_turn(self, cancelled: Callable[[], bool]) -> None:
+    def wait_turn(self, cancelled: Callable[[], bool], halted: threading.Event | None = None) -> None:
         with self._lock:
             delay = max(0.0, self._next_at - time.monotonic())
+            if halted is not None and halted.is_set():
+                raise TTSError("tts_round_halted")
             if cancelled():
                 raise TTSError("job_cancelled")
             until = time.monotonic() + delay
             while time.monotonic() < until:
+                if halted is not None and halted.is_set():
+                    raise TTSError("tts_round_halted")
                 if cancelled():
                     raise TTSError("job_cancelled")
                 time.sleep(min(0.05, until - time.monotonic()))
+            if halted is not None and halted.is_set():
+                raise TTSError("tts_round_halted")
             if cancelled():
                 raise TTSError("job_cancelled")
             self._next_at = time.monotonic() + TTS_REQUEST_INTERVAL_SECONDS
@@ -193,18 +199,20 @@ class EdgeTTSAdapter:
                 raise TTSError("tts_provider_timeout", retryable=True) from exc
             except aiohttp.ClientResponseError as exc:
                 if exc.status == 429:
-                    delay = 0.0
+                    retry_at = None
+                    header = ""
                     try:
                         header=exc.headers.get("Retry-After", "0")
                         try: delay=float(header)
                         except (TypeError,ValueError):
                             parsed=email.utils.parsedate_to_datetime(header)
                             delay=(parsed.astimezone(timezone.utc)-datetime.now(timezone.utc)).total_seconds()
-                        delay=max(0.0,min(3600.0,delay))
+                        delay=max(0.0,delay)
+                        retry_at=_now_after(delay) if delay else None
                     except (AttributeError, OverflowError, TypeError, ValueError):
-                        pass
+                        retry_at="9999-12-31T23:59:59Z" if isinstance(header,str) and header.isdigit() else None
                     raise TTSError("tts_provider_throttled", retryable=True,
-                        retry_after_at=_now_after(delay) if delay else None,http_status=429) from exc
+                        retry_after_at=retry_at,http_status=429) from exc
                 raise TTSError("tts_provider_temporary_failure" if exc.status >= 500 else "tts_provider_rejected",
                     retryable=exc.status >= 500,http_status=exc.status) from exc
             except (aiohttp.ClientError, OSError) as exc:
@@ -540,9 +548,12 @@ class TTSService:
                 "cancelled_units":cancelled}
             value["is_active"]=bool(pointer and pointer["active_artifact_id"] and pointer["active_artifact_id"]==value["manifest_artifact_id"] and value["status"]=="READY")
             job_detail=self.jobs.get_job(value["producer_job_id"],project_id)
+            value["job_status"]=job_detail["status"]
+            value["job_error_code"]=job_detail["error_code"]
             value["retry_available"]=job_detail["retry_available"]
             value["retry_block_reason"]=job_detail["retry_block_reason"]
             value["job_progress"]=job_detail["progress"]
+            value["retry_after_at"]=(job_detail["attempt"] or {}).get("retry_after_at")
             return value
 
     def latest_run(self, project_id: str) -> dict[str, Any] | None:
@@ -550,12 +561,20 @@ class TTSService:
             row=connection.execute("SELECT id FROM tts_runs WHERE project_id=? ORDER BY created_at DESC,id DESC LIMIT 1",(project_id,)).fetchone()
         return self.get_run(project_id,row["id"]) if row else None
 
+    def current_activity_run(self,project_id:str)->dict[str,Any]|None:
+        with closing(self.database.connect()) as connection:
+            row=connection.execute("""SELECT r.id FROM tts_runs r JOIN jobs j ON j.id=r.producer_job_id
+                WHERE r.project_id=? ORDER BY CASE WHEN j.status IN ('QUEUED','RUNNING','CANCEL_REQUESTED') THEN 0 ELSE 1 END,
+                  j.updated_at DESC,r.created_at DESC LIMIT 1""",(project_id,)).fetchone()
+        return self.get_run(project_id,row["id"]) if row else None
+
     def active_preview(self, project_id:str)->dict[str,Any]|None:
         with closing(self.database.connect()) as connection:
             row=connection.execute("SELECT id,status,input_snapshot FROM jobs WHERE project_id=? AND kind='edge_tts_preview' AND status IN ('QUEUED','RUNNING','CANCEL_REQUESTED') ORDER BY created_at DESC LIMIT 1",(project_id,)).fetchone()
         if not row:return None
         snapshot=json.loads(row["input_snapshot"])
-        return {"job_id":row["id"],"status":row["status"],"config":snapshot.get("config",{})}
+        detail=self.jobs.get_job(row["id"],project_id)
+        return {"job_id":row["id"],"status":row["status"],"config":snapshot.get("config",{}),"job":detail}
 
     def reconcile_cancelled_job(self, job_id: str) -> None:
         """Close queued TTS units when the shared Job API cancels before claim."""
@@ -758,7 +777,7 @@ class TTSWorker:
                     if not exc.retryable or call_no>=2: raise
                     wait_seconds=TTS_ROUND_DELAY_SECONDS
                     if exc.retry_after_at:
-                        try:wait_seconds=max(wait_seconds,min(3600,(datetime.fromisoformat(exc.retry_after_at.replace("Z","+00:00"))-datetime.now(timezone.utc)).total_seconds()))
+                        try:wait_seconds=max(wait_seconds,(datetime.fromisoformat(exc.retry_after_at.replace("Z","+00:00"))-datetime.now(timezone.utc)).total_seconds())
                         except (ValueError,TypeError):pass
                     deadline=time.monotonic()+wait_seconds
                     while time.monotonic()<deadline and not self._cancelled(job["id"]): time.sleep(min(0.1,deadline-time.monotonic()))
@@ -783,131 +802,211 @@ class TTSWorker:
         finally:
             path.unlink(missing_ok=True)
 
-    def _run_batch(self,job:dict[str,Any],round_no:int=1)->None:
+    def _run_batch(self,job:dict[str,Any])->None:
+        try:
+            self._run_batch_attempt(job)
+        except Exception as exc:
+            with closing(self.database.connect()) as connection:
+                attempt=connection.execute("SELECT id FROM job_attempts WHERE job_id=? AND status='RUNNING'",(job["id"],)).fetchone()
+                run=connection.execute("SELECT id FROM tts_runs WHERE producer_job_id=?",(job["id"],)).fetchone()
+            if attempt:
+                def terminate(connection:sqlite3.Connection)->None:
+                    if run:
+                        cancelled=connection.execute("SELECT status FROM jobs WHERE id=?",(job["id"],)).fetchone()["status"] in {"CANCEL_REQUESTED","CANCELLED"}
+                        unit_status="CANCELLED" if cancelled else "FAILED"
+                        connection.execute("UPDATE tts_run_units SET status=?,retryable=0,error_code=?,updated_at=? WHERE tts_run_id=? AND status IN ('QUEUED','RUNNING')",(unit_status,"job_cancelled" if cancelled else "tts_worker_failed",utc_now(),run["id"]))
+                        connection.execute("UPDATE tts_provider_calls SET status=?,completed_at=?,error_code=?,exception_class=? WHERE status='RUNNING' AND job_attempt_id=?",("CANCELLED" if cancelled else "FAILED",utc_now(),"job_cancelled" if cancelled else "tts_worker_failed",type(exc).__name__,attempt["id"]))
+                        status="CANCELLED" if cancelled else ("PARTIAL" if connection.execute("SELECT 1 FROM tts_run_units WHERE tts_run_id=? AND status='READY' LIMIT 1",(run["id"],)).fetchone() else "FAILED")
+                        connection.execute("UPDATE tts_runs SET status=?,completed_at=? WHERE id=?",(status,utc_now(),run["id"]))
+                try:self.jobs.fail_attempt(job["id"],attempt["id"],"tts_worker_failed",completion_hook=terminate)
+                except Exception:self.jobs._recovery_complete=False
+
+    def _run_batch_attempt(self,job:dict[str,Any])->None:
         with closing(self.database.connect()) as connection:
             row=connection.execute("SELECT r.id,j.input_snapshot FROM tts_runs r JOIN jobs j ON j.id=r.producer_job_id WHERE j.id=?",(job["id"],)).fetchone()
             attempt=connection.execute("SELECT id FROM job_attempts WHERE job_id=? AND status='RUNNING'",(job["id"],)).fetchone()
-        if not row or not attempt:return
+        if not row or not attempt:
+            raise TTSError("tts_run_or_attempt_missing")
         run_id=row["id"];attempt_id=attempt["id"];snapshot=json.loads(row["input_snapshot"])
-        if not self._validate_compact_snapshot(run_id,snapshot):
-            self.jobs.fail_attempt(job["id"],attempt_id,"tts_unit_mapping_invalid",retryable=False)
-            with closing(self.database.connect()) as connection:
-                connection.execute("UPDATE tts_runs SET status='FAILED',completed_at=?,manifest_artifact_id=NULL WHERE id=? AND status NOT IN ('READY','STALE')",(utc_now(),run_id))
+        if not self._validate_run_snapshot(run_id,snapshot):
+            self._end_attempt(job,run_id,attempt_id,"tts_unit_mapping_invalid",False,None,"FAILED")
             return
         with closing(self.database.connect()) as connection:
-            connection.execute("UPDATE tts_runs SET status='RUNNING' WHERE id=?",(run_id,))
-            connection.execute("UPDATE tts_run_units SET status='QUEUED',updated_at=? WHERE tts_run_id=? AND (status='RUNNING' OR (status='FAILED' AND retryable=1))",(utc_now(),run_id))
-        self.service._reconcile_unit_artifacts(job["project_id"],run_id)
-        with closing(self.database.connect()) as connection:
-            pending=connection.execute("SELECT * FROM tts_run_units WHERE tts_run_id=? AND status='QUEUED' ORDER BY position",(run_id,)).fetchall()
-        if not pending:
-            self._finish_batch(job,run_id,attempt_id,snapshot)
-            return
-        retryable=False;retry_after=None;review=False;cancelled=False;stale=False;throttled=False
-        iterator=iter(pending); futures={}; completed=0
+            connection.execute("UPDATE tts_runs SET status='RUNNING',completed_at=NULL WHERE id=? AND status<>'READY'",(run_id,))
+            connection.execute("UPDATE tts_run_units SET status='QUEUED',updated_at=? WHERE tts_run_id=? AND status='RUNNING'",(utc_now(),run_id))
+        self._verify_ready_units(job["project_id"],run_id)
+        retry_after=None
         temp_root=self.artifacts._ensure_directory(PurePosixPath("staging/tts"))
-        with ThreadPoolExecutor(max_workers=TTS_CONCURRENCY,thread_name_prefix="edge-tts-unit") as pool:
-            def submit_one(unit:sqlite3.Row)->None:
-                if not self.service._run_is_current(job["project_id"],run_id):
-                    raise TTSError("translation_revision_stale")
-                with closing(self.database.connect()) as connection:
-                    connection.execute("UPDATE tts_run_units SET status='RUNNING',updated_at=? WHERE tts_run_id=? AND unit_id=?",(utc_now(),run_id,unit["unit_id"]))
-                futures[pool.submit(self._synthesize_unit,job,attempt_id,run_id,unit, snapshot,temp_root,round_no)]=unit
-            for _ in range(min(TTS_CONCURRENCY,len(pending))):
-                try:submit_one(next(iterator))
-                except StopIteration:break
-                except TTSError as exc:
-                    stale=exc.code=="translation_revision_stale";review=exc.review_required;retryable=exc.retryable;break
-            while futures:
-                done,_=wait(tuple(futures),timeout=0.2,return_when=FIRST_COMPLETED)
-                if not done:
-                    if self._cancelled(job["id"]):cancelled=True
-                    continue
-                for future in done:
-                    unit=futures.pop(future);completed+=1
-                    try:future.result()
-                    except (TTSError, ArtifactError) as raw_exc:
-                        exc = raw_exc if isinstance(raw_exc, TTSError) else TTSError(raw_exc.code,
-                            retryable=raw_exc.code in {"tts_audio_decode_timeout", "tts_media_tools_unavailable"})
-                        with closing(self.database.connect()) as connection:
-                            status="CANCELLED" if exc.code=="job_cancelled" else "REVIEW_REQUIRED" if exc.review_required else "FAILED"
-                            connection.execute("UPDATE tts_run_units SET status=?,error_code=?,retryable=?,updated_at=? WHERE tts_run_id=? AND unit_id=?",
-                                (status,exc.code,int(exc.retryable),utc_now(),run_id,unit["unit_id"]))
-                        retryable=retryable or exc.retryable;retry_after=exc.retry_after_at or retry_after
-                        throttled=throttled or exc.code=="tts_provider_throttled"
-                        review=review or exc.review_required;cancelled=cancelled or exc.code=="job_cancelled"
-                    except Exception as exc:
-                        with closing(self.database.connect()) as connection:
-                            connection.execute("UPDATE tts_provider_calls SET status='FAILED',completed_at=?,error_code='tts_unit_failed',exception_class=? WHERE tts_run_id=? AND unit_id=? AND status='RUNNING'",(utc_now(),type(exc).__name__,run_id,unit["unit_id"]))
-                            connection.execute("UPDATE tts_run_units SET status='FAILED',error_code='tts_unit_failed',retryable=0,updated_at=? WHERE tts_run_id=? AND unit_id=?",(utc_now(),run_id,unit["unit_id"]))
-                    ready=self._counts(run_id)["ready_units"]
-                    counts_now=self._unit_counts(run_id)
-                    self.jobs.update_attempt_progress(job["id"],attempt_id,{"phase":"synthesizing_units","completed_units":ready,"total_units":counts_now["total_units"],"fraction":ready/max(1,counts_now["total_units"]),"current_round":round_no,"round_count":TTS_MAX_ROUNDS,"running_units":counts_now["running_units"],"queued_units":counts_now["queued_units"],"failed_units":counts_now["failed_units"]})
-                if self._cancelled(job["id"]):
-                    cancelled=True
-                    for future in futures: future.cancel()
-                    break
-                while len(futures)<TTS_CONCURRENCY and not throttled:
+        for round_no in range(1,TTS_MAX_ROUNDS+1):
+            if self._cancelled(job["id"]):
+                self._end_attempt(job,run_id,attempt_id,"job_cancelled",False,None,"CANCELLED")
+                return
+            if not self.service._run_is_current(job["project_id"],run_id):
+                self._end_attempt(job,run_id,attempt_id,"translation_revision_stale",False,None,"STALE")
+                return
+            with closing(self.database.connect()) as connection:
+                connection.execute("UPDATE tts_run_units SET status='QUEUED',updated_at=? WHERE tts_run_id=? AND status='FAILED' AND retryable=1",(utc_now(),run_id))
+            self.service._reconcile_unit_artifacts(job["project_id"],run_id)
+            with closing(self.database.connect()) as connection:
+                pending=connection.execute("SELECT * FROM tts_run_units WHERE tts_run_id=? AND status='QUEUED' ORDER BY position",(run_id,)).fetchall()
+            counts=self._unit_counts(run_id)
+            self._progress(job["id"],attempt_id,"synthesizing_units",round_no,counts,0)
+            if not pending:
+                break
+            iterator=iter(pending);futures={};halted=threading.Event();round_retry_after=None
+            with ThreadPoolExecutor(max_workers=TTS_CONCURRENCY,thread_name_prefix="edge-tts-unit") as pool:
+                def submit_one(unit:sqlite3.Row)->None:
+                    if self._cancelled(job["id"]):raise TTSError("job_cancelled")
+                    if not self.service._run_is_current(job["project_id"],run_id):raise TTSError("translation_revision_stale")
+                    with closing(self.database.connect()) as connection:
+                        connection.execute("UPDATE tts_run_units SET status='RUNNING',updated_at=? WHERE tts_run_id=? AND unit_id=? AND status='QUEUED'",(utc_now(),run_id,unit["unit_id"]))
+                    future=pool.submit(self._synthesize_unit,job,attempt_id,run_id,unit,snapshot,temp_root,round_no,halted)
+                    futures[future]=unit
+                for _ in range(min(TTS_CONCURRENCY,len(pending))):
                     try:submit_one(next(iterator))
                     except StopIteration:break
-                    except TTSError as exc:
-                        stale=exc.code=="translation_revision_stale";review=exc.review_required
-                        break
-        if self._cancelled(job["id"]):cancelled=True
-        with closing(self.database.connect()) as connection:
-            if cancelled:
-                connection.execute("UPDATE tts_run_units SET status='CANCELLED',retryable=0,error_code='job_cancelled',updated_at=? WHERE tts_run_id=? AND status IN ('QUEUED','RUNNING')",(utc_now(),run_id))
-                connection.execute("UPDATE tts_runs SET status='CANCELLED',completed_at=? WHERE id=?",(utc_now(),run_id))
-            elif stale:
-                connection.execute("UPDATE tts_run_units SET status='STALE',error_code='translation_revision_stale',updated_at=? WHERE tts_run_id=? AND status='QUEUED'",(utc_now(),run_id))
-                connection.execute("UPDATE tts_runs SET status='STALE',completed_at=? WHERE id=?",(utc_now(),run_id))
-            else:
-                counts=self._counts(run_id)
-                if counts["ready_units"]==counts["total_units"]:
-                    pass
-                else:
-                    status="REVIEW_REQUIRED" if review else "PARTIAL" if counts["ready_units"] else "FAILED"
-                    connection.execute("UPDATE tts_runs SET status=?,completed_at=? WHERE id=?",(status,utc_now(),run_id))
-        if cancelled or stale:
-            self._finish_manifest_only(job,run_id,attempt_id,snapshot, cancelled=cancelled)
-            return
-        counts=self._counts(run_id)
+                while futures:
+                    done,_=wait(tuple(futures),timeout=0.1,return_when=FIRST_COMPLETED)
+                    if not done:
+                        if self._cancelled(job["id"]):
+                            for future in futures:future.cancel()
+                        continue
+                    for future in done:
+                        unit=futures.pop(future)
+                        try:future.result()
+                        except (TTSError,ArtifactError) as raw:
+                            exc=raw if isinstance(raw,TTSError) else TTSError(raw.code,retryable=raw.code in {"tts_audio_decode_timeout","tts_media_tools_unavailable"})
+                            if exc.code=="tts_provider_throttled":
+                                halted.set()
+                                if exc.retry_after_at and (round_retry_after is None or exc.retry_after_at>round_retry_after):round_retry_after=exc.retry_after_at
+                            if exc.code=="job_cancelled":
+                                status="CANCELLED";retryable_unit=False
+                            elif exc.code=="tts_round_halted":
+                                status="QUEUED";retryable_unit=False
+                            elif exc.review_required:
+                                status="REVIEW_REQUIRED";retryable_unit=False
+                            elif exc.code=="translation_revision_stale":
+                                status="STALE";retryable_unit=False
+                            else:
+                                status="FAILED";retryable_unit=exc.retryable
+                            with closing(self.database.connect()) as connection:
+                                connection.execute("UPDATE tts_run_units SET status=?,error_code=?,retryable=?,updated_at=? WHERE tts_run_id=? AND unit_id=?",(status,exc.code,int(retryable_unit),utc_now(),run_id,unit["unit_id"]))
+                        except Exception as exc:
+                            with closing(self.database.connect()) as connection:
+                                connection.execute("UPDATE tts_provider_calls SET status='FAILED',completed_at=?,error_code='tts_unit_failed',exception_class=? WHERE tts_run_id=? AND unit_id=? AND status='RUNNING'",(utc_now(),type(exc).__name__,run_id,unit["unit_id"]))
+                                connection.execute("UPDATE tts_run_units SET status='FAILED',error_code='tts_unit_failed',retryable=0,updated_at=? WHERE tts_run_id=? AND unit_id=?",(utc_now(),run_id,unit["unit_id"]))
+                        counts=self._unit_counts(run_id)
+                        self._progress(job["id"],attempt_id,"synthesizing_units",round_no,counts,counts["running_units"])
+                    if self._cancelled(job["id"]):
+                        for future in futures:future.cancel()
+                        continue
+                    while len(futures)<TTS_CONCURRENCY and not halted.is_set():
+                        try:submit_one(next(iterator))
+                        except StopIteration:break
+                        except TTSError:break
+            if self._cancelled(job["id"]):
+                self._end_attempt(job,run_id,attempt_id,"job_cancelled",False,None,"CANCELLED")
+                return
+            if not self.service._run_is_current(job["project_id"],run_id):
+                self._end_attempt(job,run_id,attempt_id,"translation_revision_stale",False,None,"STALE")
+                return
+            self.service._reconcile_unit_artifacts(job["project_id"],run_id)
+            counts=self._unit_counts(run_id)
+            if counts["ready_units"]==counts["total_units"]:
+                self._progress(job["id"],attempt_id,"verifying_outputs",round_no,counts,0)
+                self._finish_batch(job,run_id,attempt_id,snapshot)
+                return
+            with closing(self.database.connect()) as connection:
+                remaining=connection.execute("SELECT COUNT(*) FROM tts_run_units WHERE tts_run_id=? AND (status='QUEUED' OR (status='FAILED' AND retryable=1))",(run_id,)).fetchone()[0]
+            if remaining==0:break
+            if round_no>=TTS_MAX_ROUNDS:break
+            if round_retry_after and (retry_after is None or round_retry_after>retry_after):retry_after=round_retry_after
+            next_at=retry_after or _now_after(TTS_ROUND_DELAY_SECONDS)
+            wait_seconds=max(TTS_ROUND_DELAY_SECONDS,(datetime.fromisoformat(next_at.replace("Z","+00:00"))-datetime.now(timezone.utc)).total_seconds())
+            self._progress(job["id"],attempt_id,"retry_wait",round_no,counts,0,next_round=round_no+1,retry_after_at=next_at,retry_units=remaining)
+            deadline=time.monotonic()+max(0,wait_seconds)
+            while time.monotonic()<deadline:
+                if self._cancelled(job["id"]):
+                    self._end_attempt(job,run_id,attempt_id,"job_cancelled",False,None,"CANCELLED")
+                    return
+                time.sleep(min(0.1,deadline-time.monotonic()))
+        counts=self._unit_counts(run_id)
         if counts["ready_units"]==counts["total_units"]:
             self._finish_batch(job,run_id,attempt_id,snapshot)
-        elif retryable and round_no < TTS_MAX_ROUNDS and counts["ready_units"] > 0 and not self._cancelled(job["id"]):
-            self.jobs.update_attempt_progress(job["id"],attempt_id,{"phase":"retry_wait","completed_units":counts["ready_units"],"total_units":counts["total_units"],"fraction":counts["ready_units"]/max(1,counts["total_units"]),"current_round":round_no+1,"round_count":TTS_MAX_ROUNDS,"running_units":0,"queued_units":0,"failed_units":counts["total_units"]-counts["ready_units"]})
-            wait_seconds=TTS_ROUND_DELAY_SECONDS
-            if retry_after:
-                try: wait_seconds=max(wait_seconds,min(3600,(datetime.fromisoformat(retry_after.replace("Z","+00:00"))-datetime.now(timezone.utc)).total_seconds()))
-                except (ValueError,TypeError): pass
-            deadline=time.monotonic()+wait_seconds
-            while time.monotonic()<deadline and not self._cancelled(job["id"]): time.sleep(min(0.1,deadline-time.monotonic()))
-            if not self._cancelled(job["id"]): self._run_batch(job,round_no+1)
-            else: self._finish_manifest_only(job,run_id,attempt_id,snapshot,cancelled=True)
-        else:
-            self.jobs.fail_attempt(job["id"],attempt_id,"tts_units_incomplete",retryable=retryable,retry_after_at=retry_after)
+            return
+        retryable=bool(counts["queued_units"] or counts["failed_units"])
+        terminal="PARTIAL" if counts["ready_units"] else "FAILED"
+        self._end_attempt(job,run_id,attempt_id,"tts_units_incomplete",retryable,retry_after,terminal)
+
+    def _progress(self,job_id:str,attempt_id:str,phase:str,round_no:int,counts:dict[str,int],running:int,*,next_round:int|None=None,retry_after_at:str|None=None,retry_units:int=0)->None:
+        value={"phase":phase,"completed_units":counts["ready_units"],"total_units":counts["total_units"],"fraction":counts["ready_units"]/max(1,counts["total_units"]),"current_round":round_no,"round_count":TTS_MAX_ROUNDS,"running_units":running,"queued_units":counts["queued_units"],"failed_units":counts["failed_units"],"retry_units":retry_units}
+        if next_round is not None:value["next_round"]=next_round
+        if retry_after_at is not None:value["retry_after_at"]=retry_after_at
+        self.jobs.update_attempt_progress(job_id,attempt_id,value)
+
+    def _end_attempt(self,job:dict[str,Any],run_id:str,attempt_id:str,error_code:str,retryable:bool,retry_after_at:str|None,run_status:str)->None:
+        def close_run(connection:sqlite3.Connection)->None:
+            stamp=utc_now()
+            if run_status=="CANCELLED":
+                connection.execute("UPDATE tts_run_units SET status='CANCELLED',retryable=0,error_code='job_cancelled',updated_at=? WHERE tts_run_id=? AND status IN ('QUEUED','RUNNING')",(stamp,run_id))
+                connection.execute("UPDATE tts_provider_calls SET status='CANCELLED',completed_at=?,error_code='job_cancelled' WHERE job_attempt_id=? AND status='RUNNING'",(stamp,attempt_id))
+            elif run_status=="STALE":
+                connection.execute("UPDATE tts_run_units SET status='STALE',retryable=0,error_code='translation_revision_stale',updated_at=? WHERE tts_run_id=? AND status IN ('QUEUED','RUNNING')",(stamp,run_id))
+                connection.execute("UPDATE tts_provider_calls SET status='INTERRUPTED',completed_at=?,error_code='translation_revision_stale' WHERE job_attempt_id=? AND status='RUNNING'",(stamp,attempt_id))
+            actual_job=connection.execute("SELECT status FROM jobs WHERE id=?",(job["id"],)).fetchone()["status"]
+            final="CANCELLED" if actual_job in {"CANCELLED","CANCEL_REQUESTED"} else run_status
+            if final not in {"CANCELLED","STALE","PARTIAL","FAILED"}:
+                final="CANCELLED" if connection.execute("SELECT status FROM jobs WHERE id=?",(job["id"],)).fetchone()["status"]=="CANCELLED" else "FAILED"
+            connection.execute("UPDATE tts_runs SET status=?,completed_at=? WHERE id=? AND status<>'READY'",(final,stamp,run_id))
+        self.jobs.fail_attempt(job["id"],attempt_id,error_code,retryable=retryable,retry_after_at=retry_after_at,completion_hook=close_run)
 
     def _counts(self,run_id:str)->dict[str,int]:
         with closing(self.database.connect()) as connection:
             row=connection.execute("SELECT COUNT(*) AS total,SUM(status='READY') AS ready FROM tts_run_units WHERE tts_run_id=?",(run_id,)).fetchone()
         return {"total_units":row["total"],"ready_units":row["ready"] or 0}
 
-    def _validate_compact_snapshot(self,run_id:str,snapshot:dict[str,Any])->bool:
+    def _run_snapshot_values(self,run_id:str)->list[dict[str,Any]]:
         with closing(self.database.connect()) as connection:
             rows=connection.execute("SELECT unit_id,logical_unit_key,position,source_segment_ids_json,revision_segment_ids_json,source_text,accepted_text,text_sha256,start_us,end_us,source_window_duration_us,synthesis_fingerprint FROM tts_run_units WHERE tts_run_id=? ORDER BY position",(run_id,)).fetchall()
-        values=[{"unit_id":r["unit_id"],"logical_unit_key":r["logical_unit_key"],"position":r["position"],"source_segment_ids":json.loads(r["source_segment_ids_json"]),"revision_segment_ids":json.loads(r["revision_segment_ids_json"]),"source_text":r["source_text"],"accepted_text":r["accepted_text"],"text_sha256":r["text_sha256"],"start_us":r["start_us"],"end_us":r["end_us"],"source_window_duration_us":r["source_window_duration_us"],"synthesis_fingerprint":r["synthesis_fingerprint"]} for r in rows]
-        return len(values)==snapshot.get("unit_count") and _hash(values)==snapshot.get("units_sha256") and all(item["position"]==i for i,item in enumerate(values)) and len({item["unit_id"] for item in values})==len(values)
+        return [{"unit_id":r["unit_id"],"logical_unit_key":r["logical_unit_key"],"position":r["position"],"source_segment_ids":json.loads(r["source_segment_ids_json"]),"revision_segment_ids":json.loads(r["revision_segment_ids_json"]),"source_text":r["source_text"],"accepted_text":r["accepted_text"],"text_sha256":r["text_sha256"],"start_us":r["start_us"],"end_us":r["end_us"],"source_window_duration_us":r["source_window_duration_us"],"synthesis_fingerprint":r["synthesis_fingerprint"]} for r in rows]
+
+    def _validate_run_snapshot(self,run_id:str,snapshot:dict[str,Any])->bool:
+        values=self._run_snapshot_values(run_id)
+        identity_ok=all(item["position"]==i for i,item in enumerate(values)) and len({item["unit_id"] for item in values})==len(values) and len({item["logical_unit_key"] for item in values})==len(values)
+        if not identity_ok:return False
+        if isinstance(snapshot.get("units"),list):
+            legacy=snapshot["units"]
+            return len(legacy)==len(values) and _canonical(legacy)==_canonical(values)
+        return len(values)==snapshot.get("unit_count") and _hash(values)==snapshot.get("units_sha256")
+
+    def _verify_ready_units(self,project_id:str,run_id:str)->None:
+        with closing(self.database.connect()) as connection:
+            rows=connection.execute("SELECT unit_id,artifact_id,synthesis_fingerprint FROM tts_run_units WHERE tts_run_id=? AND status='READY'",(run_id,)).fetchall()
+        for unit in rows:
+            try:
+                artifact=self.artifacts.verify_ready(unit["artifact_id"],project_id)
+                metadata=artifact.get("verification_metadata") or {}
+                valid=(artifact.get("content_fingerprint")==unit["synthesis_fingerprint"] and
+                    type(metadata.get("duration_us")) is int and metadata["duration_us"]>0 and
+                    type(metadata.get("sample_count")) is int and metadata["sample_count"]>0 and
+                    metadata.get("sample_rate")==24000 and metadata.get("channels")==1 and
+                    metadata.get("codec")=="mp3" and metadata.get("container")=="mp3")
+            except ArtifactError:
+                valid=False
+            if not valid:
+                with closing(self.database.connect()) as connection:
+                    connection.execute("UPDATE tts_run_units SET status='FAILED',artifact_id=NULL,retryable=1,error_code='tts_artifact_unavailable',updated_at=? WHERE tts_run_id=? AND unit_id=? AND status='READY'",(utc_now(),run_id,unit["unit_id"]))
 
     def _unit_counts(self,run_id:str)->dict[str,int]:
         with closing(self.database.connect()) as connection:
             row=connection.execute("SELECT COUNT(*) total,SUM(status='READY') ready,SUM(status='RUNNING') running,SUM(status='QUEUED') queued,SUM(status='FAILED') failed FROM tts_run_units WHERE tts_run_id=?",(run_id,)).fetchone()
         return {"total_units":row["total"],"ready_units":row["ready"] or 0,"running_units":row["running"] or 0,"queued_units":row["queued"] or 0,"failed_units":row["failed"] or 0}
 
-    def _synthesize_unit(self,job:dict[str,Any],attempt_id:str,run_id:str,unit:sqlite3.Row,snapshot:dict[str,Any],temp_root:Path,round_no:int=1)->None:
+    def _synthesize_unit(self,job:dict[str,Any],attempt_id:str,run_id:str,unit:sqlite3.Row,snapshot:dict[str,Any],temp_root:Path,round_no:int=1,halted:threading.Event|None=None)->None:
         config=snapshot["config"];temp=temp_root/f"{uuid.uuid4()}.mp3"
         call_id=str(uuid.uuid4()); started=time.monotonic(); stamp=utc_now()
         try:
-            _REQUEST_PACER.wait_turn(lambda:self._cancelled(job["id"]))
+            _REQUEST_PACER.wait_turn(lambda:self._cancelled(job["id"]),halted)
             with closing(self.database.connect()) as connection:
                 call_no=connection.execute("UPDATE tts_run_units SET attempt_count=attempt_count+1,updated_at=? WHERE tts_run_id=? AND unit_id=? RETURNING attempt_count",(utc_now(),run_id,unit["unit_id"])).fetchone()[0]
                 connection.execute("INSERT INTO tts_provider_calls(id,project_id,tts_run_id,unit_id,job_attempt_id,call_kind,round_no,call_no,status,started_at) VALUES(?,?,?,?,?,'batch_unit',?,?,'RUNNING',?)",(call_id,job["project_id"],run_id,unit["unit_id"],attempt_id,round_no,call_no,stamp))
@@ -944,12 +1043,18 @@ class TTSWorker:
 
     def _finish_batch(self,job:dict[str,Any],run_id:str,attempt_id:str,snapshot:dict[str,Any])->None:
         if not self.service._run_is_current(job["project_id"],run_id):
-            with closing(self.database.connect()) as connection:
-                connection.execute("UPDATE tts_runs SET status='STALE',completed_at=? WHERE id=?",(utc_now(),run_id))
-            self._finish_manifest_only(job,run_id,attempt_id,snapshot,cancelled=False)
+            self._end_attempt(job,run_id,attempt_id,"translation_revision_stale",False,None,"STALE")
             return
+        self._verify_ready_units(job["project_id"],run_id)
         with closing(self.database.connect()) as connection:
+            rows=connection.execute("SELECT unit_id,status,artifact_id FROM tts_run_units WHERE tts_run_id=? ORDER BY position",(run_id,)).fetchall()
             unit_rows=connection.execute("SELECT unit_id,artifact_id,synthesis_fingerprint FROM tts_run_units WHERE tts_run_id=? AND status='READY'",(run_id,)).fetchall()
+        expected_count=snapshot.get("unit_count",len(snapshot.get("units",[])) if isinstance(snapshot.get("units"),list) else -1)
+        if len(rows)!=expected_count or any(item["status"]!="READY" or not item["artifact_id"] for item in rows) or not self._validate_run_snapshot(run_id,snapshot):
+            counts=self._unit_counts(run_id)
+            retryable=any(item["status"] in {"FAILED","QUEUED"} for item in rows)
+            self._end_attempt(job,run_id,attempt_id,"tts_outputs_incomplete",retryable,None,"PARTIAL" if counts["ready_units"] else "FAILED")
+            return
         invalid=[]
         for unit in unit_rows:
             try:
@@ -960,13 +1065,17 @@ class TTSWorker:
             with closing(self.database.connect()) as connection:
                 for unit_id in invalid:
                     connection.execute("UPDATE tts_run_units SET status='FAILED',artifact_id=NULL,retryable=1,error_code='tts_artifact_unavailable',updated_at=? WHERE tts_run_id=? AND unit_id=?",(utc_now(),run_id,unit_id))
-                connection.execute("UPDATE tts_runs SET status='PARTIAL' WHERE id=?",(run_id,))
-            self.jobs.fail_attempt(job["id"],attempt_id,"tts_artifact_unavailable",retryable=True)
+            counts=self._unit_counts(run_id)
+            self._end_attempt(job,run_id,attempt_id,"tts_artifact_unavailable",True,None,"PARTIAL" if counts["ready_units"] else "FAILED")
             return
         manifest=self.artifacts.publish(project_id=job["project_id"],job_id=job["id"],attempt_id=attempt_id,
             kind="tts_run_manifest",input_fingerprint=job["input_fingerprint"],fingerprint_version=TTS_FINGERPRINT_VERSION,source=self._manifest(run_id,snapshot))
         evidence=self.artifacts.completion_evidence(job["id"],attempt_id,[manifest["id"]])
         def complete(connection:sqlite3.Connection)->None:
+            job_status=connection.execute("SELECT status FROM jobs WHERE id=?",(job["id"],)).fetchone()["status"]
+            if job_status in {"CANCELLED","CANCEL_REQUESTED"}:
+                connection.execute("UPDATE tts_runs SET status='CANCELLED',manifest_artifact_id=?,completed_at=? WHERE id=?",(manifest["id"],utc_now(),run_id))
+                return
             active=connection.execute("SELECT active_artifact_id,input_fingerprint FROM stage_pointers WHERE project_id=? AND stage='tts'",(job["project_id"],)).fetchone()
             status="READY" if active and active["active_artifact_id"]==manifest["id"] and active["input_fingerprint"]==job["input_fingerprint"] else "STALE"
             connection.execute("UPDATE tts_runs SET status=?,manifest_artifact_id=?,completed_at=? WHERE id=?",
@@ -975,19 +1084,5 @@ class TTSWorker:
         if self.jobs.get_job(job["id"])["status"]=="CANCELLED":
             with closing(self.database.connect()) as connection:
                 connection.execute("UPDATE tts_runs SET status='CANCELLED',manifest_artifact_id=?,completed_at=? WHERE id=?",(manifest["id"],utc_now(),run_id))
-
-    def _finish_manifest_only(self,job:dict[str,Any],run_id:str,attempt_id:str,snapshot:dict[str,Any],*,cancelled:bool)->None:
-        try:
-            manifest=self.artifacts.publish(project_id=job["project_id"],job_id=job["id"],attempt_id=attempt_id,
-                kind="tts_run_manifest",input_fingerprint=job["input_fingerprint"],fingerprint_version=TTS_FINGERPRINT_VERSION,source=self._manifest(run_id,snapshot))
-            with closing(self.database.connect()) as connection:
-                connection.execute("UPDATE tts_runs SET manifest_artifact_id=? WHERE id=?",(manifest["id"],run_id))
-            evidence=self.artifacts.completion_evidence(job["id"],attempt_id,[manifest["id"]])
-            self.jobs.complete_attempt(job["id"],attempt_id,evidence,completion_hook=lambda conn:conn.execute(
-                "UPDATE tts_runs SET manifest_artifact_id=? WHERE id=?",(manifest["id"],run_id)))
-        except Exception:
-            if not cancelled:
-                try:self.jobs.fail_attempt(job["id"],attempt_id,"tts_run_stale",retryable=False)
-                except Exception:pass
 
 

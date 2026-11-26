@@ -56,3 +56,9 @@ export async function createProject(name: string): Promise<ProjectCreated> {
   await check(response);
   return (await response.json()) as ProjectCreated;
 }
+
+export async function deleteProject(project: Project): Promise<void> {
+  const csrf=currentCsrfToken(); if(!csrf) throw new Error("Phiên cục bộ chưa sẵn sàng.");
+  const response=await fetch(`/api/v1/projects/${project.id}`,{method:"DELETE",credentials:"same-origin",headers:{"Content-Type":"application/json","X-CSRF-Token":csrf,"Idempotency-Key":crypto.randomUUID()},body:JSON.stringify({expected_lock_version:project.lock_version})});
+  await check(response);
+}

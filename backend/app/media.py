@@ -242,6 +242,9 @@ class MediaImportService:
     def choose_source(self, session_token: str, project_id: str, *, purpose: str = "source", asset_id: str | None = None) -> dict[str, str]:
         if purpose not in {"source", "relink"} or (purpose == "source" and asset_id is not None) or (purpose == "relink" and not asset_id):
             raise MediaError("invalid_selection_purpose")
+        with closing(self.database.connect()) as connection:
+            if connection.execute("SELECT 1 FROM projects WHERE id=? AND deleted_at IS NULL",(project_id,)).fetchone() is None: raise MediaError("project_not_found")
+            if purpose=="relink" and connection.execute("SELECT 1 FROM media_assets WHERE id=? AND project_id=? AND deleted_at IS NULL",(asset_id,project_id)).fetchone() is None: raise MediaError("asset_not_found")
         if os.name != "nt":
             raise MediaError("picker_unavailable")
         nonce = os.urandom(32).hex()
@@ -328,9 +331,11 @@ class MediaImportService:
                 identity = _path_identity(path)
                 if identity != json.loads(selection["file_identity_json"]):
                     raise MediaError("source_changed")
-                project = connection.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone()
+                project = connection.execute("SELECT 1 FROM projects WHERE id=? AND deleted_at IS NULL", (project_id,)).fetchone()
                 if project is None:
                     raise MediaError("project_not_found")
+                if connection.execute("SELECT 1 FROM media_assets WHERE project_id=? AND deleted_at IS NULL LIMIT 1",(project_id,)).fetchone() or connection.execute("SELECT 1 FROM jobs WHERE project_id=? AND kind='media_import' AND status IN ('QUEUED','RUNNING','CANCEL_REQUESTED') LIMIT 1",(project_id,)).fetchone():
+                    raise MediaError("project_video_limit")
                 connection.execute("INSERT OR IGNORE INTO media_import_state(project_id,desired_generation,active_generation) VALUES(?,0,0)", (project_id,))
                 state = connection.execute("SELECT desired_generation FROM media_import_state WHERE project_id=?", (project_id,)).fetchone()
                 generation = state["desired_generation"] + 1
@@ -351,7 +356,7 @@ class MediaImportService:
 
     def list_assets(self, project_id: str) -> list[dict[str, Any]]:
         with closing(self.database.connect()) as connection:
-            rows = connection.execute("SELECT m.id,m.mode,m.status,m.display_name,m.private_source_path,m.source_identity_json,m.managed_artifact_id,m.sha256,m.file_size,m.metadata_json,m.created_at,m.lock_version,a.status AS artifact_status FROM media_assets m LEFT JOIN artifacts a ON a.id=m.managed_artifact_id WHERE m.project_id=? AND m.status<>'PENDING' ORDER BY m.created_at DESC,m.id", (project_id,)).fetchall()
+            rows = connection.execute("SELECT m.id,m.mode,m.status,m.display_name,m.private_source_path,m.source_identity_json,m.managed_artifact_id,m.sha256,m.file_size,m.metadata_json,m.created_at,m.lock_version,a.status AS artifact_status FROM media_assets m LEFT JOIN artifacts a ON a.id=m.managed_artifact_id WHERE m.project_id=? AND m.deleted_at IS NULL ORDER BY m.created_at DESC,m.id", (project_id,)).fetchall()
         items = []
         for row in rows:
             status = row["status"]
@@ -387,6 +392,8 @@ class MediaImportService:
             connection.commit()
         if row is None:
             return {"media_asset_id": None, "generation": 0, "status": "UNSELECTED", "asset": None}
+        if row["media_asset_id"] is None:
+            return {"media_asset_id": None, "generation": row["generation"], "status": "UNSELECTED", "asset": None}
         asset = assets.get(row["media_asset_id"])
         status = asset["status"] if asset else "MISSING"
         return {"media_asset_id": row["media_asset_id"], "generation": row["generation"], "status": status, "asset": asset}
@@ -420,6 +427,32 @@ class MediaImportService:
             connection.commit()
         return {"media_asset_id": asset_id, "generation": generation, "status": "READY", "asset": asset}
 
+    def delete_asset(self, project_id: str, asset_id: str, expected_lock_version: int, idempotency_key: str) -> None:
+        self.jobs.validate_idempotency_key(idempotency_key)
+        digest=hashlib.sha256(json.dumps({"project_id":project_id,"asset_id":asset_id,"expected_lock_version":expected_lock_version},sort_keys=True,separators=(",",":")).encode()).hexdigest()
+        scope=f"media:delete:{asset_id}"
+        with closing(self.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            previous=connection.execute("SELECT request_digest FROM idempotency_records WHERE scope=? AND idempotency_key=?",(scope,idempotency_key)).fetchone()
+            if previous:
+                if previous["request_digest"]!=digest: raise IdempotencyConflict
+                connection.commit(); return
+            project=connection.execute("SELECT 1 FROM projects WHERE id=? AND deleted_at IS NULL",(project_id,)).fetchone()
+            asset=connection.execute("SELECT lock_version FROM media_assets WHERE id=? AND project_id=? AND deleted_at IS NULL",(asset_id,project_id)).fetchone()
+            if project is None or asset is None: raise MediaError("asset_not_found")
+            if asset["lock_version"]!=expected_lock_version: raise MediaError("asset_revision_conflict")
+            if connection.execute("SELECT 1 FROM jobs WHERE project_id=? AND status IN ('QUEUED','RUNNING','CANCEL_REQUESTED') LIMIT 1",(project_id,)).fetchone(): raise MediaError("project_has_active_job")
+            stamp=utc_now()
+            connection.execute("UPDATE media_assets SET deleted_at=?,lock_version=lock_version+1 WHERE id=? AND lock_version=?",(stamp,asset_id,expected_lock_version))
+            source=connection.execute("SELECT media_asset_id FROM project_processing_sources WHERE project_id=?",(project_id,)).fetchone()
+            if source and source["media_asset_id"]==asset_id:
+                connection.execute("UPDATE project_processing_sources SET media_asset_id=NULL,generation=generation+1,updated_at=? WHERE project_id=?",(stamp,project_id))
+                connection.execute("UPDATE media_import_state SET active_asset_id=NULL WHERE project_id=? AND active_asset_id=?",(project_id,asset_id))
+                connection.execute("UPDATE stage_pointers SET active_artifact_id=NULL,pointer_generation=pointer_generation+1,updated_at=? WHERE project_id=? AND active_artifact_id IS NOT NULL",(stamp,project_id))
+            connection.execute("UPDATE selections SET state='REVOKED' WHERE project_id=? AND asset_id=? AND state='ISSUED'",(project_id,asset_id))
+            connection.execute("INSERT INTO idempotency_records(scope,idempotency_key,request_digest,project_id,response_json,created_at) VALUES(?,?,?,?, '{}',?)",(scope,idempotency_key,digest,project_id,stamp))
+            connection.commit()
+
     def relink_asset(self, session_token: str, project_id: str, asset_id: str, selection_id: str,
                      expected_lock_version: int, idempotency_key: str) -> dict[str, Any]:
         try:
@@ -448,7 +481,7 @@ class MediaImportService:
                 raise MediaError("selection_consumed")
             if selection["expires_at"] <= time.time():
                 raise MediaError("selection_expired")
-            asset = connection.execute("SELECT * FROM media_assets WHERE id=? AND project_id=?", (asset_id, project_id)).fetchone()
+            asset = connection.execute("SELECT * FROM media_assets WHERE id=? AND project_id=? AND deleted_at IS NULL", (asset_id, project_id)).fetchone()
             if asset is None or asset["mode"] != "LINK":
                 raise MediaError("asset_not_found")
             if asset["status"] not in {"MISSING", "CHANGED"}:
@@ -558,7 +591,7 @@ class MediaImportService:
             raise MediaError("asset_not_found") from exc
         with closing(self.database.connect()) as connection:
             row = connection.execute(
-                "SELECT * FROM media_assets WHERE id=? AND project_id=?",
+                "SELECT * FROM media_assets WHERE id=? AND project_id=? AND deleted_at IS NULL",
                 (asset_id, project_id),
             ).fetchone()
         if row is None or row["status"] == "PENDING":
@@ -716,7 +749,7 @@ class MediaImportService:
 
     def reconcile_pending_assets(self) -> int:
         with closing(self.database.connect()) as connection:
-            rows = connection.execute("SELECT a.*,j.status AS job_status FROM media_assets a JOIN jobs j ON j.id=a.producer_job_id WHERE a.status='PENDING'").fetchall()
+            rows = connection.execute("SELECT a.*,j.status AS job_status FROM media_assets a JOIN jobs j ON j.id=a.producer_job_id JOIN projects p ON p.id=a.project_id WHERE a.status='PENDING' AND a.deleted_at IS NULL AND p.deleted_at IS NULL").fetchall()
         promoted = 0
         for row in rows:
             if row["job_status"] != "READY":
